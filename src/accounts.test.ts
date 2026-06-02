@@ -134,6 +134,25 @@ test("detectEmail reads claude oauthAccount.emailAddress", () => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+test("detectEmail falls back to the parent dir for the default config dir", () => {
+  // Simulate the default Claude layout: ~/.claude/ (dir) + ~/.claude.json (home).
+  const fakeHome = mkdtempSync(join(tmpdir(), "home-"));
+  const defaultDir = join(fakeHome, ".claude");
+  mkdirSync(defaultDir, { recursive: true });
+  writeFileSync(join(fakeHome, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "parent@example.com" } }));
+  const tool = {
+    id: "claude",
+    label: "Claude Code",
+    envVar: "CLAUDE_CONFIG_DIR",
+    defaultDir,
+    bin: "claude",
+    accountFile: ".claude.json",
+    emailPath: ["oauthAccount", "emailAddress"],
+  };
+  expect(detectEmail(defaultDir, tool)).toBe("parent@example.com");
+  rmSync(fakeHome, { recursive: true, force: true });
+});
+
 test("detectEmail returns undefined when absent", () => {
   const dir = mkdtempSync(join(tmpdir(), "claudedir-"));
   expect(detectEmail(dir, getTool("claude"))).toBeUndefined();
