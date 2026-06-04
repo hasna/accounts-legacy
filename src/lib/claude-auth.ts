@@ -103,8 +103,12 @@ export function snapshotClaudeAuthToProfile(profileDir: string, tool: ToolDef): 
 }
 
 /** Build auth snapshots from files already present in the profile config dir. */
-export function ensureProfileAuthSnapshot(profileDir: string, tool: ToolDef): void {
-  if (hasAuthSnapshot(profileDir)) return;
+export function ensureProfileAuthSnapshot(
+  profileDir: string,
+  tool: ToolDef,
+  opts: { overwrite?: boolean } = {},
+): void {
+  if (!opts.overwrite && hasAuthSnapshot(profileDir)) return;
   const authDir = profileAuthDir(profileDir);
   assertSafeWritePath(join(authDir, OAUTH_SNAPSHOT), { mustStayUnder: profileDir });
   mkdirSync(authDir, { recursive: true });

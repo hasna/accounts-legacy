@@ -28,6 +28,7 @@ import { installHook, uninstallHook, shellSnippet, hookPath } from "./lib/hook.j
 import { profileHasAuth } from "./lib/claude-auth.js";
 import { loadStore } from "./storage.js";
 import { formatEnvAssignments, formatExportLines, profileEnv } from "./lib/env.js";
+import { finalizeLogin } from "./lib/login.js";
 
 const program = new Command();
 
@@ -219,14 +220,21 @@ program
       console.log(chalk.dim(`  config dir: ${profile.dir}`));
       console.log(chalk.dim(`  env: ${formatEnvAssignments(env)}`));
       console.log(chalk.yellow(`  ${tool.loginHint ?? "complete the login flow, then exit when done"}`));
-      const next = tool.id === "claude" ? `accounts detect ${name} --tool ${tool.id}  &&  accounts apply ${name} --tool ${tool.id}` : `accounts detect ${name} --tool ${tool.id}`;
-      console.log(chalk.dim(`  Then: ${next}`));
+      if (tool.id === "claude") {
+        console.log(chalk.dim("  After Claude exits, accounts will make this the live/default Claude account."));
+      }
       const res = spawnSync(tool.bin, loginArgs, {
         stdio: "inherit",
         env: { ...process.env, ...env },
       });
       if (res.error) die(`failed to launch ${tool.bin}: ${res.error.message}`);
-      process.exit(res.status ?? 0);
+      if ((res.status ?? 0) !== 0) process.exit(res.status ?? 1);
+      const finalized = finalizeLogin(name, tool.id);
+      if (finalized.applied) {
+        console.log(chalk.green(`✓ ${chalk.bold(name)} is now the live/default ${tool.label} account`));
+      } else {
+        console.log(chalk.green(`✓ ${chalk.bold(name)} login finished and profile is active`));
+      }
     }),
   );
 

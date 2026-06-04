@@ -29,6 +29,8 @@ export type { AddOptions, RemoveOptions, UpdateOptions } from "./lib/profiles.js
 export { applyProfile, appliedProfile } from "./lib/apply.js";
 export { importProfile, ensureProfileForLogin } from "./lib/import-profile.js";
 export type { ImportOptions } from "./lib/import-profile.js";
+export { finalizeLogin } from "./lib/login.js";
+export type { FinalizeLoginResult } from "./lib/login.js";
 export { pickProfile } from "./lib/pick.js";
 export type { PickOptions, PickResult } from "./lib/pick.js";
 export { installHook, uninstallHook, hookPath, hookScript, shellSnippet } from "./lib/hook.js";

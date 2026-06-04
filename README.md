@@ -37,10 +37,8 @@ accounts add work --email work@company.com
 accounts add personal --email me@gmail.com
 
 # 3. Log in once per profile (isolated dir)
-accounts login work        # run /login inside Claude, then /exit
-accounts detect work
-accounts login personal
-accounts detect personal
+accounts login work        # run /login inside Claude, then /exit; accounts auto-applies it
+accounts login personal    # same: login, exit; it becomes the live/default account
 
 # 4. Switch
 accounts apply work --tool claude   # Cursor / VS Code — live ~/.claude auth
@@ -51,8 +49,10 @@ accounts launch work --tool claude
 eval "$(accounts env personal --tool claude)"   # other terminal
 ```
 
-Do **not** run `accounts apply` until after `accounts login` and `accounts detect` — apply
-refuses profiles without an auth snapshot so live OAuth is not wiped.
+After `accounts login <name> --tool claude`, `accounts` snapshots the auth Claude
+wrote, updates the detected email, and applies that profile to live `~/.claude`
+paths automatically. `accounts apply` still refuses profiles without auth so live
+OAuth is not wiped.
 
 ## Three pointers (active, applied, isolated)
 

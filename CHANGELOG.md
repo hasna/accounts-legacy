@@ -6,6 +6,13 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-06-04
+
+### Fixed
+
+- `accounts login <name> --tool claude` now finalizes the login automatically after Claude exits:
+  snapshots profile auth, refreshes detected email, and applies the profile to live/default Claude.
+
 ### Added
 
 - Built-in profile adapters for opencode, Cursor Agent, Kimi Code, and Grok Build.

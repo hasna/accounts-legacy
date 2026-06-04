@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { addProfile, useProfile, renameProfile, removeProfile, currentProfile } from "./lib/profiles.js";
 import { applyProfile, appliedProfile } from "./lib/apply.js";
 import { importProfile, ensureProfileForLogin } from "./lib/import-profile.js";
+import { finalizeLogin } from "./lib/login.js";
 import {
   ensureProfileAuthSnapshot,
   hasAuthSnapshot,
@@ -137,6 +138,43 @@ test("applyProfile writes oauth to live paths", () => {
   const live = liveClaudePaths();
   const liveJson = JSON.parse(readFileSync(live.homeJson, "utf8")) as { oauthAccount: { emailAddress: string } };
   expect(liveJson.oauthAccount.emailAddress).toBe("work@example.com");
+  rmSync(workDir, { recursive: true, force: true });
+});
+
+test("finalizeLogin snapshots and applies a Claude login automatically", () => {
+  const workDir = mkdtempSync(join(tmpdir(), "work-login-"));
+  addProfile({ name: "work", dir: workDir });
+  writeOAuth(workDir, "work@example.com");
+
+  const result = finalizeLogin("work", "claude");
+
+  expect(result.applied).toBe(true);
+  expect(appliedProfile("claude")?.name).toBe("work");
+  expect(currentProfile("claude")?.name).toBe("work");
+  const live = JSON.parse(readFileSync(liveClaudePaths().homeJson, "utf8")) as {
+    oauthAccount: { emailAddress: string };
+  };
+  expect(live.oauthAccount.emailAddress).toBe("work@example.com");
+  rmSync(workDir, { recursive: true, force: true });
+});
+
+test("finalizeLogin refreshes a stale auth snapshot from the profile dir", () => {
+  const workDir = mkdtempSync(join(tmpdir(), "work-login-refresh-"));
+  writeOAuth(workDir, "old@example.com");
+  addProfile({ name: "work", dir: workDir });
+  ensureProfileAuthSnapshot(workDir, getTool("claude"));
+  writeOAuth(workDir, "new@example.com");
+
+  finalizeLogin("work", "claude");
+
+  const snap = JSON.parse(readFileSync(profileOAuthSnapshot(workDir), "utf8")) as {
+    oauthAccount: { emailAddress: string };
+  };
+  expect(snap.oauthAccount.emailAddress).toBe("new@example.com");
+  const live = JSON.parse(readFileSync(liveClaudePaths().homeJson, "utf8")) as {
+    oauthAccount: { emailAddress: string };
+  };
+  expect(live.oauthAccount.emailAddress).toBe("new@example.com");
   rmSync(workDir, { recursive: true, force: true });
 });
 
