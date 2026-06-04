@@ -4,13 +4,17 @@ For contributors and coding agents working in this repo.
 
 ## Three-pointer model
 
+Profiles are keyed by **tool + name**. The same name can be reused across tools
+(`work` for Claude, Codex, Cursor, etc.). Bare name lookup is allowed only when
+it resolves to one profile; otherwise commands must pass `--tool`.
+
 Each tool (e.g. `claude`) tracks **two registry pointers** plus an optional **isolated runtime** mode:
 
 | Pointer / mode | Store field | CLI surface | What it controls |
 |----------------|-------------|-------------|------------------|
 | **Active** (intent) | `store.current[toolId]` | `accounts use`, `accounts active`, `accounts pick` (always), `launch`/`shell` | Which profile you mean for terminal workflows and the shell hook |
 | **Applied** (live auth) | `store.applied[toolId]` | `accounts apply`, `accounts applied`, `accounts pick` (default) | OAuth/credentials on live `~/.claude` paths (what Cursor/VS Code read) |
-| **Isolated** (no pointer) | — | `accounts env`, `accounts launch`, `accounts shell` | `CLAUDE_CONFIG_DIR` (or tool env var) for one process/shell only |
+| **Isolated** (no pointer) | — | `accounts env`, `accounts launch`, `accounts shell` | Tool env vars rendered from `src/lib/env.ts` for one process/shell only |
 
 **Rules:**
 
@@ -18,6 +22,7 @@ Each tool (e.g. `claude`) tracks **two registry pointers** plus an optional **is
 - `accounts apply` updates **applied** and also sets **active** to the same profile.
 - `accounts pick` defaults to **active + apply**; use `--env` or `--no-act` for other modes.
 - The shell hook compares **active** vs **applied** and runs `accounts apply` when they differ ([hook docs](./hook.md)).
+- `apply` is Claude-only until another tool has a verified live-path adapter.
 
 Registry file: `~/.hasna/accounts/accounts.json` (fields `current` and `applied`, not `active`).
 
@@ -27,6 +32,8 @@ Registry file: `~/.hasna/accounts/accounts.json` (fields `current` and `applied`
 |------|------|
 | `src/storage.ts` | `ACCOUNTS_HOME`, load/save store, sanitize stale pointers |
 | `src/lib/profiles.ts` | CRUD, `useProfile` → `current`, rename/remove pointer hygiene |
+| `src/lib/tools.ts` | Built-in and custom tool registry |
+| `src/lib/env.ts` | Per-tool env rendering (`{profileDir}`, `{profileName}`, `{toolId}` templates) |
 | `src/lib/apply.ts` | `applyProfile`, `applied` pointer, live path sync |
 | `src/lib/claude-auth.ts` | Auth snapshots under `<profile>/.accounts-auth/` |
 | `src/lib/import-profile.ts` | `import` / `login` |

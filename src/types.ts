@@ -15,8 +15,11 @@ export const toolDefSchema = z.object({
   id: slugSchema,
   label: z.string().min(1).max(64),
   envVar: z.string().min(1).regex(/^[A-Z_][A-Z0-9_]*$/, "envVar must look like AN_ENV_VAR"),
+  extraEnv: z.record(z.string()).optional(),
   defaultDir: z.string().min(1),
   bin: z.string().min(1),
+  loginArgs: z.array(z.string()).optional(),
+  loginHint: z.string().optional(),
   accountFile: z.string().optional(),
   emailPath: z.array(z.string()).optional(),
 });

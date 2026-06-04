@@ -27,6 +27,7 @@ import { pickProfile, resolvePickMode } from "./lib/pick.js";
 import { installHook, uninstallHook, shellSnippet, hookPath } from "./lib/hook.js";
 import { profileHasAuth } from "./lib/claude-auth.js";
 import { loadStore } from "./storage.js";
+import { formatEnvAssignments, formatExportLines, profileEnv } from "./lib/env.js";
 
 const program = new Command();
 
@@ -90,7 +91,7 @@ program
       console.log(`  config dir: ${p.dir}`);
       console.log(`  email:      ${p.email ?? chalk.dim("(none — set with `accounts set " + p.name + " --email ...`)")}`);
       const tool = getTool(p.tool);
-      console.log(chalk.dim(`  launch it:  accounts launch ${p.name}    (sets ${tool.envVar} and runs ${tool.bin})`));
+      console.log(chalk.dim(`  launch it:  accounts launch ${p.name} --tool ${p.tool}    (sets ${tool.envVar} and runs ${tool.bin})`));
     }),
   );
 
@@ -123,10 +124,11 @@ program
   .command("show")
   .argument("<name>", "profile name")
   .description("show full details for a profile")
+  .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .option("--json", "output JSON")
   .action(
-    action((name: string, opts: { json?: boolean }) => {
-      const p = getProfile(name);
+    action((name: string, opts: { tool?: string; json?: boolean }) => {
+      const p = getProfile(name, opts.tool);
       if (opts.json) {
         console.log(JSON.stringify(p, null, 2));
         return;
@@ -148,15 +150,16 @@ program
   .command("use")
   .argument("<name>", "profile name")
   .description("set a profile as the active one for its tool")
+  .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .action(
-    action((name: string) => {
-      const { profile, toolId } = useProfile(name);
+    action((name: string, opts: { tool?: string }) => {
+      const { profile, toolId } = useProfile(name, opts.tool);
       const tool = getTool(toolId);
       console.log(chalk.green(`✓ ${chalk.bold(profile.name)} is now the active ${tool.label} profile`));
       console.log(chalk.dim("  this CLI can't change your current shell's env, so either:"));
-      console.log(`    accounts apply ${profile.name}                 ${chalk.dim("# IDE: sync auth to ~/.claude")}`);
-      console.log(`    eval "$(accounts env ${profile.name})"        ${chalk.dim("# terminal: isolated config dir")}`);
-      console.log(`    accounts launch ${profile.name}                ${chalk.dim("# launch " + tool.bin + " with it")}`);
+      console.log(`    accounts apply ${profile.name} --tool ${profile.tool}          ${chalk.dim("# IDE: sync auth to ~/.claude")}`);
+      console.log(`    eval "$(accounts env ${profile.name} --tool ${profile.tool})"  ${chalk.dim("# terminal: isolated config dir")}`);
+      console.log(`    accounts launch ${profile.name} --tool ${profile.tool}         ${chalk.dim("# launch " + tool.bin + " with it")}`);
     }),
   );
 
@@ -164,9 +167,10 @@ program
   .command("apply")
   .argument("<name>", "profile name")
   .description("apply profile auth to live ~/.claude paths (requires login/snapshot; Claude-only)")
+  .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .action(
-    action((name: string) => {
-      const { profile, previous } = applyProfile(name);
+    action((name: string, opts: { tool?: string }) => {
+      const { profile, previous } = applyProfile(name, opts.tool);
       console.log(chalk.green(`✓ applied ${chalk.bold(profile.name)} to live ${getTool(profile.tool).label} paths`));
       if (previous) console.log(chalk.dim(`  previous applied profile "${previous}" was snapshotted`));
       if (profile.email) console.log(chalk.dim(`  email: ${profile.email}`));
@@ -195,27 +199,31 @@ program
       console.log(chalk.green(`✓ imported profile ${chalk.bold(p.name)}`));
       console.log(`  config dir: ${p.dir}`);
       console.log(`  email:      ${p.email ?? chalk.dim("(none)")}`);
-      console.log(chalk.dim(`  next: accounts login ${p.name}  OR  accounts apply ${p.name}`));
+      console.log(chalk.dim(`  next: accounts login ${p.name} --tool ${p.tool}  OR  accounts apply ${p.name} --tool ${p.tool}`));
     }),
   );
 
 program
   .command("login")
   .argument("<name>", "profile name")
-  .description("launch Claude Code in an isolated profile dir to run /login (OAuth)")
+  .description("launch the tool's login flow inside an isolated profile dir")
   .option("-t, --tool <tool>", "tool", DEFAULT_TOOL)
   .action(
     action((name: string, opts: { tool: string }) => {
       const profile = ensureProfileForLogin(name, opts.tool);
       const tool = getTool(profile.tool);
-      useProfile(name);
+      const env = profileEnv(profile, tool);
+      const loginArgs = tool.loginArgs ?? [];
+      useProfile(name, tool.id);
       console.log(chalk.green(`→ launching ${tool.bin} for profile ${chalk.bold(name)}`));
       console.log(chalk.dim(`  config dir: ${profile.dir}`));
-      console.log(chalk.yellow("  In Claude, run /login to authenticate. Then /exit when done."));
-      console.log(chalk.dim(`  Then: accounts detect ${name}  &&  accounts apply ${name}`));
-      const res = spawnSync(tool.bin, [], {
+      console.log(chalk.dim(`  env: ${formatEnvAssignments(env)}`));
+      console.log(chalk.yellow(`  ${tool.loginHint ?? "complete the login flow, then exit when done"}`));
+      const next = tool.id === "claude" ? `accounts detect ${name} --tool ${tool.id}  &&  accounts apply ${name} --tool ${tool.id}` : `accounts detect ${name} --tool ${tool.id}`;
+      console.log(chalk.dim(`  Then: ${next}`));
+      const res = spawnSync(tool.bin, loginArgs, {
         stdio: "inherit",
-        env: { ...process.env, [tool.envVar]: profile.dir },
+        env: { ...process.env, ...env },
       });
       if (res.error) die(`failed to launch ${tool.bin}: ${res.error.message}`);
       process.exit(res.status ?? 0);
@@ -232,14 +240,14 @@ program
     action(async (opts: { tool: string; env?: boolean; act?: boolean }) => {
       const result = await pickProfile({ tool: opts.tool, mode: resolvePickMode(opts) });
       if (!result) return;
-      useProfile(result.profile.name);
+      useProfile(result.profile.name, result.profile.tool);
       console.log(chalk.green(`✓ selected ${chalk.bold(result.profile.name)}`));
       if (result.mode === "apply") {
-        applyProfile(result.profile.name);
+        applyProfile(result.profile.name, result.profile.tool);
         console.log(chalk.dim("  applied to live Claude paths"));
       } else if (result.mode === "env") {
         const tool = getTool(result.profile.tool);
-        console.log(`export ${tool.envVar}=${JSON.stringify(result.profile.dir)}`);
+        console.log(formatExportLines(profileEnv(result.profile, tool)));
       }
     }),
   );
@@ -306,13 +314,14 @@ program
   .command("env")
   .argument("[name]", "profile name (defaults to the active profile for the tool)")
   .description("print the `export VAR=dir` line to activate a profile in your shell")
-  .option("-t, --tool <tool>", "tool (used when no name is given)", DEFAULT_TOOL)
+  .option("-t, --tool <tool>", "tool (required when a named profile is ambiguous; defaults to claude when no name is given)")
   .action(
-    action((name: string | undefined, opts: { tool: string }) => {
-      const profile = name ? getProfile(name) : currentProfile(opts.tool);
-      if (!profile) die(`no active profile for "${opts.tool}". Use \`accounts use <name>\` first.`);
+    action((name: string | undefined, opts: { tool?: string }) => {
+      const toolId = opts.tool ?? DEFAULT_TOOL;
+      const profile = name ? getProfile(name, opts.tool) : currentProfile(toolId);
+      if (!profile) die(`no active profile for "${toolId}". Use \`accounts use <name>\` first.`);
       const tool = getTool(profile.tool);
-      console.log(`export ${tool.envVar}=${JSON.stringify(profile.dir)}`);
+      console.log(formatExportLines(profileEnv(profile, tool)));
     }),
   );
 
@@ -322,15 +331,17 @@ program
   .argument("<name>", "profile name")
   .argument("[args...]", "extra args passed to the tool binary")
   .description("launch the tool's binary with the profile's config dir active")
+  .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .action(
-    action((name: string, args: string[]) => {
-      const profile = getProfile(name);
+    action((name: string, args: string[], opts: { tool?: string }) => {
+      const profile = getProfile(name, opts.tool);
       const tool = getTool(profile.tool);
-      useProfile(name); // mark active + bump lastUsedAt
-      console.log(chalk.dim(`→ ${tool.envVar}=${profile.dir} ${tool.bin} ${args.join(" ")}`));
+      const env = profileEnv(profile, tool);
+      useProfile(name, tool.id); // mark active + bump lastUsedAt
+      console.log(chalk.dim(`→ ${formatEnvAssignments(env)} ${tool.bin} ${args.join(" ")}`));
       const res = spawnSync(tool.bin, args, {
         stdio: "inherit",
-        env: { ...process.env, [tool.envVar]: profile.dir },
+        env: { ...process.env, ...env },
       });
       if (res.error) die(`failed to launch ${tool.bin}: ${res.error.message}`);
       process.exit(res.status ?? 0);
@@ -341,16 +352,18 @@ program
   .command("shell")
   .argument("<name>", "profile name")
   .description("open a subshell with the profile's config dir active")
+  .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .action(
-    action((name: string) => {
-      const profile = getProfile(name);
+    action((name: string, opts: { tool?: string }) => {
+      const profile = getProfile(name, opts.tool);
       const tool = getTool(profile.tool);
-      useProfile(name);
+      const env = profileEnv(profile, tool);
+      useProfile(name, tool.id);
       const shell = process.env.SHELL || "/bin/sh";
-      console.log(chalk.dim(`→ subshell with ${tool.envVar}=${profile.dir} (exit to leave)`));
+      console.log(chalk.dim(`→ subshell with ${formatEnvAssignments(env)} (exit to leave)`));
       const res = spawnSync(shell, ["-i"], {
         stdio: "inherit",
-        env: { ...process.env, [tool.envVar]: profile.dir, ACCOUNTS_ACTIVE: profile.name },
+        env: { ...process.env, ...env, ACCOUNTS_ACTIVE: profile.name },
       });
       process.exit(res.status ?? 0);
     }),
@@ -377,11 +390,12 @@ program
   .command("set")
   .argument("<name>", "profile name")
   .description("update a profile's email, description, or config dir")
+  .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .option("-e, --email <email>", "set the account email")
   .option("--description <text>", "set the description")
   .option("-d, --dir <path>", "set the config dir")
   .action(
-    action((name: string, opts: { email?: string; description?: string; dir?: string }) => {
+    action((name: string, opts: { tool?: string; email?: string; description?: string; dir?: string }) => {
       if (opts.email === undefined && opts.description === undefined && opts.dir === undefined) {
         die("nothing to set — pass --email, --description, or --dir");
       }
@@ -394,9 +408,10 @@ program
   .command("detect")
   .argument("<name>", "profile name")
   .description("re-detect the account email from the profile's config dir")
+  .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .action(
-    action((name: string) => {
-      const p = redetectEmail(name);
+    action((name: string, opts: { tool?: string }) => {
+      const p = redetectEmail(name, opts.tool);
       console.log(p.email ? chalk.green(`✓ ${p.name}: ${p.email}`) : chalk.yellow(`no email found in ${p.dir}`));
     }),
   );
@@ -406,9 +421,10 @@ program
   .argument("<old>", "current name")
   .argument("<new>", "new name")
   .description("rename a profile")
+  .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .action(
-    action((oldName: string, newName: string) => {
-      const p = renameProfile(oldName, newName);
+    action((oldName: string, newName: string, opts: { tool?: string }) => {
+      const p = renameProfile(oldName, newName, opts.tool);
       console.log(chalk.green(`✓ renamed to ${chalk.bold(p.name)}`));
     }),
   );
@@ -418,10 +434,11 @@ program
   .alias("rm")
   .argument("<name>", "profile name")
   .description("remove a profile from the registry")
+  .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .option("--purge", "also delete the managed config dir on disk")
   .action(
-    action((name: string, opts: { purge?: boolean }) => {
-      const { profile, purged, purgeNote } = removeProfile(name, opts.purge);
+    action((name: string, opts: { tool?: string; purge?: boolean }) => {
+      const { profile, purged, purgeNote } = removeProfile(name, { tool: opts.tool, purge: opts.purge });
       console.log(chalk.green(`✓ removed ${chalk.bold(profile.name)}`));
       if (purged) console.log(chalk.dim(`  deleted ${profile.dir}`));
       if (purgeNote) console.log(chalk.yellow(`  ${purgeNote}`));
@@ -432,9 +449,10 @@ program
   .command("path")
   .argument("<name>", "profile name")
   .description("print just the config dir path (useful for scripting)")
+  .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .action(
-    action((name: string) => {
-      console.log(getProfile(name).dir);
+    action((name: string, opts: { tool?: string }) => {
+      console.log(getProfile(name, opts.tool).dir);
     }),
   );
 
@@ -453,7 +471,8 @@ tools
       }
       for (const t of all) {
         const tag = isBuiltinTool(t.id) ? chalk.dim("built-in") : chalk.magenta("custom");
-        console.log(`${chalk.cyan(t.id.padEnd(10))} ${t.label.padEnd(16)} ${chalk.dim(t.envVar)} → ${chalk.dim(t.defaultDir)}  ${tag}`);
+        const envNames = [t.envVar, ...Object.keys(t.extraEnv ?? {})].join(", ");
+        console.log(`${chalk.cyan(t.id.padEnd(10))} ${t.label.padEnd(16)} ${chalk.dim(envNames)} → ${chalk.dim(t.defaultDir)}  ${tag}`);
       }
     }),
   );
@@ -466,20 +485,39 @@ tools
   .requiredOption("--env-var <VAR>", "env var that points the tool at its config dir")
   .requiredOption("--bin <bin>", "binary to launch")
   .option("--default-dir <path>", "default config dir (default: ~/.<id>)")
+  .option("--extra-env <VAR=VALUE...>", "additional env var templates; supports {profileDir}, {profileName}, {toolId}")
+  .option("--login-arg <arg...>", "arguments for `accounts login <profile> --tool <id>`")
   .option("--account-file <file>", "file inside the config dir holding the email")
   .option("--email-path <path>", "dot-path to the email inside that file (e.g. account.email)")
   .action(
     action(
       (
         id: string,
-        opts: { label: string; envVar: string; bin: string; defaultDir?: string; accountFile?: string; emailPath?: string },
+        opts: {
+          label: string;
+          envVar: string;
+          bin: string;
+          defaultDir?: string;
+          extraEnv?: string[];
+          loginArg?: string[];
+          accountFile?: string;
+          emailPath?: string;
+        },
       ) => {
+        const extraEnv: Record<string, string> = {};
+        for (const entry of opts.extraEnv ?? []) {
+          const idx = entry.indexOf("=");
+          if (idx <= 0) die(`invalid --extra-env ${entry}; expected VAR=VALUE`);
+          extraEnv[entry.slice(0, idx)] = entry.slice(idx + 1);
+        }
         const def = {
           id,
           label: opts.label,
           envVar: opts.envVar,
           bin: opts.bin,
           defaultDir: opts.defaultDir ? expandPath(opts.defaultDir) : join(homedir(), `.${id}`),
+          ...(Object.keys(extraEnv).length > 0 ? { extraEnv } : {}),
+          ...(opts.loginArg ? { loginArgs: opts.loginArg } : {}),
           ...(opts.accountFile ? { accountFile: opts.accountFile } : {}),
           ...(opts.emailPath ? { emailPath: opts.emailPath.split(".") } : {}),
         };

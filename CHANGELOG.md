@@ -6,6 +6,12 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+### Added
+
+- Built-in profile adapters for opencode, Cursor Agent, Kimi Code, and Grok Build.
+- Multi-env profile rendering (`extraEnv`) for tools that need more than one environment variable.
+- Per-tool profile names: the same profile name can exist for different tools; ambiguous commands require `--tool`.
+
 ### Fixed
 
 - Docs/UX aligned with CLI: three-pointer model (`current` / `applied` / isolated), hook guide,

@@ -17,6 +17,7 @@ import {
 import { loadStore, saveStore } from "./storage.js";
 import { detectEmail } from "./lib/detect.js";
 import { getTool, listTools, addCustomTool, removeCustomTool, isBuiltinTool } from "./lib/tools.js";
+import { formatExportLines, profileEnv } from "./lib/env.js";
 import { AccountsError } from "./types.js";
 
 let home: string;
@@ -61,6 +62,35 @@ test("list and find", () => {
   expect(listProfiles("codex").map((p) => p.name)).toEqual(["personal"]);
   expect(findProfile("work")?.name).toBe("work");
   expect(findProfile("ghost")).toBeUndefined();
+});
+
+test("built-in tools cover major coding agents", () => {
+  const ids = listTools().map((t) => t.id);
+  expect(ids).toContain("claude");
+  expect(ids).toContain("codex");
+  expect(ids).toContain("opencode");
+  expect(ids).toContain("cursor");
+  expect(ids).toContain("kimi");
+  expect(ids).toContain("grok");
+});
+
+test("same profile name is allowed across tools and ambiguous without tool", () => {
+  addProfile({ name: "work", tool: "claude" });
+  addProfile({ name: "work", tool: "codex" });
+  expect(() => getProfile("work")).toThrow(AccountsError);
+  expect(getProfile("work", "codex").tool).toBe("codex");
+  useProfile("work", "codex");
+  expect(currentProfile("codex")?.name).toBe("work");
+  expect(currentProfile("claude")).toBeUndefined();
+});
+
+test("profileEnv renders extra per-tool environment templates", () => {
+  const p = addProfile({ name: "ops", tool: "opencode" });
+  const env = profileEnv(p, getTool("opencode"));
+  expect(env.OPENCODE_CONFIG_DIR).toBe(p.dir);
+  expect(env.XDG_CONFIG_HOME).toBe(join(p.dir, "xdg-config"));
+  expect(env.XDG_DATA_HOME).toBe(join(p.dir, "xdg-data"));
+  expect(formatExportLines(env)).toContain("export OPENCODE_CONFIG_DIR=");
 });
 
 test("getProfile throws for missing", () => {
@@ -185,12 +215,12 @@ test("store persists across loads", () => {
 });
 
 test("custom tools: register, use for a profile, and list", () => {
-  addCustomTool({ id: "cursor", label: "Cursor", envVar: "CURSOR_CONFIG_DIR", defaultDir: "/tmp/.cursor", bin: "cursor" });
-  expect(listTools().some((t) => t.id === "cursor")).toBe(true);
-  expect(isBuiltinTool("cursor")).toBe(false);
-  expect(getTool("cursor").label).toBe("Cursor");
-  const p = addProfile({ name: "design", tool: "cursor", email: "d@example.com" });
-  expect(p.tool).toBe("cursor");
+  addCustomTool({ id: "windsurf", label: "Windsurf", envVar: "WINDSURF_HOME", defaultDir: "/tmp/.windsurf", bin: "windsurf" });
+  expect(listTools().some((t) => t.id === "windsurf")).toBe(true);
+  expect(isBuiltinTool("windsurf")).toBe(false);
+  expect(getTool("windsurf").label).toBe("Windsurf");
+  const p = addProfile({ name: "design", tool: "windsurf", email: "d@example.com" });
+  expect(p.tool).toBe("windsurf");
 });
 
 test("custom tools: cannot redefine a built-in", () => {
@@ -206,12 +236,12 @@ test("custom tools: invalid envVar is rejected", () => {
 });
 
 test("custom tools: cannot remove while in use, can after", () => {
-  addCustomTool({ id: "cursor", label: "Cursor", envVar: "CURSOR_CONFIG_DIR", defaultDir: "/tmp/.cursor", bin: "cursor" });
-  addProfile({ name: "design", tool: "cursor" });
-  expect(() => removeCustomTool("cursor")).toThrow(AccountsError);
+  addCustomTool({ id: "windsurf", label: "Windsurf", envVar: "WINDSURF_HOME", defaultDir: "/tmp/.windsurf", bin: "windsurf" });
+  addProfile({ name: "design", tool: "windsurf" });
+  expect(() => removeCustomTool("windsurf")).toThrow(AccountsError);
   removeProfile("design");
-  removeCustomTool("cursor");
-  expect(listTools().some((t) => t.id === "cursor")).toBe(false);
+  removeCustomTool("windsurf");
+  expect(listTools().some((t) => t.id === "windsurf")).toBe(false);
 });
 
 test("custom tools: removing a built-in throws", () => {

@@ -60,14 +60,14 @@ export function importProfile(opts: ImportOptions) {
 }
 
 export function ensureProfileForLogin(name: string, toolId = DEFAULT_TOOL) {
-  const existing = findProfileByName(name);
+  const existing = findProfileByName(name, toolId);
   if (existing) return existing;
   return addProfile({ name, tool: toolId, description: "created for login" });
 }
 
-function findProfileByName(name: string) {
+function findProfileByName(name: string, toolId: string) {
   try {
-    return getProfile(name);
+    return getProfile(name, toolId);
   } catch (err) {
     if (err instanceof AccountsError) return undefined;
     throw err;

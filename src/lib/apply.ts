@@ -22,12 +22,12 @@ export function appliedProfile(toolId: string): Profile | undefined {
  * Apply a profile's auth to the tool's live default paths (IDE-friendly).
  * Snapshots the previously applied profile's auth before switching.
  */
-export function applyProfile(name: string): { profile: Profile; previous?: string } {
-  return withApplyLock(() => applyProfileUnlocked(name));
+export function applyProfile(name: string, toolId?: string): { profile: Profile; previous?: string } {
+  return withApplyLock(() => applyProfileUnlocked(name, toolId));
 }
 
-function applyProfileUnlocked(name: string): { profile: Profile; previous?: string } {
-  const profile = getProfile(name);
+function applyProfileUnlocked(name: string, toolId?: string): { profile: Profile; previous?: string } {
+  const profile = getProfile(name, toolId);
   const tool = getTool(profile.tool);
 
   if (tool.id !== "claude") {
@@ -55,7 +55,7 @@ function applyProfileUnlocked(name: string): { profile: Profile; previous?: stri
 
   store.applied[tool.id] = name;
   saveStore(store);
-  useProfile(name);
+  useProfile(name, tool.id);
 
   return { profile, ...(previous && previous !== name ? { previous } : {}) };
 }

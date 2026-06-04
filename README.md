@@ -1,8 +1,8 @@
 # @hasna/accounts
 
-> Manage and switch between multiple **Claude Code** (and other AI coding tool)
-> profiles/accounts on one machine — isolated config dirs, IDE-friendly apply mode,
-> and one-command switching.
+> Manage and switch between multiple AI coding tool profiles/accounts on one
+> machine — Claude Code, Codex CLI, opencode, Cursor Agent, Kimi Code, Grok
+> Build, and custom tools.
 
 `accounts` is a local-first CLI. Each **profile** is an isolated config directory.
 Switch **in the terminal** with `CLAUDE_CONFIG_DIR`, or **in Cursor / VS Code** with
@@ -11,7 +11,10 @@ Switch **in the terminal** with `CLAUDE_CONFIG_DIR`, or **in Cursor / VS Code** 
 - **Isolated profiles** — separate config dirs (skills, settings, sessions). Nothing leaks.
 - **Apply mode** — sync OAuth / credentials to live paths for IDEs (Claude-only today).
 - **Remembers the email** — auto-detected from `.claude.json` when possible.
-- **Multi-tool** — Claude Code built-in; Codex + custom tools via `accounts tools add`.
+- **Multi-tool** — first-class built-ins for Claude, Codex, opencode, Cursor Agent,
+  Kimi Code, and Grok Build; custom tools via `accounts tools add`.
+- **Per-tool names** — `work` can exist for Claude, Codex, Cursor, etc.; pass
+  `--tool` when a bare profile name is ambiguous.
 - **Local-first** — registry at `~/.hasna/accounts/`. No network, no telemetry.
 
 ## Install
@@ -40,12 +43,12 @@ accounts login personal
 accounts detect personal
 
 # 4. Switch
-accounts apply work        # Cursor / VS Code — live ~/.claude auth
+accounts apply work --tool claude   # Cursor / VS Code — live ~/.claude auth
 accounts apply personal
 
 # Or terminal-only (parallel sessions OK):
-accounts launch work
-eval "$(accounts env personal)"   # other terminal
+accounts launch work --tool claude
+eval "$(accounts env personal --tool claude)"   # other terminal
 ```
 
 Do **not** run `accounts apply` until after `accounts login` and `accounts detect` — apply
@@ -85,18 +88,18 @@ Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
 |---------|-------------|
 | `accounts add <name>` | Create a profile. `--tool`, `--email`, `--dir`, `--description`. |
 | `accounts import [name]` | Import existing config dir (default `~/.claude`). `--copy` for managed copy. |
-| `accounts login <name>` | Launch Claude in profile dir for `/login` (creates profile via import if missing). |
-| `accounts apply <name>` | Apply profile auth to live Claude paths (requires snapshot; Claude-only). |
+| `accounts login <name> --tool <tool>` | Launch the tool's login flow in an isolated profile dir. |
+| `accounts apply <name> --tool claude` | Apply profile auth to live Claude paths (requires snapshot; Claude-only). |
 | `accounts pick` | Interactive picker; default applies. `--env`, `--no-act`. |
-| `accounts use <name>` | Mark profile active; prints apply/env hints. |
+| `accounts use <name> --tool <tool>` | Mark profile active; prints apply/env hints. |
 | `accounts list` (`ls`) | List profiles (`●` active, `◉` applied, `●◉` both). |
-| `accounts show <name>` | Profile details including active/applied flags. |
+| `accounts show <name> --tool <tool>` | Profile details including active/applied flags. |
 | `accounts current` | Active profile per tool (with applied hint). |
 | `accounts active [tool]` | Print active profile name (scripting). |
 | `accounts applied [tool]` | Print applied profile name (scripting). |
-| `accounts env [name]` | Print `export CLAUDE_CONFIG_DIR=…` |
-| `accounts launch\|run <name>` | Launch tool with profile env. |
-| `accounts shell <name>` | Subshell with profile env. |
+| `accounts env [name] --tool <tool>` | Print one or more `export ...` lines for the profile. |
+| `accounts launch\|run <name> --tool <tool>` | Launch tool with profile env. |
+| `accounts shell <name> --tool <tool>` | Subshell with profile env. |
 | `accounts hook install` | Install `claude()` wrapper — see [docs/hook.md](docs/hook.md). |
 | `accounts hook uninstall` | Remove hook script. |
 | `accounts hook path` | Print hook script path. |
@@ -138,8 +141,14 @@ Overrides: `ACCOUNTS_HOME`, `ACCOUNTS_STORE_PATH`.
 |------|----|---------|-------------|
 | Claude Code | `claude` | `CLAUDE_CONFIG_DIR` | `~/.claude` |
 | Codex CLI | `codex` | `CODEX_HOME` | `~/.codex` |
+| opencode | `opencode` | `OPENCODE_CONFIG_DIR`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME` | `~/.config/opencode` |
+| Cursor Agent | `cursor` | `CURSOR_CONFIG_DIR` | `~/.cursor` |
+| Kimi Code | `kimi` | `KIMI_CODE_HOME` | `~/.kimi-code` |
+| Grok Build | `grok` | `HOME` (process-scoped) | `~/.grok` |
 
 `apply` is **Claude-only** today. Use `launch` / `env` for other tools.
+For Grok Build, prefer `accounts launch` or `accounts shell`; exporting `HOME`
+globally is intentionally not recommended.
 
 ## Library
 
