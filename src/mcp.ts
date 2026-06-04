@@ -2,11 +2,12 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { currentProfile, listProfiles } from "./lib/profiles.js";
+import { currentProfile, getProfile, listProfiles } from "./lib/profiles.js";
 import { appliedProfile } from "./lib/apply.js";
 import { switchProfile, type SwitchMode } from "./lib/switch.js";
 import { listTools } from "./lib/tools.js";
 import { AccountsError } from "./types.js";
+import { listSupervisorStates, sendSupervisorRequest } from "./lib/supervisor.js";
 
 function ok(data: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
@@ -17,7 +18,7 @@ function fail(message: string) {
 }
 
 const server = new Server(
-  { name: "accounts", version: "0.1.4" },
+  { name: "accounts", version: "0.1.5" },
   { capabilities: { tools: {} } },
 );
 
@@ -39,9 +40,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: { type: "object", properties: { tool: { type: "string" } }, required: ["tool"] },
     },
     {
+      name: "supervisor_status",
+      description: "Show accounts-run supervisors that can restart an agent process after profile switches.",
+      inputSchema: { type: "object", properties: { tool: { type: "string" } } },
+    },
+    {
       name: "switch_profile",
       description:
-        "Switch to a profile. For Claude this applies live/default auth. Returns restart/resume handoff command; MCP does not kill the parent agent process.",
+        "Switch to a profile. If the current agent was started with accounts run, the supervisor restarts it under the new profile; otherwise this returns a restart/resume handoff command.",
       inputSchema: {
         type: "object",
         properties: {
@@ -70,16 +76,49 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (typeof tool !== "string") return fail("tool is required");
         return ok({ tool, active: currentProfile(tool) ?? null, applied: appliedProfile(tool) ?? null });
       }
+      case "supervisor_status": {
+        const tool = args["tool"];
+        const states =
+          typeof tool === "string" ? listSupervisorStates().filter((state) => state.tool === tool) : listSupervisorStates();
+        return ok({ supervisors: states });
+      }
       case "switch_profile": {
         const name = args["name"];
         if (typeof name !== "string") return fail("name is required");
+        const profile = getProfile(name, typeof args["tool"] === "string" ? args["tool"] : undefined);
+        const resume = args["resume"] !== false;
+        const switchArgs = Array.isArray(args["args"])
+          ? args["args"].filter((value): value is string => typeof value === "string")
+          : undefined;
+        const supervisor = await sendSupervisorRequest(
+          profile.tool,
+          {
+            type: "switch_profile",
+            name: profile.name,
+            tool: profile.tool,
+            mode: typeof args["mode"] === "string" ? (args["mode"] as SwitchMode) : "auto",
+            resume,
+            args: switchArgs,
+          },
+          { allowMissing: true },
+        );
+        if (supervisor) {
+          if (!supervisor.ok) return fail(supervisor.error);
+          return ok({
+            supervised: true,
+            ...supervisor,
+            instruction:
+              "Profile switch queued. The accounts supervisor will close this agent process and restart it under the selected profile.",
+          });
+        }
         const result = switchProfile(name, {
-          tool: typeof args["tool"] === "string" ? args["tool"] : undefined,
+          tool: profile.tool,
           mode: typeof args["mode"] === "string" ? (args["mode"] as SwitchMode) : "auto",
-          resume: args["resume"] === true,
-          args: Array.isArray(args["args"]) ? args["args"].filter((value): value is string => typeof value === "string") : undefined,
+          resume,
+          args: switchArgs,
         });
         return ok({
+          supervised: false,
           ...result,
           instruction: result.restartRequired
             ? "Exit the current agent session and run commandLine to resume under the selected profile."

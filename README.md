@@ -47,6 +47,11 @@ accounts apply personal
 # Or terminal-only (parallel sessions OK):
 accounts launch work --tool claude
 eval "$(accounts env personal --tool claude)"   # other terminal
+
+# Or supervised: lets MCP switch/restart this Claude process automatically
+accounts use work --tool claude
+accounts run claude --resume
+accounts switch personal --tool claude --supervisor   # from another terminal
 ```
 
 After `accounts login <name> --tool claude`, `accounts` snapshots the auth Claude
@@ -92,6 +97,7 @@ Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
 | `accounts apply <name> --tool claude` | Apply profile auth to live Claude paths (requires snapshot; Claude-only). |
 | `accounts pick` | Interactive picker; default applies. `--env`, `--no-act`. |
 | `accounts switch <name> --tool <tool>` | Switch profile and print a restart/resume command. Add `--resume`; add `--launch` to run it. |
+| `accounts switch <name> --tool <tool> --supervisor` | Ask a running `accounts run <tool>` supervisor to restart under that profile. |
 | `accounts use <name> --tool <tool>` | Mark profile active; prints apply/env hints. |
 | `accounts list` (`ls`) | List profiles (`●` active, `◉` applied, `●◉` both). |
 | `accounts show <name> --tool <tool>` | Profile details including active/applied flags. |
@@ -99,7 +105,11 @@ Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
 | `accounts active [tool]` | Print active profile name (scripting). |
 | `accounts applied [tool]` | Print applied profile name (scripting). |
 | `accounts env [name] --tool <tool>` | Print one or more `export ...` lines for the profile. |
-| `accounts launch\|run <name> --tool <tool>` | Launch tool with profile env. |
+| `accounts launch <name> --tool <tool>` | Launch tool once with profile env. |
+| `accounts run <tool> [args...]` | Run a tool under the supervisor so MCP/CLI can switch and restart it. |
+| `accounts supervisor status [tool]` | Show running supervisors. |
+| `accounts supervisor switch <name> --tool <tool>` | Switch a running supervisor to another profile. |
+| `accounts supervisor stop <tool>` | Stop a running supervisor and its child process. |
 | `accounts shell <name> --tool <tool>` | Subshell with profile env. |
 | `accounts hook install` | Install `claude()` wrapper — see [docs/hook.md](docs/hook.md). |
 | `accounts hook uninstall` | Remove hook script. |
@@ -125,16 +135,29 @@ Add it to Claude/Codex/opencode/Cursor MCP config as a command server named
 - `current_profile`
 - `switch_profile`
 
-`switch_profile` applies Claude live auth when the target profile is Claude and
-returns a restart handoff command. MCP servers cannot safely kill their parent
-agent process, so the tool returns an instruction such as: exit this session and
-run `CLAUDE_CONFIG_DIR=... claude --continue`.
+For automatic agent restarts, start the agent through `accounts run`:
+
+```bash
+accounts use account001 --tool claude
+accounts run claude --resume
+```
+
+When `switch_profile` is called from that Claude session, `accounts-mcp` contacts
+the supervisor. The supervisor applies/switches the profile, closes the current
+Claude process, and restarts it with the selected profile. Claude uses
+`claude --continue`; Codex uses `codex resume --last`; opencode uses
+`opencode --continue`; custom tools can define `resumeArgs`.
+
+If the agent was not started through `accounts run`, MCP falls back to the safe
+handoff behavior and returns a command such as:
+`CLAUDE_CONFIG_DIR=... claude --continue`.
 
 Human equivalent:
 
 ```bash
 accounts switch account001 --tool claude --resume
 accounts switch account001 --tool claude --resume --launch
+accounts switch account001 --tool claude --supervisor
 accounts switch codex-work --tool codex --resume
 accounts switch ops --tool opencode --resume
 ```
@@ -156,6 +179,9 @@ then invokes the real `claude` binary. Full behavior and footguns: [docs/hook.md
 ~/.hasna/accounts/
   accounts.json              # registry: profiles, current, applied (mode 600)
   claude-hook.sh             # optional shell wrapper
+  supervisors/
+    claude.sock              # local control socket for `accounts run claude`
+    claude.json              # supervisor pid/profile/command metadata
   profiles/
     claude/<name>/           # managed config dir
     claude/<name>/.accounts-auth/   # auth snapshots for apply mode
@@ -180,6 +206,8 @@ Overrides: `ACCOUNTS_HOME`, `ACCOUNTS_STORE_PATH`.
 `apply` is **Claude-only** today. Use `launch` / `env` for other tools.
 For Grok Build, prefer `accounts launch` or `accounts shell`; exporting `HOME`
 globally is intentionally not recommended.
+
+Custom tools can join supervised resume switching with `accounts tools add ... --resume-arg <arg>`.
 
 ## Library
 

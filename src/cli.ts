@@ -30,6 +30,14 @@ import { loadStore } from "./storage.js";
 import { formatEnvAssignments, formatExportLines, profileEnv } from "./lib/env.js";
 import { finalizeLogin } from "./lib/login.js";
 import { switchProfile, type SwitchMode } from "./lib/switch.js";
+import {
+  listSupervisorStates,
+  readSupervisorState,
+  resolveSupervisorLaunch,
+  runSupervisedTool,
+  sendSupervisorRequest,
+  type SupervisorState,
+} from "./lib/supervisor.js";
 
 const program = new Command();
 
@@ -39,10 +47,13 @@ function die(message: string): never {
 }
 
 /** Wrap an action so AccountsError surfaces cleanly without a stack trace. */
-function action<A extends unknown[]>(fn: (...args: A) => void) {
+function action<A extends unknown[]>(fn: (...args: A) => void | Promise<void>) {
   return (...args: A) => {
     try {
-      fn(...args);
+      Promise.resolve(fn(...args)).catch((err) => {
+        if (err instanceof AccountsError) die(err.message);
+        throw err;
+      });
     } catch (err) {
       if (err instanceof AccountsError) die(err.message);
       throw err;
@@ -296,30 +307,60 @@ program
   .option("--mode <mode>", "switch mode: auto, apply, env, active", "auto")
   .option("--resume", "include the tool's resume/continue args in the handoff command")
   .option("--launch", "launch the tool after switching")
+  .option("--supervisor", "ask a running accounts supervisor to restart the tool")
   .option("--json", "output JSON")
   .action(
-    action((name: string, args: string[], opts: { tool?: string; mode: SwitchMode; resume?: boolean; launch?: boolean; json?: boolean }) => {
-      const result = switchProfile(name, { tool: opts.tool, mode: opts.mode, resume: opts.resume, args });
-      if (opts.json) {
-        console.log(JSON.stringify(result, null, 2));
-      } else {
-        console.log(chalk.green(`✓ ${result.message}`));
-        if (result.applied) console.log(chalk.dim("  live/default auth updated"));
-        console.log(chalk.dim(`  restart command: ${result.commandLine}`));
-        if (!opts.launch) {
-          console.log(chalk.yellow("  Exit the current agent session, then run the restart command above."));
+    action(
+      async (
+        name: string,
+        args: string[],
+        opts: { tool?: string; mode: SwitchMode; resume?: boolean; launch?: boolean; supervisor?: boolean; json?: boolean },
+      ) => {
+        if (opts.supervisor && opts.launch) die("--supervisor and --launch cannot be used together");
+        if (opts.supervisor) {
+          const profile = getProfile(name, opts.tool);
+          const response = await sendSupervisorRequest(
+            profile.tool,
+            { type: "switch_profile", name: profile.name, tool: profile.tool, mode: opts.mode, resume: opts.resume ?? true, args },
+            { allowMissing: true },
+          );
+          if (!response) {
+            die(`no running accounts supervisor for ${getTool(profile.tool).label}. Start one with \`accounts run ${profile.tool}\`.`);
+          }
+          if (!response.ok) die(response.error);
+          if (opts.json) {
+            console.log(JSON.stringify(response, null, 2));
+          } else if ("queued" in response) {
+            console.log(chalk.green(`✓ queued supervisor switch to ${chalk.bold(response.result.profile.name)}`));
+            console.log(chalk.dim(`  ${response.state.command.join(" ")} will restart in ${response.restartDelayMs}ms`));
+          } else {
+            console.log(chalk.green("✓ supervisor responded"));
+          }
+          return;
         }
-      }
-      if (opts.launch) {
-        const [bin, ...launchArgs] = result.command;
-        const res = spawnSync(bin!, launchArgs, {
-          stdio: "inherit",
-          env: { ...process.env, ...result.env },
-        });
-        if (res.error) die(`failed to launch ${bin}: ${res.error.message}`);
-        process.exit(res.status ?? 0);
-      }
-    }),
+
+        const result = switchProfile(name, { tool: opts.tool, mode: opts.mode, resume: opts.resume, args });
+        if (opts.json) {
+          console.log(JSON.stringify(result, null, 2));
+        } else {
+          console.log(chalk.green(`✓ ${result.message}`));
+          if (result.applied) console.log(chalk.dim("  live/default auth updated"));
+          console.log(chalk.dim(`  restart command: ${result.commandLine}`));
+          if (!opts.launch) {
+            console.log(chalk.yellow("  Exit the current agent session, then run the restart command above."));
+          }
+        }
+        if (opts.launch) {
+          const [bin, ...launchArgs] = result.command;
+          const res = spawnSync(bin!, launchArgs, {
+            stdio: "inherit",
+            env: { ...process.env, ...result.env },
+          });
+          if (res.error) die(`failed to launch ${bin}: ${res.error.message}`);
+          process.exit(res.status ?? 0);
+        }
+      },
+    ),
   );
 
 const hook = program.command("hook").description("install a shell wrapper for claude");
@@ -371,7 +412,6 @@ program
 
 program
   .command("launch")
-  .alias("run")
   .argument("<name>", "profile name")
   .argument("[args...]", "extra args passed to the tool binary")
   .description("launch the tool's binary with the profile's config dir active")
@@ -389,6 +429,104 @@ program
       });
       if (res.error) die(`failed to launch ${tool.bin}: ${res.error.message}`);
       process.exit(res.status ?? 0);
+    }),
+  );
+
+program
+  .command("run")
+  .argument("<target>", "tool id to supervise (claude, codex, opencode...) or a profile name")
+  .argument("[args...]", "extra args passed to the tool binary")
+  .description("run a tool under the accounts supervisor so MCP can switch/restart it")
+  .option("-p, --profile <name>", "profile to run when target is a tool id")
+  .option("-t, --tool <tool>", "tool when target is a profile name")
+  .option("--resume", "start with the tool's resume/continue args")
+  .action(
+    action(async (target: string, args: string[], opts: { profile?: string; tool?: string; resume?: boolean }) => {
+      const plan = resolveSupervisorLaunch(target, { profile: opts.profile, tool: opts.tool });
+      const runArgs = [...(opts.resume ? (plan.tool.resumeArgs ?? []) : []), ...args];
+      console.error(chalk.green(`✓ accounts supervisor running ${plan.tool.label} as ${chalk.bold(plan.profile.name)}`));
+      console.error(chalk.dim(`  control: accounts supervisor status ${plan.tool.id}`));
+      console.error(chalk.dim(`  switch:  accounts switch <profile> --tool ${plan.tool.id} --supervisor`));
+      const code = await runSupervisedTool(plan.profile, plan.tool, runArgs, {
+        log: (message) => console.error(chalk.dim(message)),
+      });
+      process.exit(code);
+    }),
+  );
+
+const supervisor = program.command("supervisor").description("inspect and control accounts-run supervisors");
+
+supervisor
+  .command("status")
+  .argument("[tool]", "tool id")
+  .description("show running supervisor state")
+  .option("--json", "output JSON")
+  .action(
+    action(async (toolId: string | undefined, opts: { json?: boolean }) => {
+      const state = toolId ? readSupervisorState(toolId) : undefined;
+      const states = toolId ? (state ? [state] : []) : listSupervisorStates();
+      const live: Array<SupervisorState & { stale?: boolean }> = [];
+      for (const state of states) {
+        const response = await sendSupervisorRequest(state.tool, { type: "status" }, { allowMissing: true });
+        live.push(response?.ok && "state" in response ? response.state : { ...state, stale: true });
+      }
+      if (opts.json) {
+        console.log(JSON.stringify(live, null, 2));
+        return;
+      }
+      if (live.length === 0) {
+        console.log(chalk.dim("no accounts supervisors running"));
+        return;
+      }
+      for (const state of live) {
+        const stale = "stale" in state ? chalk.yellow(" stale") : "";
+        const child = state.childPid ? ` child:${state.childPid}` : "";
+        console.log(`${chalk.cyan(state.tool.padEnd(10))} ${chalk.bold(state.profile)} pid:${state.pid}${child}${stale}`);
+        console.log(chalk.dim(`  ${state.command.join(" ")}`));
+      }
+    }),
+  );
+
+supervisor
+  .command("switch")
+  .argument("<name>", "profile name")
+  .argument("[args...]", "extra args passed after resume/continue args")
+  .description("switch a running supervisor to another profile")
+  .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
+  .option("--mode <mode>", "switch mode: auto, apply, env, active", "auto")
+  .option("--no-resume", "restart without the tool's resume/continue args")
+  .option("--json", "output JSON")
+  .action(
+    action(async (name: string, args: string[], opts: { tool?: string; mode: SwitchMode; resume?: boolean; json?: boolean }) => {
+      const profile = getProfile(name, opts.tool);
+      const response = await sendSupervisorRequest(
+        profile.tool,
+        { type: "switch_profile", name: profile.name, tool: profile.tool, mode: opts.mode, resume: opts.resume !== false, args },
+        { allowMissing: true },
+      );
+      if (!response) die(`no running accounts supervisor for ${getTool(profile.tool).label}`);
+      if (!response.ok) die(response.error);
+      if (opts.json) {
+        console.log(JSON.stringify(response, null, 2));
+        return;
+      }
+      if ("queued" in response) {
+        console.log(chalk.green(`✓ queued supervisor switch to ${chalk.bold(response.result.profile.name)}`));
+        console.log(chalk.dim(`  restart command: ${response.result.commandLine}`));
+      }
+    }),
+  );
+
+supervisor
+  .command("stop")
+  .argument("<tool>", "tool id")
+  .description("stop a running supervisor and its child process")
+  .action(
+    action(async (toolId: string) => {
+      const response = await sendSupervisorRequest(toolId, { type: "stop" }, { allowMissing: true });
+      if (!response) die(`no running accounts supervisor for ${toolId}`);
+      if (!response.ok) die(response.error);
+      console.log(chalk.green(`✓ stopping ${toolId} supervisor`));
     }),
   );
 
@@ -531,6 +669,7 @@ tools
   .option("--default-dir <path>", "default config dir (default: ~/.<id>)")
   .option("--extra-env <VAR=VALUE...>", "additional env var templates; supports {profileDir}, {profileName}, {toolId}")
   .option("--login-arg <arg...>", "arguments for `accounts login <profile> --tool <id>`")
+  .option("--resume-arg <arg...>", "arguments for supervised resume/restart, e.g. --continue")
   .option("--account-file <file>", "file inside the config dir holding the email")
   .option("--email-path <path>", "dot-path to the email inside that file (e.g. account.email)")
   .action(
@@ -544,6 +683,7 @@ tools
           defaultDir?: string;
           extraEnv?: string[];
           loginArg?: string[];
+          resumeArg?: string[];
           accountFile?: string;
           emailPath?: string;
         },
@@ -562,6 +702,7 @@ tools
           defaultDir: opts.defaultDir ? expandPath(opts.defaultDir) : join(homedir(), `.${id}`),
           ...(Object.keys(extraEnv).length > 0 ? { extraEnv } : {}),
           ...(opts.loginArg ? { loginArgs: opts.loginArg } : {}),
+          ...(opts.resumeArg ? { resumeArgs: opts.resumeArg } : {}),
           ...(opts.accountFile ? { accountFile: opts.accountFile } : {}),
           ...(opts.emailPath ? { emailPath: opts.emailPath.split(".") } : {}),
         };

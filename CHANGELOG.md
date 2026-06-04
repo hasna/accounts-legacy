@@ -6,6 +6,16 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-06-04
+
+### Added
+
+- `accounts run <tool>` supervisor mode. It starts Claude/Codex/opencode/etc. under `accounts` so a profile switch can restart the child process.
+- Supervisor control commands: `accounts supervisor status`, `accounts supervisor switch`, and `accounts supervisor stop`.
+- `accounts switch <profile> --supervisor` to ask a running supervisor to switch/restart the tool from another terminal.
+- MCP `switch_profile` now talks to a running supervisor first; if found, it queues a real close/restart instead of only returning a handoff command.
+- MCP `supervisor_status` tool.
+
 ## [0.1.4] - 2026-06-04
 
 ### Added

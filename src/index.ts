@@ -33,6 +33,24 @@ export { finalizeLogin } from "./lib/login.js";
 export type { FinalizeLoginResult } from "./lib/login.js";
 export { switchProfile } from "./lib/switch.js";
 export type { SwitchMode, SwitchOptions, SwitchResult } from "./lib/switch.js";
+export {
+  listSupervisorStates,
+  readSupervisorState,
+  resolveSupervisorLaunch,
+  runSupervisedTool,
+  sendSupervisorRequest,
+  supervisorDir,
+  supervisorSocketPath,
+  supervisorStatePath,
+} from "./lib/supervisor.js";
+export type {
+  RunSupervisorOptions,
+  SupervisorClientOptions,
+  SupervisorLaunchPlan,
+  SupervisorRequest,
+  SupervisorResponse,
+  SupervisorState,
+} from "./lib/supervisor.js";
 export { pickProfile } from "./lib/pick.js";
 export type { PickOptions, PickResult } from "./lib/pick.js";
 export { installHook, uninstallHook, hookPath, hookScript, shellSnippet } from "./lib/hook.js";
