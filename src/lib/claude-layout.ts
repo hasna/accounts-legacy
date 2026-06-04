@@ -1,0 +1,50 @@
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import type { ToolDef } from "../types.js";
+
+export const CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials";
+export const ACCOUNTS_AUTH_DIR = ".accounts-auth";
+export const OAUTH_SNAPSHOT = "oauth-account.json";
+export const CREDENTIALS_SNAPSHOT = "credentials.json";
+export const KEYCHAIN_SNAPSHOT = "keychain.json";
+
+/** Root directory for live Claude auth files (home or ACCOUNTS_TEST_LIVE_DIR). */
+export function liveClaudeBase(): string {
+  const testBase = process.env.ACCOUNTS_TEST_LIVE_DIR;
+  return testBase && testBase.trim() ? testBase : homedir();
+}
+
+/** Live Claude Code paths (default install, no CLAUDE_CONFIG_DIR). */
+export function liveClaudePaths(): { configDir: string; homeJson: string; credentialsFile: string } {
+  const base = liveClaudeBase();
+  const configDir = join(base, ".claude");
+  return {
+    configDir,
+    homeJson: join(base, ".claude.json"),
+    credentialsFile: join(configDir, ".credentials.json"),
+  };
+}
+
+/** Account JSON paths for a profile config dir (handles parent ~/.claude.json layout). */
+export function profileAccountJsonPaths(profileDir: string, tool: ToolDef): string[] {
+  if (!tool.accountFile) return [];
+  const paths = [join(profileDir, tool.accountFile)];
+  if (profileDir === tool.defaultDir) paths.push(join(dirname(profileDir), tool.accountFile));
+  return paths;
+}
+
+export function profileAuthDir(profileDir: string): string {
+  return join(profileDir, ACCOUNTS_AUTH_DIR);
+}
+
+export function profileOAuthSnapshot(profileDir: string): string {
+  return join(profileAuthDir(profileDir), OAUTH_SNAPSHOT);
+}
+
+export function profileCredentialsSnapshot(profileDir: string): string {
+  return join(profileAuthDir(profileDir), CREDENTIALS_SNAPSHOT);
+}
+
+export function profileKeychainSnapshot(profileDir: string): string {
+  return join(profileAuthDir(profileDir), KEYCHAIN_SNAPSHOT);
+}

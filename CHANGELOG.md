@@ -4,6 +4,49 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Docs/UX aligned with CLI: three-pointer model (`current` / `applied` / isolated), hook guide,
+  `pick` flags, `doctor` stale `current` check, `show` active/applied lines, dual list markers.
+
+## [0.1.2] - 2026-06-04
+
+### Fixed
+
+- Apply lock creates `ACCOUNTS_HOME` before opening `.apply.lock` (fixes ENOENT on fresh installs).
+- `pick --no-act` no longer applies (Commander `act: false` mapping).
+- `loadStore` prunes stale `current` pointers; doctor reports stale `current`.
+- `saveStore` / live writes scoped under `accountsHome()` / live base for macOS `/var` symlink safety.
+
+### Added
+
+- `src/security.test.ts` (11 tests), `docs/IMPLEMENT.md`, `docs/hook.md`.
+
+## [0.1.1] - 2026-06-04
+
+### Fixed
+
+- Apply refuses profiles without auth (no longer deletes live OAuth).
+- Import snapshots auth from the profile dir, not live disk.
+- `rename` / `remove` maintain `store.applied` pointers.
+- macOS keychain restore allowlists `Claude Code-credentials` only.
+- Symlink guard on auth snapshot writes; profile names re-validated on store load.
+- Apply uses an exclusive lock file; hook validates profile names and surfaces apply errors.
+- `doctor` exits 1 on problems; checks stale `applied` pointers.
+
+## [0.1.0] - 2026-06-04
+
+### Added
+
+- **Apply mode** (`accounts apply`) — sync profile auth to live Claude paths for Cursor/VS Code.
+- Auth snapshots under `<profile>/.accounts-auth/` (OAuth, file credentials, macOS keychain).
+- `accounts import`, `accounts login`, `accounts pick` (interactive).
+- `accounts active` / `accounts applied` for scripting.
+- `accounts hook install` — optional `claude()` shell wrapper.
+- Store field `applied` per tool (separate from `current` for env/launch).
+
 ## [0.0.1] - 2026-06-02
 
 ### Added

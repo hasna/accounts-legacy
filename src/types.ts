@@ -43,8 +43,13 @@ export type Profile = z.infer<typeof profileSchema>;
 
 export const storeSchema = z.object({
   version: z.literal(1),
-  /** Map of toolId -> active profile name. */
+  /** Map of toolId -> active profile name (for env/launch/shell). */
   current: z.record(z.string(), z.string()).default({}),
+  /**
+   * Map of toolId -> profile name last applied to the tool's live default paths
+   * (e.g. ~/.claude + ~/.claude.json on disk for IDE use).
+   */
+  applied: z.record(z.string(), z.string()).default({}),
   profiles: z.array(profileSchema).default([]),
   /** User-registered tools (apps) added at runtime, on top of built-ins. */
   tools: z.array(toolDefSchema).default([]),

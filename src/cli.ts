@@ -20,7 +20,13 @@ import {
   updateProfile,
   useProfile,
 } from "./lib/profiles.js";
-import { storePath } from "./storage.js";
+import { accountsHome, storePath } from "./storage.js";
+import { applyProfile, appliedProfile } from "./lib/apply.js";
+import { importProfile, ensureProfileForLogin } from "./lib/import-profile.js";
+import { pickProfile, resolvePickMode } from "./lib/pick.js";
+import { installHook, uninstallHook, shellSnippet, hookPath } from "./lib/hook.js";
+import { profileHasAuth } from "./lib/claude-auth.js";
+import { loadStore } from "./storage.js";
 
 const program = new Command();
 
@@ -41,9 +47,23 @@ function action<A extends unknown[]>(fn: (...args: A) => void) {
   };
 }
 
-function fmtProfile(p: Profile, active: boolean): string {
-  const marker = active ? chalk.green("●") : chalk.dim("○");
-  const name = active ? chalk.green.bold(p.name) : chalk.bold(p.name);
+function fmtProfile(p: Profile, active: boolean, applied = false): string {
+  const marker =
+    active && applied
+      ? chalk.green("●") + chalk.magenta("◉")
+      : active
+        ? chalk.green("●")
+        : applied
+          ? chalk.magenta("◉")
+          : chalk.dim("○");
+  const name =
+    active && applied
+      ? chalk.green.bold(p.name)
+      : active
+        ? chalk.green.bold(p.name)
+        : applied
+          ? chalk.magenta.bold(p.name)
+          : chalk.bold(p.name);
   const tool = chalk.cyan(p.tool);
   const email = p.email ? chalk.yellow(p.email) : chalk.dim("(no email)");
   const desc = p.description ? chalk.dim(` — ${p.description}`) : "";
@@ -93,7 +113,8 @@ program
       }
       for (const p of profiles) {
         const active = currentProfile(p.tool)?.name === p.name;
-        console.log(fmtProfile(p, active));
+        const isApplied = appliedProfile(p.tool)?.name === p.name;
+        console.log(fmtProfile(p, active, isApplied));
       }
     }),
   );
@@ -111,8 +132,11 @@ program
         return;
       }
       const active = currentProfile(p.tool)?.name === p.name;
-      console.log(fmtProfile(p, active));
+      const isApplied = appliedProfile(p.tool)?.name === p.name;
+      console.log(fmtProfile(p, active, isApplied));
       console.log(`  tool:       ${p.tool} (${getTool(p.tool).label})`);
+      console.log(`  active:     ${active ? chalk.green("yes") : chalk.dim("no")}`);
+      console.log(`  applied:    ${isApplied ? chalk.magenta("yes") : chalk.dim("no")}`);
       console.log(`  config dir: ${p.dir}${existsSync(p.dir) ? "" : chalk.red("  [missing]")}`);
       console.log(`  email:      ${p.email ?? chalk.dim("(none)")}`);
       console.log(`  created:    ${p.createdAt}`);
@@ -130,8 +154,151 @@ program
       const tool = getTool(toolId);
       console.log(chalk.green(`✓ ${chalk.bold(profile.name)} is now the active ${tool.label} profile`));
       console.log(chalk.dim("  this CLI can't change your current shell's env, so either:"));
-      console.log(`    eval "$(accounts env ${profile.name})"        ${chalk.dim("# export into this shell")}`);
+      console.log(`    accounts apply ${profile.name}                 ${chalk.dim("# IDE: sync auth to ~/.claude")}`);
+      console.log(`    eval "$(accounts env ${profile.name})"        ${chalk.dim("# terminal: isolated config dir")}`);
       console.log(`    accounts launch ${profile.name}                ${chalk.dim("# launch " + tool.bin + " with it")}`);
+    }),
+  );
+
+program
+  .command("apply")
+  .argument("<name>", "profile name")
+  .description("apply profile auth to live ~/.claude paths (requires login/snapshot; Claude-only)")
+  .action(
+    action((name: string) => {
+      const { profile, previous } = applyProfile(name);
+      console.log(chalk.green(`✓ applied ${chalk.bold(profile.name)} to live ${getTool(profile.tool).label} paths`));
+      if (previous) console.log(chalk.dim(`  previous applied profile "${previous}" was snapshotted`));
+      if (profile.email) console.log(chalk.dim(`  email: ${profile.email}`));
+    }),
+  );
+
+program
+  .command("import")
+  .argument("[name]", "profile name (default: main)")
+  .description("import an existing config dir (default: ~/.claude) as a profile")
+  .option("-t, --tool <tool>", "tool the profile is for", DEFAULT_TOOL)
+  .option("-d, --dir <path>", "config dir to import (default: tool default dir)")
+  .option("-e, --email <email>", "account email")
+  .option("--description <text>", "description")
+  .option("--copy", "copy into a managed profile dir instead of referencing the source")
+  .action(
+    action((name: string | undefined, opts: { tool: string; dir?: string; email?: string; description?: string; copy?: boolean }) => {
+      const p = importProfile({
+        name: name ?? "main",
+        tool: opts.tool,
+        dir: opts.dir,
+        email: opts.email,
+        description: opts.description,
+        copy: opts.copy,
+      });
+      console.log(chalk.green(`✓ imported profile ${chalk.bold(p.name)}`));
+      console.log(`  config dir: ${p.dir}`);
+      console.log(`  email:      ${p.email ?? chalk.dim("(none)")}`);
+      console.log(chalk.dim(`  next: accounts login ${p.name}  OR  accounts apply ${p.name}`));
+    }),
+  );
+
+program
+  .command("login")
+  .argument("<name>", "profile name")
+  .description("launch Claude Code in an isolated profile dir to run /login (OAuth)")
+  .option("-t, --tool <tool>", "tool", DEFAULT_TOOL)
+  .action(
+    action((name: string, opts: { tool: string }) => {
+      const profile = ensureProfileForLogin(name, opts.tool);
+      const tool = getTool(profile.tool);
+      useProfile(name);
+      console.log(chalk.green(`→ launching ${tool.bin} for profile ${chalk.bold(name)}`));
+      console.log(chalk.dim(`  config dir: ${profile.dir}`));
+      console.log(chalk.yellow("  In Claude, run /login to authenticate. Then /exit when done."));
+      console.log(chalk.dim(`  Then: accounts detect ${name}  &&  accounts apply ${name}`));
+      const res = spawnSync(tool.bin, [], {
+        stdio: "inherit",
+        env: { ...process.env, [tool.envVar]: profile.dir },
+      });
+      if (res.error) die(`failed to launch ${tool.bin}: ${res.error.message}`);
+      process.exit(res.status ?? 0);
+    }),
+  );
+
+program
+  .command("pick")
+  .description("interactively choose a profile (default: mark active and apply to live Claude paths)")
+  .option("-t, --tool <tool>", "filter by tool", DEFAULT_TOOL)
+  .option("--env", "print env export after selection instead of apply")
+  .option("--no-act", "only mark active (store current); do not apply or print env")
+  .action(
+    action(async (opts: { tool: string; env?: boolean; act?: boolean }) => {
+      const result = await pickProfile({ tool: opts.tool, mode: resolvePickMode(opts) });
+      if (!result) return;
+      useProfile(result.profile.name);
+      console.log(chalk.green(`✓ selected ${chalk.bold(result.profile.name)}`));
+      if (result.mode === "apply") {
+        applyProfile(result.profile.name);
+        console.log(chalk.dim("  applied to live Claude paths"));
+      } else if (result.mode === "env") {
+        const tool = getTool(result.profile.tool);
+        console.log(`export ${tool.envVar}=${JSON.stringify(result.profile.dir)}`);
+      }
+    }),
+  );
+
+program
+  .command("active")
+  .argument("[tool]", "tool id (default: claude)")
+  .description("print the active profile name (for scripting)")
+  .action(
+    action((toolId: string | undefined) => {
+      const tool = toolId ?? DEFAULT_TOOL;
+      const p = currentProfile(tool);
+      if (!p) die(`no active profile for "${tool}". Run \`accounts use <name>\` first.`);
+      console.log(p.name);
+    }),
+  );
+
+program
+  .command("applied")
+  .argument("[tool]", "tool id (default: claude)")
+  .description("print the applied profile name (live auth on disk)")
+  .action(
+    action((toolId: string | undefined) => {
+      const tool = toolId ?? DEFAULT_TOOL;
+      const p = appliedProfile(tool);
+      if (!p) die(`no applied profile for "${tool}". Run \`accounts apply <name>\` first.`);
+      console.log(p.name);
+    }),
+  );
+
+const hook = program.command("hook").description("install a shell wrapper for claude");
+
+hook
+  .command("install")
+  .description(`write ${join(accountsHome(), "claude-hook.sh")}`)
+  .action(
+    action(() => {
+      const { path, created } = installHook();
+      console.log(chalk.green(created ? `✓ installed hook at ${path}` : `✓ updated hook at ${path}`));
+      console.log(chalk.dim(`  add to ~/.zshrc:  ${shellSnippet()}`));
+    }),
+  );
+
+hook
+  .command("uninstall")
+  .description("remove the accounts claude hook script")
+  .action(
+    action(() => {
+      if (uninstallHook()) console.log(chalk.green("✓ removed hook script"));
+      else console.log(chalk.yellow("no accounts hook script to remove"));
+    }),
+  );
+
+hook
+  .command("path")
+  .description("print the hook script path")
+  .action(
+    action(() => {
+      console.log(hookPath());
     }),
   );
 
@@ -198,8 +365,10 @@ program
       const tools = opts.tool ? [getTool(opts.tool)] : listTools();
       for (const tool of tools) {
         const p = currentProfile(tool.id);
+        const a = appliedProfile(tool.id);
         const val = p ? `${chalk.green.bold(p.name)}${p.email ? chalk.dim(" (" + p.email + ")") : ""}` : chalk.dim("(none)");
-        console.log(`${chalk.cyan(tool.label.padEnd(14))} ${val}`);
+        const appliedVal = a && a.name !== p?.name ? chalk.magenta(` → applied: ${a.name}`) : a ? chalk.magenta(" (applied)") : "";
+        console.log(`${chalk.cyan(tool.label.padEnd(14))} ${val}${appliedVal}`);
       }
     }),
   );
@@ -335,10 +504,11 @@ tools
 
 program
   .command("doctor")
-  .description("check the store and profile dirs for problems")
+  .description("check the store and profile dirs for problems (exits 1 if any)")
   .action(
     action(() => {
       console.log(chalk.bold(`store: ${storePath()}`));
+      const store = loadStore();
       const profiles = listProfiles();
       let problems = 0;
       for (const p of profiles) {
@@ -347,14 +517,45 @@ program
         if (missing) {
           console.log(chalk.red(`  ✗ ${p.name}: config dir missing (${p.dir})`));
           problems++;
-        }
-        if (noEmail) {
+        } else if (p.tool === "claude" && !profileHasAuth(p.dir, getTool("claude"))) {
+          console.log(chalk.yellow(`  ! ${p.name}: no auth snapshot (run login + detect before apply)`));
+        } else if (!noEmail) {
+          console.log(chalk.green(`  ✓ ${p.name}`));
+        } else {
           console.log(chalk.yellow(`  ! ${p.name}: no email recorded`));
         }
-        if (!missing && !noEmail) console.log(chalk.green(`  ✓ ${p.name}`));
+      }
+      for (const [toolId, appliedName] of Object.entries(store.applied)) {
+        if (!profiles.some((p) => p.name === appliedName && p.tool === toolId)) {
+          console.log(chalk.red(`  ✗ stale applied.${toolId}: "${appliedName}" (profile missing)`));
+          problems++;
+        }
+      }
+      for (const [toolId, currentName] of Object.entries(store.current)) {
+        if (!profiles.some((p) => p.name === currentName && p.tool === toolId)) {
+          console.log(chalk.red(`  ✗ stale current.${toolId}: "${currentName}" (profile missing)`));
+          problems++;
+        }
+      }
+      const driftWarned = new Set<string>();
+      for (const p of profiles) {
+        const active = store.current[p.tool];
+        const applied = store.applied[p.tool];
+        if (active && applied && active !== applied && !driftWarned.has(p.tool)) {
+          driftWarned.add(p.tool);
+          console.log(
+            chalk.yellow(
+              `  ! ${p.tool}: active (${active}) ≠ applied (${applied}) — Cursor/IDE use applied; run \`accounts apply ${active}\``,
+            ),
+          );
+        }
       }
       if (profiles.length === 0) console.log(chalk.dim("  no profiles."));
-      console.log(problems === 0 ? chalk.green("\nhealthy.") : chalk.red(`\n${problems} problem(s) found.`));
+      if (problems > 0) {
+        console.log(chalk.red(`\n${problems} problem(s) found.`));
+        process.exit(1);
+      }
+      console.log(chalk.green("\nhealthy."));
     }),
   );
 

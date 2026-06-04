@@ -19,15 +19,28 @@ bun run dev -- --help   # run the CLI from source
 
 ```
 src/
-  types.ts          - types, zod schemas, error class
-  storage.ts        - JSON registry under ~/.hasna/accounts/
+  types.ts              - types, zod schemas, error class
+  storage.ts            - JSON registry under ~/.hasna/accounts/
   lib/
-    tools.ts        - built-in + runtime-registered tools (apps)
-    detect.ts       - email auto-detection from a tool's account file
-    profiles.ts     - profile business logic
-  cli.ts            - commander CLI (the `accounts` binary)
-  index.ts          - library re-exports
-  accounts.test.ts  - tests (bun:test)
+    tools.ts            - built-in + runtime-registered tools
+    detect.ts           - email auto-detection
+    profiles.ts         - profile CRUD, current pointer
+    apply.ts            - apply mode, applied pointer
+    apply-lock.ts       - exclusive apply lock
+    claude-auth.ts      - auth snapshots + restore
+    claude-layout.ts    - live vs profile paths
+    import-profile.ts   - import / login
+    pick.ts             - interactive picker
+    hook.ts             - shell wrapper
+    safe-path.ts        - symlink guards on auth writes
+    keychain.ts         - macOS keychain (allowlisted service)
+  cli.ts                - commander CLI (the `accounts` binary)
+  index.ts              - library re-exports
+  accounts.test.ts      - core tests
+  switcher.test.ts      - apply/import/hook integration tests
+docs/
+  IMPLEMENT.md          - three-pointer model + module map
+  hook.md               - shell hook behavior and footguns
 ```
 
 ## Adding support for a new app

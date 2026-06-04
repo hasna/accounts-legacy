@@ -1,38 +1,46 @@
 # AGENTS.md — @hasna/accounts
 
-Short guide for AI coding agents working in this repo.
-
 ## What this is
 
-A local-first CLI to manage multiple **profiles/accounts** for AI coding tools
-(Claude Code, Codex, and any app registered at runtime). A profile = an isolated config
-dir (pointed at by an env var like `CLAUDE_CONFIG_DIR`) + a remembered email.
+Local-first CLI to manage **profiles** for AI coding tools (Claude Code primary).
+Each profile = isolated config dir + optional auth snapshots for **apply mode**.
 
-## Conventions
+## Three-pointer model
 
-- **Bun + TypeScript, ESM.** Use `bun install`, `bun test`, `bun run build`.
-- Strict TS (`noUncheckedIndexedAccess`, `noUnusedLocals`). Validate input with `zod`.
-- CLI built with `commander`, colors with `chalk`. **CLI only — no web/server/MCP.**
-- State lives in `~/.hasna/accounts/accounts.json` (override with `ACCOUNTS_HOME` /
-  `ACCOUNTS_STORE_PATH` — used by tests for isolation).
+See [docs/IMPLEMENT.md](docs/IMPLEMENT.md). Short version:
+
+| Pointer | Store key | CLI |
+|---------|-----------|-----|
+| Active | `current[toolId]` | `use`, `active`, `pick` (always sets active) |
+| Applied | `applied[toolId]` | `apply`, `applied`, `pick` (default also applies) |
+| Isolated | (none) | `env`, `launch`, `shell` — env var only |
+
+- **`use` ≠ IDE auth** — only updates `current`. Cursor reads live `~/.claude` via **applied**.
+- **`apply`** — Claude-only; requires auth snapshot; updates `applied` + `current`.
+- **Shell hook** — syncs active→applied before terminal `claude`; see [docs/hook.md](docs/hook.md).
+
+## Switching modes
+
+1. **Isolated** — set `CLAUDE_CONFIG_DIR` via `launch` / `env` / `shell`. Parallel terminals OK.
+2. **Apply** — `accounts apply <name>` copies auth snapshots to live `~/.claude` + `~/.claude.json`
+   (+ macOS Keychain via `security`). For Cursor / VS Code.
+
+Auth snapshots live under `<profile-dir>/.accounts-auth/`.
 
 ## Layout
 
-- `src/types.ts` — types, zod schemas, `AccountsError`.
-- `src/storage.ts` — load/save the JSON registry.
-- `src/lib/tools.ts` — `BUILTIN_TOOLS` + runtime custom tools.
-- `src/lib/detect.ts` — email auto-detection.
-- `src/lib/profiles.ts` — profile CRUD + active-profile logic.
-- `src/cli.ts` — the `accounts` binary.
+- `src/lib/profiles.ts` — CRUD + `current` / `useProfile`
+- `src/lib/apply.ts` — apply + `applied` pointer in store
+- `src/lib/claude-auth.ts` — snapshot/restore OAuth, credentials, keychain
+- `src/lib/import-profile.ts` — `import` / `login` helpers
+- `src/lib/pick.ts` — interactive picker (`apply` | `env` | `none`)
+- `src/lib/hook.ts` — shell wrapper install
+- `src/cli.ts` — `accounts` binary
 
 ## Before you finish
 
-1. `bun run typecheck` — clean.
-2. `bun test` — all green (never weaken a test to pass).
-3. `bun run build` — succeeds.
-4. Smoke-test the built binary: `ACCOUNTS_HOME=$(mktemp -d) node dist/cli.js <cmd>`.
+1. `bun run typecheck`
+2. `bun test` (uses `ACCOUNTS_HOME` + `ACCOUNTS_TEST_LIVE_DIR` in tests)
+3. `bun run build`
 
-## Adding a new app
-
-Prefer runtime registration (`accounts tools add`). For a built-in, add to
-`BUILTIN_TOOLS` with `accountFile` + `emailPath` if the app stores its account email.
+Tests must not touch the user's real `~/.claude` — `ACCOUNTS_TEST_LIVE_DIR` redirects live paths.

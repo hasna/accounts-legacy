@@ -56,6 +56,9 @@ export function addProfile(opts: AddOptions): Profile {
   }
 
   const dir = opts.dir ? expandPath(opts.dir) : join(profilesDir(), toolId, name);
+  if (store.profiles.some((p) => p.dir === dir)) {
+    throw new AccountsError(`a profile already uses config dir ${dir}`);
+  }
   mkdirSync(dir, { recursive: true });
 
   const email = opts.email ?? detectEmail(dir, tool);
@@ -81,6 +84,7 @@ export function removeProfile(name: string, purge = false): { profile: Profile; 
 
   store.profiles.splice(idx, 1);
   if (store.current[profile.tool] === name) delete store.current[profile.tool];
+  if (store.applied[profile.tool] === name) delete store.applied[profile.tool];
   saveStore(store);
 
   let purged = false;
@@ -108,6 +112,7 @@ export function renameProfile(oldName: string, newName: string): Profile {
   if (store.profiles.some((p) => p.name === newName)) throw new AccountsError(`a profile named "${newName}" already exists`);
 
   if (store.current[profile.tool] === oldName) store.current[profile.tool] = newName;
+  if (store.applied[profile.tool] === oldName) store.applied[profile.tool] = newName;
   profile.name = newName;
   saveStore(store);
   return profile;

@@ -1,0 +1,61 @@
+# Implementation guide — `@hasna/accounts`
+
+For contributors and coding agents working in this repo.
+
+## Three-pointer model
+
+Each tool (e.g. `claude`) tracks **two registry pointers** plus an optional **isolated runtime** mode:
+
+| Pointer / mode | Store field | CLI surface | What it controls |
+|----------------|-------------|-------------|------------------|
+| **Active** (intent) | `store.current[toolId]` | `accounts use`, `accounts active`, `accounts pick` (always), `launch`/`shell` | Which profile you mean for terminal workflows and the shell hook |
+| **Applied** (live auth) | `store.applied[toolId]` | `accounts apply`, `accounts applied`, `accounts pick` (default) | OAuth/credentials on live `~/.claude` paths (what Cursor/VS Code read) |
+| **Isolated** (no pointer) | — | `accounts env`, `accounts launch`, `accounts shell` | `CLAUDE_CONFIG_DIR` (or tool env var) for one process/shell only |
+
+**Rules:**
+
+- `accounts use` updates **active** only — it does **not** change IDE auth.
+- `accounts apply` updates **applied** and also sets **active** to the same profile.
+- `accounts pick` defaults to **active + apply**; use `--env` or `--no-act` for other modes.
+- The shell hook compares **active** vs **applied** and runs `accounts apply` when they differ ([hook docs](./hook.md)).
+
+Registry file: `~/.hasna/accounts/accounts.json` (fields `current` and `applied`, not `active`).
+
+## Key modules
+
+| Path | Role |
+|------|------|
+| `src/storage.ts` | `ACCOUNTS_HOME`, load/save store, sanitize stale pointers |
+| `src/lib/profiles.ts` | CRUD, `useProfile` → `current`, rename/remove pointer hygiene |
+| `src/lib/apply.ts` | `applyProfile`, `applied` pointer, live path sync |
+| `src/lib/claude-auth.ts` | Auth snapshots under `<profile>/.accounts-auth/` |
+| `src/lib/import-profile.ts` | `import` / `login` |
+| `src/lib/pick.ts` | Interactive picker |
+| `src/lib/hook.ts` | `claude-hook.sh` generator |
+| `src/cli.ts` | Commander CLI |
+
+## Apply safety
+
+- Refuse apply when the profile has no auth snapshot and no oauth in the profile dir.
+- Never delete live oauth unless replacing with target profile auth.
+- Exclusive lock: `src/lib/apply-lock.ts`.
+- Live paths in tests: set `ACCOUNTS_TEST_LIVE_DIR` (never touch real `~/.claude`).
+
+## Doctor
+
+`accounts doctor` exits **1** when:
+
+- A profile config dir is missing
+- `applied.<tool>` or `current.<tool>` points at a removed profile
+
+Warnings (exit 0): no email, no auth snapshot, active ≠ applied drift.
+
+## Tests
+
+```bash
+bun test
+bun run typecheck
+bun run build
+```
+
+Use isolated `ACCOUNTS_HOME` and `ACCOUNTS_TEST_LIVE_DIR` in every test (`accounts.test.ts`, `switcher.test.ts`).

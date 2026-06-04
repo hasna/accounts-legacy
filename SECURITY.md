@@ -4,6 +4,7 @@
 
 | Version | Supported |
 |---------|-----------|
+| 0.1.x   | Yes       |
 | 0.0.x   | Yes       |
 
 ## Reporting a Vulnerability
@@ -27,14 +28,16 @@ telemetry, and has no server component.
 
 - Profile names, the tool each targets, an optional account **email**, the config-dir
   path, and timestamps.
-- It does **not** store passwords, API keys, or OAuth tokens. Those remain wherever the
-  underlying tool keeps them (e.g. the OS keychain or the tool's own config dir).
+- **Apply mode** may store auth **snapshots** under `<profile-dir>/.accounts-auth/`
+  (OAuth account JSON, file credentials, and on macOS a copy of the Keychain payload).
+  Treat profile directories and `~/.hasna/accounts/accounts.json` as sensitive — same
+  trust level as `~/.claude` or SSH keys.
 
-### Email detection
+### Email detection and apply mode
 
-Email auto-detection only **reads** a tool's existing account file (e.g.
-`~/.claude/.claude.json`) to record which account a profile belongs to. It never writes
-to those files.
+Email auto-detection **reads** a tool's account file. **`accounts apply`** **writes**
+to live `~/.claude` paths and may update the macOS Keychain entry
+`Claude Code-credentials`. Only run apply on profile dirs you trust.
 
 ### Launching tools
 

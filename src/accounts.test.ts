@@ -14,7 +14,7 @@ import {
   removeProfile,
   redetectEmail,
 } from "./lib/profiles.js";
-import { loadStore } from "./storage.js";
+import { loadStore, saveStore } from "./storage.js";
 import { detectEmail } from "./lib/detect.js";
 import { getTool, listTools, addCustomTool, removeCustomTool, isBuiltinTool } from "./lib/tools.js";
 import { AccountsError } from "./types.js";
@@ -216,6 +216,38 @@ test("custom tools: cannot remove while in use, can after", () => {
 
 test("custom tools: removing a built-in throws", () => {
   expect(() => removeCustomTool("claude")).toThrow(AccountsError);
+});
+
+test("remove clears applied pointer", () => {
+  addProfile({ name: "work", email: "w@example.com" });
+  useProfile("work");
+  const store = loadStore();
+  store.applied = { claude: "work" };
+  saveStore(store);
+  removeProfile("work");
+  expect(loadStore().applied.claude).toBeUndefined();
+});
+
+test("rename updates applied pointer", () => {
+  addProfile({ name: "work" });
+  const store = loadStore();
+  store.applied = { claude: "work" };
+  saveStore(store);
+  renameProfile("work", "job");
+  expect(loadStore().applied.claude).toBe("job");
+});
+
+test("loadStore prunes stale current and applied pointers", () => {
+  addProfile({ name: "work" });
+  addProfile({ name: "codexprof", tool: "codex" });
+  const store = loadStore();
+  store.current = { claude: "ghost", codex: "codexprof" };
+  store.applied = { claude: "ghost" };
+  saveStore(store);
+  const reloaded = loadStore();
+  expect(reloaded.current.claude).toBeUndefined();
+  expect(reloaded.applied.claude).toBeUndefined();
+  expect(reloaded.current.codex).toBe("codexprof");
 });
 
 test("explicit dir is honored and created", () => {

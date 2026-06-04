@@ -25,3 +25,20 @@ export {
   currentProfile,
 } from "./lib/profiles.js";
 export type { AddOptions, UpdateOptions } from "./lib/profiles.js";
+export { applyProfile, appliedProfile } from "./lib/apply.js";
+export { importProfile, ensureProfileForLogin } from "./lib/import-profile.js";
+export type { ImportOptions } from "./lib/import-profile.js";
+export { pickProfile } from "./lib/pick.js";
+export type { PickOptions, PickResult } from "./lib/pick.js";
+export { installHook, uninstallHook, hookPath, hookScript, shellSnippet } from "./lib/hook.js";
+export {
+  snapshotClaudeAuthToProfile,
+  snapshotLiveAuthToProfile,
+  restoreClaudeAuthFromProfile,
+  ensureProfileAuthSnapshot,
+  hasAuthSnapshot,
+  profileHasAuth,
+} from "./lib/claude-auth.js";
+export { withApplyLock } from "./lib/apply-lock.js";
+export { isSafeProfileName } from "./lib/hook.js";
+export { readClaudeKeychain, keychainSupported } from "./lib/keychain.js";

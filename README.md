@@ -1,88 +1,136 @@
 # @hasna/accounts
 
 > Manage and switch between multiple **Claude Code** (and other AI coding tool)
-> profiles/accounts on one machine — isolated config dirs, a remembered email per
-> account, and one-command switching.
+> profiles/accounts on one machine — isolated config dirs, IDE-friendly apply mode,
+> and one-command switching.
 
-`accounts` is a small, local-first CLI. Each **profile** is an isolated config
-directory that a tool reads via an environment variable (Claude Code uses
-`CLAUDE_CONFIG_DIR`, Codex uses `CODEX_HOME`). `accounts` tracks those profiles,
-remembers which **email** each one belongs to, and switches between them — so you can
-run a work account and a personal account side by side without logging in and out.
+`accounts` is a local-first CLI. Each **profile** is an isolated config directory.
+Switch **in the terminal** with `CLAUDE_CONFIG_DIR`, or **in Cursor / VS Code** with
+`accounts apply` (syncs auth to live `~/.claude` paths).
 
-- 🗂️ **Isolated profiles** — every profile gets its own config dir (skills, settings,
-  sessions, memory). Nothing leaks between accounts.
-- 📧 **Remembers the email** — auto-detected from the tool's account file when
-  available, or set it yourself.
-- 🔀 **One-command switching** — `accounts launch work` starts the tool with the right
-  config dir; `eval "$(accounts env work)"` exports it into your shell.
-- 🧰 **Multi-tool** — Claude Code today, Codex too; trivially extensible.
-- 🪶 **Local-first, no web** — a single JSON registry under `~/.hasna/accounts/`. No
-  servers, no telemetry.
+- **Isolated profiles** — separate config dirs (skills, settings, sessions). Nothing leaks.
+- **Apply mode** — sync OAuth / credentials to live paths for IDEs (Claude-only today).
+- **Remembers the email** — auto-detected from `.claude.json` when possible.
+- **Multi-tool** — Claude Code built-in; Codex + custom tools via `accounts tools add`.
+- **Local-first** — registry at `~/.hasna/accounts/`. No network, no telemetry.
 
 ## Install
 
 ```bash
-bun install -g @hasna/accounts   # or: npm install -g @hasna/accounts
+bun install -g @hasna/accounts
 accounts --help
 ```
 
 Requires Node ≥ 18 (or Bun ≥ 1.0).
 
-## Quick start
+## Quick start (two Claude subscriptions)
 
 ```bash
-# Create a profile (config dir is created for you)
-accounts add work --email work@company.com --description "Work account"
+# 1. Import your current install (optional)
+accounts import main --dir ~/.claude
+
+# 2. Create profiles
+accounts add work --email work@company.com
 accounts add personal --email me@gmail.com
 
-# Import an existing config dir (email auto-detected from .claude.json)
-accounts add main --dir ~/.claude
+# 3. Log in once per profile (isolated dir)
+accounts login work        # run /login inside Claude, then /exit
+accounts detect work
+accounts login personal
+accounts detect personal
 
-# See what you have
-accounts list
-accounts current
+# 4. Switch
+accounts apply work        # Cursor / VS Code — live ~/.claude auth
+accounts apply personal
 
-# Use one — pick whichever fits your shell workflow:
-accounts launch work             # start `claude` with work's config dir
-eval "$(accounts env work)"      # export CLAUDE_CONFIG_DIR into THIS shell
-accounts shell work              # open a subshell with it set
+# Or terminal-only (parallel sessions OK):
+accounts launch work
+eval "$(accounts env personal)"   # other terminal
 ```
 
-### Why three ways to "switch"?
+Do **not** run `accounts apply` until after `accounts login` and `accounts detect` — apply
+refuses profiles without an auth snapshot so live OAuth is not wiped.
 
-A child process (this CLI) can't mutate its parent shell's environment. So:
+## Three pointers (active, applied, isolated)
 
-| You want… | Use |
-|-----------|-----|
-| To just run the tool now with a profile | `accounts launch <name> [-- args]` |
-| The profile active for the rest of this shell | `eval "$(accounts env <name>)"` |
-| A throwaway subshell scoped to a profile | `accounts shell <name>` |
+| Pointer / mode | Set by | Meaning |
+|----------------|--------|---------|
+| **Active** | `accounts use`, `launch`, `pick` | Registry `current` — which profile you intend (terminal + hook) |
+| **Applied** | `accounts apply`, `pick` (default) | Registry `applied` — auth on live `~/.claude` (what Cursor sees) |
+| **Isolated** | `env`, `launch`, `shell` | Per-process `CLAUDE_CONFIG_DIR`; does not change live disk |
 
-`accounts use <name>` records the active profile (shown in `list`/`current`) and prints
-the two activation options.
+| Mode | Command | Best for |
+|------|---------|----------|
+| **Isolated** | `accounts launch`, `accounts env`, `accounts shell` | Terminal, two accounts at once |
+| **Apply** | `accounts apply <name>` | Cursor, VS Code, single global auth |
+| **Picker** | `accounts pick` | Interactive choose; default applies to live paths |
+
+`accounts use` alone does **not** change Cursor — run `accounts apply` for IDE auth.
+
+A child process cannot change your parent shell — use `eval "$(accounts env …)"` or the
+[shell hook](docs/hook.md) (terminal `claude` only, not IDE extensions).
+
+Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
+
+## Switching modes (summary)
+
+- **`accounts active`** — prints active profile (`store.current`); scripting.
+- **`accounts applied`** — prints applied profile (`store.applied`); scripting.
+- **`accounts current`** — human-readable active (+ applied hint) per tool.
+- **`accounts list`** — `●` active, `◉` applied, `●◉` when both are the same profile.
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
 | `accounts add <name>` | Create a profile. `--tool`, `--email`, `--dir`, `--description`. |
-| `accounts list` (`ls`) | List profiles. `--tool`, `--json`. |
-| `accounts show <name>` | Full details. `--json`. |
-| `accounts use <name>` | Mark a profile active for its tool. |
-| `accounts env [name]` | Print `export VAR=dir` (for `eval`). `--tool` when no name. |
-| `accounts launch <name> [-- args]` (`run`) | Launch the tool's binary with the profile. |
-| `accounts shell <name>` | Open a subshell with the profile's env set. |
-| `accounts current` | Show the active profile per tool. `--tool`. |
-| `accounts set <name>` | Update `--email`, `--description`, `--dir`. |
-| `accounts detect <name>` | Re-detect the email from the profile's config dir. |
-| `accounts rename <old> <new>` | Rename a profile. |
-| `accounts remove <name>` (`rm`) | Remove a profile. `--purge` deletes the managed dir. |
-| `accounts path <name>` | Print just the config dir (for scripting). |
-| `accounts tools` | List supported tools. `--json`. |
-| `accounts tools add <id>` | Register a custom app. `--label`, `--env-var`, `--bin`, `--default-dir`, `--account-file`, `--email-path`. |
-| `accounts tools remove <id>` | Remove a custom tool. |
-| `accounts doctor` | Check the registry and profile dirs. |
+| `accounts import [name]` | Import existing config dir (default `~/.claude`). `--copy` for managed copy. |
+| `accounts login <name>` | Launch Claude in profile dir for `/login` (creates profile via import if missing). |
+| `accounts apply <name>` | Apply profile auth to live Claude paths (requires snapshot; Claude-only). |
+| `accounts pick` | Interactive picker; default applies. `--env`, `--no-act`. |
+| `accounts use <name>` | Mark profile active; prints apply/env hints. |
+| `accounts list` (`ls`) | List profiles (`●` active, `◉` applied, `●◉` both). |
+| `accounts show <name>` | Profile details including active/applied flags. |
+| `accounts current` | Active profile per tool (with applied hint). |
+| `accounts active [tool]` | Print active profile name (scripting). |
+| `accounts applied [tool]` | Print applied profile name (scripting). |
+| `accounts env [name]` | Print `export CLAUDE_CONFIG_DIR=…` |
+| `accounts launch\|run <name>` | Launch tool with profile env. |
+| `accounts shell <name>` | Subshell with profile env. |
+| `accounts hook install` | Install `claude()` wrapper — see [docs/hook.md](docs/hook.md). |
+| `accounts hook uninstall` | Remove hook script. |
+| `accounts hook path` | Print hook script path. |
+| `accounts detect <name>` | Re-detect email from config dir. |
+| `accounts doctor` | Check registry and dirs (exits 1 on errors). |
+
+See `accounts --help` for `set`, `rename`, `remove`, `tools`, etc.
+
+## Shell hook (optional)
+
+```bash
+accounts hook install
+# Add to ~/.zshrc or ~/.bashrc:
+source "$(accounts hook path)"
+```
+
+The wrapper runs `accounts apply` when the **active** profile differs from **applied**,
+then invokes the real `claude` binary. Full behavior and footguns: [docs/hook.md](docs/hook.md).
+
+## Storage layout
+
+```
+~/.hasna/accounts/
+  accounts.json              # registry: profiles, current, applied (mode 600)
+  claude-hook.sh             # optional shell wrapper
+  profiles/
+    claude/<name>/           # managed config dir
+    claude/<name>/.accounts-auth/   # auth snapshots for apply mode
+      oauth-account.json
+      credentials.json       # Linux / file-based auth
+      keychain.json          # macOS keychain payload
+```
+
+Overrides: `ACCOUNTS_HOME`, `ACCOUNTS_STORE_PATH`.
 
 ## Supported tools
 
@@ -91,77 +139,12 @@ the two activation options.
 | Claude Code | `claude` | `CLAUDE_CONFIG_DIR` | `~/.claude` |
 | Codex CLI | `codex` | `CODEX_HOME` | `~/.codex` |
 
-Email auto-detection currently reads `<dir>/.claude.json → oauthAccount.emailAddress`
-for Claude Code. For other tools, set the email with `--email` / `accounts set`.
+`apply` is **Claude-only** today. Use `launch` / `env` for other tools.
 
-Add a profile for a specific tool with `--tool`:
-
-```bash
-accounts add work-codex --tool codex --email work@company.com
-accounts launch work-codex
-```
-
-### Register any app at runtime (scalable)
-
-`accounts` isn't limited to the built-ins. Any app that reads its config dir from an
-environment variable can be registered as a tool — no code change, persisted in your
-store:
-
-```bash
-accounts tools add cursor \
-  --label "Cursor" \
-  --env-var CURSOR_CONFIG_DIR \
-  --bin cursor \
-  --account-file .cursor.json \
-  --email-path account.email     # optional: where to auto-detect the email
-
-accounts add design --tool cursor --email design@company.com
-accounts launch design           # runs `cursor` with CURSOR_CONFIG_DIR set
-
-accounts tools                   # built-ins are tagged built-in, yours as custom
-accounts tools remove cursor     # (only when no profile uses it)
-```
-
-`tools add` options: `--label`, `--env-var` (required), `--bin` (required),
-`--default-dir` (defaults to `~/.<id>`), `--account-file` + `--email-path` (optional,
-enable email auto-detection). Built-in tool ids can't be redefined or removed.
-
-## How it stores things
-
-```
-~/.hasna/accounts/
-  accounts.json                 # the registry (profiles + active pointers), mode 600
-  profiles/
-    claude/<name>/              # managed config dir for a Claude profile
-    codex/<name>/               # managed config dir for a Codex profile
-```
-
-Environment overrides (handy for testing/automation):
-
-- `ACCOUNTS_HOME` — base dir (default `~/.hasna/accounts`)
-- `ACCOUNTS_STORE_PATH` — exact path to the registry JSON
-
-Profiles created without `--dir` get a managed dir under `profiles/`. Profiles created
-with `--dir` (e.g. importing `~/.claude`) point at that dir and are never deleted by
-`--purge`.
-
-## Shell helper (optional)
-
-Add a quick switcher to your `~/.zshrc` / `~/.bashrc`:
-
-```bash
-ccacct() { eval "$(accounts env "$1")" && echo "Claude profile → $1"; }
-# usage: ccacct work
-```
-
-## Library use
+## Library
 
 ```ts
-import { listProfiles, addProfile, useProfile } from "@hasna/accounts";
-
-addProfile({ name: "work", email: "work@company.com" });
-useProfile("work");
-console.log(listProfiles());
+import { addProfile, applyProfile, importProfile } from "@hasna/accounts";
 ```
 
 ## License
