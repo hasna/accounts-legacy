@@ -21,8 +21,10 @@ If you discover a security vulnerability, please report it responsibly:
 ### Local-first
 
 `@hasna/accounts` stores everything locally in a single JSON registry under
-`~/.hasna/accounts/` (created with mode `600`). It makes no network calls, sends no
-telemetry, and has no server component.
+`~/.hasna/accounts/` (created with mode `600`). It makes no network calls by
+default, sends no telemetry, and has no server component. Optional S3 registry
+sync is only used when `HASNA_ACCOUNTS_S3_BUCKET` or `ACCOUNTS_S3_BUCKET` is
+configured.
 
 ### What it stores
 
@@ -32,6 +34,8 @@ telemetry, and has no server component.
   (OAuth account JSON, file credentials, and on macOS a copy of the Keychain payload).
   Treat profile directories and `~/.hasna/accounts/accounts.json` as sensitive — same
   trust level as `~/.claude` or SSH keys.
+- Optional S3 sync only writes the registry JSON snapshot by default. Auth snapshot
+  files are not uploaded by the native storage helper.
 
 ### Email detection and apply mode
 

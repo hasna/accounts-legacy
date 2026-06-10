@@ -68,8 +68,12 @@ test("built-in tools cover major coding agents", () => {
   const ids = listTools().map((t) => t.id);
   expect(ids).toContain("claude");
   expect(ids).toContain("codex");
+  expect(ids).toContain("takumi");
+  expect(ids).toContain("gemini");
   expect(ids).toContain("opencode");
   expect(ids).toContain("cursor");
+  expect(ids).toContain("pi");
+  expect(ids).toContain("hermes");
   expect(ids).toContain("kimi");
   expect(ids).toContain("grok");
 });

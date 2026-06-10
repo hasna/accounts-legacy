@@ -1,6 +1,6 @@
 {
   "name": "@hasna/accounts",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Manage and switch between multiple Claude Code (and other AI coding tool) profiles/accounts locally — isolated config dirs, per-account email, one-command switching.",
   "type": "module",
   "main": "dist/index.js",
@@ -13,6 +13,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./storage": {
+      "types": "./dist/storage.d.ts",
+      "import": "./dist/storage.js"
     }
   },
   "files": [
@@ -21,7 +25,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "rm -rf dist && bun build src/cli.ts --outdir dist --target node && bun build src/mcp.ts --outdir dist --target node && bun build src/index.ts --outdir dist --target node && tsc --emitDeclarationOnly --outDir dist",
+    "build": "rm -rf dist && bun build src/cli.ts --outdir dist --target node && bun build src/mcp.ts --outdir dist --target node && bun build src/index.ts --outdir dist --target node && bun build src/storage.ts --outdir dist --target node --external @aws-sdk/client-s3 && tsc --emitDeclarationOnly --outDir dist",
     "dev": "bun run src/cli.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test"
@@ -30,8 +34,12 @@
     "claude",
     "claude-code",
     "codex",
+    "takumi",
+    "gemini",
     "opencode",
     "cursor-agent",
+    "pi",
+    "hermes",
     "kimi-code",
     "grok-build",
     "profile",
@@ -61,6 +69,7 @@
   "author": "Andrei Hasna <andrei@hasna.com>",
   "license": "Apache-2.0",
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.985.0",
     "@modelcontextprotocol/sdk": "^1.27.1",
     "chalk": "^5.4.1",
     "commander": "^13.1.0",

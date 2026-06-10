@@ -20,13 +20,22 @@ import {
   updateProfile,
   useProfile,
 } from "./lib/profiles.js";
-import { accountsHome, storePath } from "./storage.js";
+import {
+  accountsHome,
+  getAccountsStorageStatus,
+  loadStore,
+  storagePull,
+  storagePush,
+  storageSync,
+  storePath,
+  type AccountsStorageStatus,
+  type AccountsStorageSyncResult,
+} from "./storage.js";
 import { applyProfile, appliedProfile } from "./lib/apply.js";
 import { importProfile, ensureProfileForLogin } from "./lib/import-profile.js";
 import { pickProfile, resolvePickMode } from "./lib/pick.js";
 import { installHook, uninstallHook, shellSnippet, hookPath } from "./lib/hook.js";
 import { profileHasAuth } from "./lib/claude-auth.js";
-import { loadStore } from "./storage.js";
 import { formatEnvAssignments, formatExportLines, profileEnv } from "./lib/env.js";
 import { finalizeLogin } from "./lib/login.js";
 import { switchProfile, type SwitchMode } from "./lib/switch.js";
@@ -82,6 +91,36 @@ function fmtProfile(p: Profile, active: boolean, applied = false): string {
   const email = p.email ? chalk.yellow(p.email) : chalk.dim("(no email)");
   const desc = p.description ? chalk.dim(` — ${p.description}`) : "";
   return `${marker} ${name}  ${tool}  ${email}${desc}`;
+}
+
+function printStorageStatus(status: AccountsStorageStatus, json?: boolean): void {
+  if (json) {
+    console.log(JSON.stringify(status, null, 2));
+    return;
+  }
+  console.log(`${chalk.cyan("mode")}       ${status.mode}`);
+  console.log(`${chalk.cyan("local")}      ${status.local.storePath}`);
+  console.log(
+    `${chalk.cyan("remote")}     ${
+      status.remote.configured
+        ? `${status.remote.bucket}/${status.remote.prefix}`
+        : chalk.dim(`not configured (${status.remote.bucketEnv})`)
+    }`,
+  );
+}
+
+function printStorageSyncResult(result: AccountsStorageSyncResult, json?: boolean): void {
+  if (json) {
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  if (result.skipped) {
+    console.log(chalk.yellow(`skipped: ${result.reason ?? "storage sync is not configured"}`));
+    console.log(chalk.dim(`key: ${result.key}`));
+    return;
+  }
+  console.log(chalk.green(`pushed ${result.pushed}, pulled ${result.pulled}`));
+  console.log(chalk.dim(`key: ${result.key}`));
 }
 
 program
@@ -565,6 +604,48 @@ program
         const appliedVal = a && a.name !== p?.name ? chalk.magenta(` → applied: ${a.name}`) : a ? chalk.magenta(" (applied)") : "";
         console.log(`${chalk.cyan(tool.label.padEnd(14))} ${val}${appliedVal}`);
       }
+    }),
+  );
+
+const storage = program.command("storage").description("inspect and sync the accounts storage snapshot");
+
+storage
+  .command("status", { isDefault: true })
+  .description("show local and optional S3 snapshot storage status")
+  .option("--json", "output JSON")
+  .action(
+    action((opts: { json?: boolean }) => {
+      printStorageStatus(getAccountsStorageStatus(), opts.json);
+    }),
+  );
+
+storage
+  .command("push")
+  .description("push the local accounts snapshot to S3 when configured")
+  .option("--json", "output JSON")
+  .action(
+    action(async (opts: { json?: boolean }) => {
+      printStorageSyncResult(await storagePush(), opts.json);
+    }),
+  );
+
+storage
+  .command("pull")
+  .description("pull the accounts snapshot from S3 when configured")
+  .option("--json", "output JSON")
+  .action(
+    action(async (opts: { json?: boolean }) => {
+      printStorageSyncResult(await storagePull(), opts.json);
+    }),
+  );
+
+storage
+  .command("sync")
+  .description("pull then push the accounts snapshot when S3 is configured")
+  .option("--json", "output JSON")
+  .action(
+    action(async (opts: { json?: boolean }) => {
+      printStorageSyncResult(await storageSync(), opts.json);
     }),
   );
 
