@@ -5,11 +5,16 @@ import { getTool } from "./tools.js";
 import { getProfile, useProfile } from "./profiles.js";
 import {
   ensureProfileAuthSnapshot,
+  liveOAuthEmail,
   profileHasAuth,
   restoreClaudeAuthFromProfile,
   snapshotLiveAuthToProfile,
 } from "./claude-auth.js";
 import { withApplyLock } from "./apply-lock.js";
+
+function singleMatch(profiles: Profile[]): Profile | undefined {
+  return profiles.length === 1 ? profiles[0] : undefined;
+}
 
 export function appliedProfile(toolId: string): Profile | undefined {
   const store = loadStore();
@@ -45,10 +50,17 @@ function applyProfileUnlocked(name: string, toolId?: string): { profile: Profile
   const store = loadStore();
   const previous = store.applied[tool.id];
 
-  if (previous && previous !== name) {
-    const prevProfile = store.profiles.find((p) => p.name === previous && p.tool === tool.id);
-    if (prevProfile) snapshotLiveAuthToProfile(prevProfile.dir, tool);
-  }
+  // Preserve whatever auth is currently live by snapshotting it into the
+  // profile that actually owns it. The live OAuth email is the source of
+  // truth — the applied pointer goes stale when the user logs in directly
+  // on the live paths (e.g. `claude /login`), and trusting it would clobber
+  // another profile's snapshot with the wrong account's tokens.
+  const liveEmail = liveOAuthEmail();
+  const owner =
+    (liveEmail &&
+      singleMatch(store.profiles.filter((p) => p.tool === tool.id && p.email === liveEmail))) ||
+    (previous ? store.profiles.find((p) => p.name === previous && p.tool === tool.id) : undefined);
+  if (owner) snapshotLiveAuthToProfile(owner.dir, tool);
 
   ensureProfileAuthSnapshot(profile.dir, tool);
   restoreClaudeAuthFromProfile(profile.dir, tool, name);

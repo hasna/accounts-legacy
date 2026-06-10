@@ -115,6 +115,7 @@ Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
 | `accounts hook install` | Install `claude()` wrapper — see [docs/hook.md](docs/hook.md). |
 | `accounts hook uninstall` | Remove hook script. |
 | `accounts hook path` | Print hook script path. |
+| `accounts agents` | List Claude agent sessions across **all** profiles (`claude agents` only shows the current account). `--background`, `--profile <name>`, `--json`. |
 | `accounts detect <name>` | Re-detect email from config dir. |
 | `accounts doctor` | Check registry and dirs (exits 1 on errors). |
 

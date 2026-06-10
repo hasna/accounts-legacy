@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
@@ -39,12 +39,26 @@ function writeJsonFile(path: string, data: JsonRecord, stayUnder?: string): void
 }
 
 function readOAuthFromPaths(paths: string[]): JsonRecord | undefined {
+  return findOAuthSource(paths)?.oauth;
+}
+
+function findOAuthSource(paths: string[]): { path: string; oauth: JsonRecord } | undefined {
   for (const p of paths) {
     const data = readJsonFile(p);
     const oauth = data?.oauthAccount;
-    if (oauth && typeof oauth === "object") return oauth as JsonRecord;
+    if (oauth && typeof oauth === "object") return { path: p, oauth: oauth as JsonRecord };
   }
   return undefined;
+}
+
+/** True when the snapshot is missing or strictly older than its source file. */
+function snapshotIsStale(sourcePath: string, snapshotPath: string): boolean {
+  if (!existsSync(snapshotPath)) return true;
+  try {
+    return statSync(sourcePath).mtimeMs > statSync(snapshotPath).mtimeMs;
+  } catch {
+    return false;
+  }
 }
 
 function mergeOAuthInto(
@@ -75,6 +89,14 @@ function mergeOAuthInto(
   }
 }
 
+/** Email address of the account currently authenticated on the live Claude paths. */
+export function liveOAuthEmail(): string | undefined {
+  const live = liveClaudePaths();
+  const oauth = readOAuthFromPaths([live.homeJson]);
+  const email = oauth?.emailAddress;
+  return typeof email === "string" && email ? email : undefined;
+}
+
 /** Snapshot live Claude auth into a profile directory (used when switching away on apply). */
 export function snapshotLiveAuthToProfile(profileDir: string, _tool: ToolDef): void {
   const authDir = profileAuthDir(profileDir);
@@ -102,25 +124,33 @@ export function snapshotClaudeAuthToProfile(profileDir: string, tool: ToolDef): 
   snapshotLiveAuthToProfile(profileDir, tool);
 }
 
-/** Build auth snapshots from files already present in the profile config dir. */
+/**
+ * Build auth snapshots from files already present in the profile config dir.
+ * Snapshots are refreshed per-file whenever the source in the profile dir is
+ * newer than the existing snapshot — a running tool rotates its OAuth tokens
+ * in place, and restoring a login-time snapshot over rotated tokens logs the
+ * account out (rotated-out refresh tokens are revoked server-side).
+ */
 export function ensureProfileAuthSnapshot(
   profileDir: string,
   tool: ToolDef,
   opts: { overwrite?: boolean } = {},
 ): void {
-  if (!opts.overwrite && hasAuthSnapshot(profileDir)) return;
   const authDir = profileAuthDir(profileDir);
   assertSafeWritePath(join(authDir, OAUTH_SNAPSHOT), { mustStayUnder: profileDir });
   mkdirSync(authDir, { recursive: true });
 
-  const oauth = readOAuthFromPaths(profileAccountJsonPaths(profileDir, tool));
-  if (oauth) writeJsonFile(profileOAuthSnapshot(profileDir), { oauthAccount: oauth }, profileDir);
+  const oauthSource = findOAuthSource(profileAccountJsonPaths(profileDir, tool));
+  const oauthSnap = profileOAuthSnapshot(profileDir);
+  if (oauthSource && (opts.overwrite || snapshotIsStale(oauthSource.path, oauthSnap))) {
+    writeJsonFile(oauthSnap, { oauthAccount: oauthSource.oauth }, profileDir);
+  }
 
   const credFile = join(profileDir, ".credentials.json");
-  if (existsSync(credFile)) {
-    const dest = profileCredentialsSnapshot(profileDir);
-    assertSafeWritePath(dest, { mustStayUnder: profileDir });
-    copyFileSync(credFile, dest);
+  const credSnap = profileCredentialsSnapshot(profileDir);
+  if (existsSync(credFile) && (opts.overwrite || snapshotIsStale(credFile, credSnap))) {
+    assertSafeWritePath(credSnap, { mustStayUnder: profileDir });
+    copyFileSync(credFile, credSnap);
   }
 }
 

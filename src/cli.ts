@@ -32,6 +32,7 @@ import {
   type AccountsStorageSyncResult,
 } from "./storage.js";
 import { applyProfile, appliedProfile } from "./lib/apply.js";
+import { listAgentsAcrossProfiles } from "./lib/agents.js";
 import { importProfile, ensureProfileForLogin } from "./lib/import-profile.js";
 import { pickProfile, resolvePickMode } from "./lib/pick.js";
 import { installHook, uninstallHook, shellSnippet, hookPath } from "./lib/hook.js";
@@ -603,6 +604,52 @@ program
         const val = p ? `${chalk.green.bold(p.name)}${p.email ? chalk.dim(" (" + p.email + ")") : ""}` : chalk.dim("(none)");
         const appliedVal = a && a.name !== p?.name ? chalk.magenta(` → applied: ${a.name}`) : a ? chalk.magenta(" (applied)") : "";
         console.log(`${chalk.cyan(tool.label.padEnd(14))} ${val}${appliedVal}`);
+      }
+    }),
+  );
+
+program
+  .command("agents")
+  .description("list Claude Code agent sessions (interactive + background) across all profiles")
+  .option("-t, --tool <tool>", "tool id", "claude")
+  .option("-p, --profile <name>", "only show agents for this profile")
+  .option("-b, --background", "only show background agents")
+  .option("--json", "output JSON")
+  .action(
+    action((opts: { tool: string; profile?: string; background?: boolean; json?: boolean }) => {
+      const results = listAgentsAcrossProfiles({
+        tool: opts.tool,
+        profile: opts.profile,
+        backgroundOnly: opts.background,
+      });
+      if (opts.json) {
+        console.log(JSON.stringify(results, null, 2));
+        return;
+      }
+      if (results.length === 0) {
+        console.log(chalk.dim(`no ${opts.tool} profiles registered`));
+        return;
+      }
+      for (const r of results) {
+        const email = r.email ? chalk.yellow(r.email) : chalk.dim("(no email)");
+        console.log(`${chalk.bold(r.profile)}  ${chalk.cyan(r.tool)}  ${email}`);
+        if (r.error) {
+          console.log(`  ${chalk.red("error:")} ${r.error}`);
+          continue;
+        }
+        if (r.agents.length === 0) {
+          console.log(chalk.dim("  (no agents)"));
+          continue;
+        }
+        for (const a of r.agents) {
+          const kind = a.kind === "background" ? chalk.magenta("background ") : chalk.dim("interactive");
+          const state = String(a.state ?? a.status ?? "");
+          const stateFmt = state === "working" || state === "busy" ? chalk.green(state) : chalk.dim(state);
+          const name = typeof a.name === "string" ? ` ${a.name}` : "";
+          const session = typeof a.sessionId === "string" ? chalk.dim(`  ${a.sessionId.slice(0, 8)}`) : "";
+          const cwd = typeof a.cwd === "string" ? chalk.dim(`  ${a.cwd}`) : "";
+          console.log(`  ${kind} ${stateFmt.padEnd(8)}${session}${chalk.bold(name)}${cwd}`);
+        }
       }
     }),
   );

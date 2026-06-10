@@ -1,6 +1,6 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { addProfile, useProfile, renameProfile, removeProfile, currentProfile } from "./lib/profiles.js";
@@ -257,4 +257,107 @@ test("switchProfile marks Codex active and returns resume command without applyi
   expect(result.env.CODEX_HOME).toBe(p.dir);
   expect(currentProfile("codex")?.name).toBe("codexer");
   expect(appliedProfile("codex")).toBeUndefined();
+});
+
+// --- auth persistence regressions (logout-on-switch bugs) ---
+
+function writeCreds(dir: string, token: string) {
+  mkdirSync(join(dir, ".claude"), { recursive: true });
+  writeFileSync(join(dir, ".claude", ".credentials.json"), JSON.stringify({ token }));
+}
+
+test("apply restores fresher profile-root credentials over a stale snapshot", () => {
+  const workDir = mkdtempSync(join(tmpdir(), "work-fresh-"));
+  writeOAuth(workDir, "work@example.com");
+  writeFileSync(join(workDir, ".credentials.json"), JSON.stringify({ token: "old-token" }));
+  addProfile({ name: "work", dir: workDir });
+  const tool = getTool("claude");
+  ensureProfileAuthSnapshot(workDir, tool);
+
+  // simulate the running claude rotating its OAuth tokens inside the profile dir
+  writeFileSync(join(workDir, ".credentials.json"), JSON.stringify({ token: "rotated-token" }));
+  const future = new Date(Date.now() + 5000);
+  utimesSync(join(workDir, ".credentials.json"), future, future);
+
+  applyProfile("work");
+
+  const live = JSON.parse(readFileSync(liveClaudePaths().credentialsFile, "utf8")) as { token: string };
+  expect(live.token).toBe("rotated-token");
+  rmSync(workDir, { recursive: true, force: true });
+});
+
+test("apply refreshes a stale oauth snapshot from the profile dir", () => {
+  const workDir = mkdtempSync(join(tmpdir(), "work-oauth-fresh-"));
+  writeOAuth(workDir, "old@example.com");
+  addProfile({ name: "work", dir: workDir, email: "old@example.com" });
+  const tool = getTool("claude");
+  ensureProfileAuthSnapshot(workDir, tool);
+
+  writeOAuth(workDir, "renamed@example.com");
+  const future = new Date(Date.now() + 5000);
+  utimesSync(join(workDir, ".claude.json"), future, future);
+
+  applyProfile("work");
+
+  const live = JSON.parse(readFileSync(liveClaudePaths().homeJson, "utf8")) as {
+    oauthAccount: { emailAddress: string };
+  };
+  expect(live.oauthAccount.emailAddress).toBe("renamed@example.com");
+  rmSync(workDir, { recursive: true, force: true });
+});
+
+test("re-applying the same profile preserves rotated live credentials", () => {
+  const workDir = mkdtempSync(join(tmpdir(), "work-reapply-"));
+  writeOAuth(workDir, "work@example.com");
+  writeFileSync(join(workDir, ".credentials.json"), JSON.stringify({ token: "login-token" }));
+  addProfile({ name: "work", dir: workDir });
+
+  applyProfile("work");
+  // simulate claude rotating tokens on the live paths while work is applied
+  writeCreds(liveBase, "live-rotated-token");
+  const future = new Date(Date.now() + 5000);
+  utimesSync(liveClaudePaths().credentialsFile, future, future);
+
+  applyProfile("work");
+
+  const live = JSON.parse(readFileSync(liveClaudePaths().credentialsFile, "utf8")) as { token: string };
+  expect(live.token).toBe("live-rotated-token");
+  rmSync(workDir, { recursive: true, force: true });
+});
+
+test("apply snapshots live auth into the email-matching profile, not the stale applied pointer", () => {
+  const workDir = mkdtempSync(join(tmpdir(), "work-owner-"));
+  const personalDir = mkdtempSync(join(tmpdir(), "personal-owner-"));
+  const thirdDir = mkdtempSync(join(tmpdir(), "third-owner-"));
+  writeOAuth(workDir, "work@example.com");
+  writeOAuth(personalDir, "personal@example.com");
+  writeOAuth(thirdDir, "third@example.com");
+  addProfile({ name: "work", dir: workDir });
+  addProfile({ name: "personal", dir: personalDir });
+  addProfile({ name: "third", dir: thirdDir });
+
+  applyProfile("personal");
+  // simulate the user logging into "work" directly in the live ~/.claude
+  // (registry still believes "personal" is applied)
+  writeFileSync(
+    liveClaudePaths().homeJson,
+    JSON.stringify({ oauthAccount: { emailAddress: "work@example.com" } }),
+  );
+  writeCreds(liveBase, "work-live-token");
+
+  applyProfile("third");
+
+  // work's live tokens must be preserved in work's profile dir
+  const workSnap = JSON.parse(
+    readFileSync(join(workDir, ".accounts-auth", "credentials.json"), "utf8"),
+  ) as { token: string };
+  expect(workSnap.token).toBe("work-live-token");
+  // personal's snapshot must NOT be clobbered with work's auth
+  const personalSnap = JSON.parse(readFileSync(profileOAuthSnapshot(personalDir), "utf8")) as {
+    oauthAccount: { emailAddress: string };
+  };
+  expect(personalSnap.oauthAccount.emailAddress).toBe("personal@example.com");
+  rmSync(workDir, { recursive: true, force: true });
+  rmSync(personalDir, { recursive: true, force: true });
+  rmSync(thirdDir, { recursive: true, force: true });
 });
