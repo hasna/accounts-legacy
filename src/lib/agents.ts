@@ -1,10 +1,14 @@
 import { spawnSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
 import { platform } from "node:os";
 import type { Profile } from "../types.js";
 import { listProfiles } from "./profiles.js";
 import { getTool } from "./tools.js";
 
 export type AgentEntry = Record<string, unknown>;
+
+/** Minimal profile shape needed to query agents (allows synthetic entries). */
+export type ProfileLike = Pick<Profile, "name" | "tool" | "dir"> & { email?: string };
 
 export interface ProfileAgents {
   profile: string;
@@ -21,7 +25,16 @@ export interface AgentsRunnerResult {
   error?: string;
 }
 
-export type AgentsRunner = (profile: Profile) => AgentsRunnerResult;
+export type AgentsRunner = (profile: ProfileLike) => AgentsRunnerResult;
+
+export interface ProcessInfo {
+  pid: number;
+  ppid: number;
+  command: string;
+  configDir?: string;
+}
+
+export type ProcessScanner = () => ProcessInfo[];
 
 /**
  * Extract the first top-level JSON array from output that may be wrapped in
@@ -66,7 +79,7 @@ export function extractJsonArray(raw: string): unknown[] | undefined {
  * Claude Code switches to print-mode argument parsing when stdout is not a
  * TTY and never reaches the `agents` subcommand, so a plain pipe won't work.
  */
-export function runClaudeAgentsJson(profile: Profile, timeoutMs = 20_000): AgentsRunnerResult {
+export function runClaudeAgentsJson(profile: ProfileLike, timeoutMs = 20_000): AgentsRunnerResult {
   const tool = getTool(profile.tool);
   const bin = tool.bin ?? "claude";
   const env = { ...process.env, [tool.envVar]: profile.dir };
@@ -89,20 +102,112 @@ export function runClaudeAgentsJson(profile: Profile, timeoutMs = 20_000): Agent
   return { ok: true, raw: res.stdout ?? "" };
 }
 
+/**
+ * True when a `ps` command line looks like a real agent session process for
+ * the tool — not a daemon, pty host, pre-warmed spare, shell snapshot, our
+ * own `agents` listing invocation, or an `accounts` wrapper.
+ */
+export function isToolSessionCommand(command: string, bin: string): boolean {
+  const argv = command.trim().split(/\s+/);
+  if (argv.length === 0) return false;
+  const base = (p: string) => p.split("/").pop() ?? p;
+
+  let head = argv[0] ?? "";
+  let rest = argv.slice(1);
+  // unwrap interpreter wrappers: `node /path/to/bin/claude ...`
+  if ((base(head) === "node" || base(head) === "bun") && rest[0]) {
+    head = rest[0]!;
+    rest = rest.slice(1);
+  }
+  // versioned native builds live under .../<bin>/versions/<semver>
+  const isVersionedBuild = head.includes(`/${bin}/versions/`);
+  if (base(head) !== bin && !isVersionedBuild) return false;
+
+  if (rest[0] === "agents") return false; // our own listing call
+  const joined = rest.join(" ");
+  if (/--bg-pty-host|--bg-spare/.test(joined)) return false; // daemon helpers
+  if (rest[0] === "daemon") return false;
+  return true;
+}
+
+/** Scan running processes for agent sessions of a tool (pid, ppid, command, config dir). */
+export function scanToolProcesses(toolId = "claude"): ProcessInfo[] {
+  const tool = getTool(toolId);
+  const bin = tool.bin ?? toolId;
+  const res = spawnSync("ps", ["-axo", "pid=,ppid=,args="], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  if (res.status !== 0 || !res.stdout) return [];
+
+  const out: ProcessInfo[] = [];
+  for (const line of res.stdout.split("\n")) {
+    const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.+)$/);
+    if (!m) continue;
+    const pid = Number(m[1]);
+    const ppid = Number(m[2]);
+    const command = m[3]!.trim();
+    if (pid === process.pid) continue;
+    if (!isToolSessionCommand(command, bin)) continue;
+    const configDir = readProcessEnvVar(pid, tool.envVar);
+    out.push({ pid, ppid, command, ...(configDir ? { configDir } : {}) });
+  }
+  return out;
+}
+
+/** Best-effort read of one env var from a running process (Linux /proc only). */
+function readProcessEnvVar(pid: number, envVar: string): string | undefined {
+  try {
+    const environ = readFileSync(`/proc/${pid}/environ`, "utf8");
+    for (const kv of environ.split("\0")) {
+      if (kv.startsWith(`${envVar}=`)) return kv.slice(envVar.length + 1) || undefined;
+    }
+  } catch {
+    /* macOS, or process exited */
+  }
+  return undefined;
+}
+
 export interface ListAgentsOptions {
   tool?: string;
   profile?: string;
   backgroundOnly?: boolean;
   runner?: AgentsRunner;
+  /** Override the tool's default config dir (used by tests). */
+  defaultDir?: string;
+  processScanner?: ProcessScanner;
 }
 
-/** List agent sessions for every profile of a tool (default: claude). */
+/**
+ * List agent sessions for every profile of a tool (default: claude).
+ *
+ * Besides registered profiles this also queries the tool's DEFAULT config
+ * dir (e.g. ~/.claude) as a synthetic "(default)" entry — headless sessions
+ * started without the accounts CLI live there — and cross-checks the daemon
+ * listings against a process scan, reporting session processes no daemon
+ * knows about under "(untracked)".
+ */
 export function listAgentsAcrossProfiles(opts: ListAgentsOptions = {}): ProfileAgents[] {
   const toolId = opts.tool ?? "claude";
   const runner = opts.runner ?? runClaudeAgentsJson;
-  const profiles = listProfiles(toolId).filter((p) => !opts.profile || p.name === opts.profile);
+  const tool = getTool(toolId);
 
-  return profiles.map((profile) => {
+  const registered = listProfiles(toolId);
+  const entries: ProfileLike[] = [...registered];
+  const defaultDir = opts.defaultDir ?? tool.defaultDir;
+  if (defaultDir && !registered.some((p) => p.dir === defaultDir) && existsSync(defaultDir)) {
+    entries.unshift({ name: "(default)", tool: toolId, dir: defaultDir });
+  }
+
+  const wanted = entries.filter(
+    (p) => !opts.profile || p.name === opts.profile || (opts.profile === "default" && p.name === "(default)"),
+  );
+
+  // pids reported by any daemon, collected BEFORE the kind filter so that
+  // interactive sessions never show up again as "(untracked)" processes
+  const reported = new Set<number>();
+
+  const results = wanted.map((profile) => {
     const base: ProfileAgents = {
       profile: profile.name,
       tool: profile.tool,
@@ -116,9 +221,43 @@ export function listAgentsAcrossProfiles(opts: ListAgentsOptions = {}): ProfileA
     const parsed = extractJsonArray(result.raw);
     if (!parsed) return { ...base, error: "could not parse agents output" };
 
+    for (const a of parsed as AgentEntry[]) {
+      if (typeof a.pid === "number") reported.add(a.pid);
+    }
     const agents = (parsed as AgentEntry[]).filter(
       (a) => !opts.backgroundOnly || a.kind === "background",
     );
     return { ...base, agents };
   });
+
+  // Cross-check daemon listings against actually-running processes; anything
+  // the daemons don't report (e.g. headless loops on stale daemons) is shown
+  // rather than silently dropped. Skipped when filtering to one profile.
+  if (!opts.profile) {
+    const scanner = opts.processScanner ?? scanToolProcesses;
+    const scanned = scanner();
+    if (scanned.length > 0) {
+      const untracked = scanned.filter(
+        (p) =>
+          !reported.has(p.pid) &&
+          !reported.has(p.ppid) &&
+          !scanned.some((q) => q.ppid === p.pid && reported.has(q.pid)),
+      );
+      if (untracked.length > 0) {
+        results.push({
+          profile: "(untracked)",
+          tool: toolId,
+          dir: "",
+          agents: untracked.map((p) => ({
+            kind: "process",
+            pid: p.pid,
+            command: p.command,
+            ...(p.configDir ? { configDir: p.configDir } : {}),
+          })),
+        });
+      }
+    }
+  }
+
+  return results;
 }

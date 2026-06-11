@@ -642,6 +642,12 @@ program
           continue;
         }
         for (const a of r.agents) {
+          if (a.kind === "process") {
+            const cfg = typeof a.configDir === "string" ? chalk.dim(`  cfg=${a.configDir}`) : "";
+            const cmd = typeof a.command === "string" ? chalk.dim(`  ${a.command.slice(0, 100)}`) : "";
+            console.log(`  ${chalk.yellow("process    ")} pid ${a.pid}${cfg}${cmd}`);
+            continue;
+          }
           const kind = a.kind === "background" ? chalk.magenta("background ") : chalk.dim("interactive");
           const state = String(a.state ?? a.status ?? "");
           const stateFmt = state === "working" || state === "busy" ? chalk.green(state) : chalk.dim(state);
