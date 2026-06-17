@@ -6,6 +6,13 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-06-17
+
+### Fixed
+
+- Claude OAuth profiles now strip `apiKeyHelper` and API auth env settings before login, env, launch, supervisor restart, and apply so subscription profiles do not fall back to API-key auth.
+
+
 ## [0.1.5] - 2026-06-04
 
 ### Added

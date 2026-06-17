@@ -23,6 +23,16 @@ import { assertSafeWritePath } from "./safe-path.js";
 
 type JsonRecord = Record<string, unknown>;
 
+export const CLAUDE_API_AUTH_ENV_KEYS = [
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_BASE_URL",
+  "CLAUDE_CODE_API_KEY_HELPER",
+  "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+] as const;
+
 function readJsonFile(path: string): JsonRecord | undefined {
   if (!existsSync(path)) return undefined;
   try {
@@ -40,6 +50,12 @@ function writeJsonFile(path: string, data: JsonRecord, stayUnder?: string): void
 
 function readOAuthFromPaths(paths: string[]): JsonRecord | undefined {
   return findOAuthSource(paths)?.oauth;
+}
+
+function readOAuthSnapshot(profileDir: string): JsonRecord | undefined {
+  const snap = readJsonFile(profileOAuthSnapshot(profileDir));
+  const oauth = snap?.oauthAccount;
+  return oauth && typeof oauth === "object" ? (oauth as JsonRecord) : undefined;
 }
 
 function findOAuthSource(paths: string[]): { path: string; oauth: JsonRecord } | undefined {
@@ -87,6 +103,49 @@ function mergeOAuthInto(
       writeJsonFile(paths[1], parent, stayUnder);
     }
   }
+}
+
+function sanitizeSettingsFile(configDir: string, stayUnder: string): boolean {
+  const settingsPath = join(configDir, "settings.json");
+  const settings = readJsonFile(settingsPath);
+  if (!settings) return false;
+
+  let changed = false;
+  if ("apiKeyHelper" in settings) {
+    delete settings.apiKeyHelper;
+    changed = true;
+  }
+
+  const env = settings.env;
+  if (env && typeof env === "object" && !Array.isArray(env)) {
+    const envRecord = env as JsonRecord;
+    for (const key of CLAUDE_API_AUTH_ENV_KEYS) {
+      if (key in envRecord) {
+        delete envRecord[key];
+        changed = true;
+      }
+    }
+  }
+
+  if (changed) writeJsonFile(settingsPath, settings, stayUnder);
+  return changed;
+}
+
+export function sanitizeClaudeProfileApiSettings(profileDir: string, tool: ToolDef): boolean {
+  if (tool.id !== "claude") return false;
+  return sanitizeSettingsFile(profileDir, profileDir);
+}
+
+export function sanitizeClaudeOAuthProfileSettings(profileDir: string, tool: ToolDef): boolean {
+  if (tool.id !== "claude") return false;
+  if (!readOAuthSnapshot(profileDir) && !readOAuthFromPaths(profileAccountJsonPaths(profileDir, tool))) {
+    return false;
+  }
+  return sanitizeClaudeProfileApiSettings(profileDir, tool);
+}
+
+export function sanitizeLiveClaudeOAuthSettings(): boolean {
+  return sanitizeSettingsFile(liveClaudePaths().configDir, liveClaudeBase());
 }
 
 /** Email address of the account currently authenticated on the live Claude paths. */
@@ -152,6 +211,8 @@ export function ensureProfileAuthSnapshot(
     assertSafeWritePath(credSnap, { mustStayUnder: profileDir });
     copyFileSync(credFile, credSnap);
   }
+
+  sanitizeClaudeOAuthProfileSettings(profileDir, tool);
 }
 
 export function profileHasAuth(profileDir: string, tool: ToolDef): boolean {
@@ -186,6 +247,9 @@ export function restoreClaudeAuthFromProfile(
   if (!oauth) {
     throw new AccountsError("profile has no OAuth account data to apply");
   }
+
+  sanitizeClaudeOAuthProfileSettings(profileDir, tool);
+  sanitizeLiveClaudeOAuthSettings();
 
   assertSafeWritePath(live.homeJson, { mustStayUnder: liveRoot });
   mergeOAuthInto([live.homeJson], oauth, false, liveRoot);

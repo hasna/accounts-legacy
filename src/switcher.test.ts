@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { addProfile, useProfile, renameProfile, removeProfile, currentProfile } from "./lib/profiles.js";
+import { addProfile, useProfile, renameProfile, removeProfile, currentProfile, getProfile } from "./lib/profiles.js";
 import { applyProfile, appliedProfile } from "./lib/apply.js";
 import { importProfile, ensureProfileForLogin } from "./lib/import-profile.js";
 import { finalizeLogin } from "./lib/login.js";
@@ -16,6 +16,7 @@ import { liveClaudePaths, profileOAuthSnapshot } from "./lib/claude-layout.js";
 import { installHook, hookPath, hookScript, isSafeProfileName } from "./lib/hook.js";
 import { resolvePickMode } from "./lib/pick.js";
 import { switchProfile } from "./lib/switch.js";
+import { profileEnv } from "./lib/env.js";
 import { loadStore } from "./storage.js";
 import { getTool } from "./lib/tools.js";
 import { AccountsError } from "./types.js";
@@ -128,6 +129,69 @@ test("ensureProfileForLogin creates profile when missing", () => {
   expect(p.tool).toBe("claude");
   expect(existsSync(p.dir)).toBe(true);
   expect(ensureProfileForLogin("newlogin").dir).toBe(p.dir);
+});
+
+test("apply removes Claude API-helper settings from OAuth profiles and live settings", () => {
+  const workDir = mkdtempSync(join(tmpdir(), "work-settings-"));
+  writeOAuth(workDir, "work@example.com");
+  writeFileSync(
+    join(workDir, "settings.json"),
+    JSON.stringify({ apiKeyHelper: "/tmp/helper", env: { ANTHROPIC_API_KEY: "secret", KEEP_ME: "yes" } }),
+  );
+  mkdirSync(join(liveBase, ".claude"), { recursive: true });
+  writeFileSync(
+    join(liveBase, ".claude", "settings.json"),
+    JSON.stringify({ apiKeyHelper: "/tmp/live-helper", env: { ANTHROPIC_AUTH_TOKEN: "secret", KEEP_ME: "yes" } }),
+  );
+  addProfile({ name: "work", dir: workDir });
+  ensureProfileAuthSnapshot(workDir, getTool("claude"));
+
+  applyProfile("work");
+
+  const profileSettings = JSON.parse(readFileSync(join(workDir, "settings.json"), "utf8")) as {
+    apiKeyHelper?: string;
+    env: Record<string, string | undefined>;
+  };
+  expect(profileSettings.apiKeyHelper).toBeUndefined();
+  expect(profileSettings.env.ANTHROPIC_API_KEY).toBeUndefined();
+  expect(profileSettings.env.KEEP_ME).toBe("yes");
+
+  const liveSettings = JSON.parse(readFileSync(join(liveBase, ".claude", "settings.json"), "utf8")) as {
+    apiKeyHelper?: string;
+    env: Record<string, string | undefined>;
+  };
+  expect(liveSettings.apiKeyHelper).toBeUndefined();
+  expect(liveSettings.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+  expect(liveSettings.env.KEEP_ME).toBe("yes");
+  rmSync(workDir, { recursive: true, force: true });
+});
+
+test("profileEnv removes Claude API-helper settings before OAuth exists", () => {
+  const dir = mkdtempSync(join(tmpdir(), "env-preoauth-"));
+  writeFileSync(join(dir, "settings.json"), JSON.stringify({ apiKeyHelper: "/tmp/helper" }));
+  addProfile({ name: "preoauth", dir });
+
+  const env = profileEnv(getProfile("preoauth", "claude"), getTool("claude"));
+
+  const settings = JSON.parse(readFileSync(join(dir, "settings.json"), "utf8")) as { apiKeyHelper?: string };
+  expect(settings.apiKeyHelper).toBeUndefined();
+  expect(env.ANTHROPIC_API_KEY).toBe("");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+test("profileEnv clears Claude API auth environment variables", () => {
+  const dir = mkdtempSync(join(tmpdir(), "env-clean-"));
+  writeOAuth(dir, "env@example.com");
+  addProfile({ name: "envclean", dir });
+  ensureProfileAuthSnapshot(dir, getTool("claude"));
+
+  const env = profileEnv(getProfile("envclean", "claude"), getTool("claude"));
+
+  expect(env.CLAUDE_CONFIG_DIR).toBe(dir);
+  expect(env.ANTHROPIC_API_KEY).toBe("");
+  expect(env.ANTHROPIC_AUTH_TOKEN).toBe("");
+  expect(env.CLAUDE_CODE_API_KEY_HELPER).toBe("");
+  rmSync(dir, { recursive: true, force: true });
 });
 
 test("applyProfile writes oauth to live paths", () => {

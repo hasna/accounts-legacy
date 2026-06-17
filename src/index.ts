@@ -61,6 +61,10 @@ export {
   ensureProfileAuthSnapshot,
   hasAuthSnapshot,
   profileHasAuth,
+  sanitizeClaudeProfileApiSettings,
+  sanitizeClaudeOAuthProfileSettings,
+  sanitizeLiveClaudeOAuthSettings,
+  CLAUDE_API_AUTH_ENV_KEYS,
 } from "./lib/claude-auth.js";
 export { withApplyLock } from "./lib/apply-lock.js";
 export { isSafeProfileName } from "./lib/hook.js";
