@@ -352,6 +352,23 @@ test("switchProfile marks Codex active and returns resume command without applyi
   expect(appliedProfile("codex")).toBeUndefined();
 });
 
+test("switchProfile launches Codex App with isolated app state", () => {
+  const p = addProfile({ name: "desktop", tool: "codex-app" });
+
+  const result = switchProfile("desktop", { tool: "codex-app" });
+
+  expect(result.applied).toBe(false);
+  expect(result.command).toEqual([
+    "/Applications/Codex.app/Contents/MacOS/Codex",
+    `--user-data-dir=${join(p.dir, "electron-user-data")}`,
+  ]);
+  expect(result.env.CODEX_HOME).toBe(p.dir);
+  expect(result.commandLine).toContain("CODEX_HOME=");
+  expect(result.commandLine).toContain("--user-data-dir=");
+  expect(currentProfile("codex-app")?.name).toBe("desktop");
+  expect(appliedProfile("codex-app")).toBeUndefined();
+});
+
 test("switchProfile puts Codex dangerous permissions before the resume subcommand", () => {
   const p = addProfile({ name: "codexdanger", tool: "codex" });
 

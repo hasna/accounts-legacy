@@ -33,7 +33,8 @@ Registry file: `~/.hasna/accounts/accounts.json` (fields `current` and `applied`
 | `src/storage.ts` | `ACCOUNTS_HOME`, load/save store, sanitize stale pointers |
 | `src/lib/profiles.ts` | CRUD, `useProfile` → `current`, rename/remove pointer hygiene |
 | `src/lib/tools.ts` | Built-in and custom tool registry |
-| `src/lib/env.ts` | Per-tool env rendering (`{profileDir}`, `{profileName}`, `{toolId}` templates) |
+| `src/lib/env.ts` | Per-tool env rendering (`{profileDir}`, `{profileName}`, `{toolId}` templates), including Claude channel state |
+| `src/lib/codex-app.ts` | Codex App profile preparation, including file-based credential cache defaults |
 | `src/lib/apply.ts` | `applyProfile`, `applied` pointer, live path sync |
 | `src/lib/claude-auth.ts` | Auth snapshots under `<profile>/.accounts-auth/` |
 | `src/lib/import-profile.ts` | `import` / `login` |

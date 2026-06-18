@@ -1,8 +1,8 @@
 # @hasna/accounts
 
 > Manage and switch between multiple AI coding tool profiles/accounts on one
-> machine — Claude Code, Takumi, Codex CLI, Gemini CLI, opencode, Cursor
-> Agent, Pi Coding Agent, Hermes, Kimi Code, Grok Build, and custom tools.
+> machine — Claude Code, Takumi, Codex CLI, Codex App, Gemini CLI, opencode,
+> Cursor Agent, Pi Coding Agent, Hermes, Kimi Code, Grok Build, and custom tools.
 
 `accounts` is a local-first CLI. Each **profile** is an isolated config directory.
 Switch **in the terminal** with `CLAUDE_CONFIG_DIR`, or **in Cursor / VS Code** with
@@ -11,9 +11,9 @@ Switch **in the terminal** with `CLAUDE_CONFIG_DIR`, or **in Cursor / VS Code** 
 - **Isolated profiles** — separate config dirs (skills, settings, sessions). Nothing leaks.
 - **Apply mode** — sync OAuth / credentials to live paths for IDEs (Claude-only today).
 - **Remembers the email** — auto-detected from `.claude.json` when possible.
-- **Multi-tool** — first-class built-ins for Claude, Takumi, Codex, Gemini,
-  opencode, Cursor Agent, Pi, Hermes, Kimi Code, and Grok Build; custom tools
-  via `accounts tools add`.
+- **Multi-tool** — first-class built-ins for Claude, Takumi, Codex CLI, Codex
+  App, Gemini, opencode, Cursor Agent, Pi, Hermes, Kimi Code, and Grok Build;
+  custom tools via `accounts tools add`.
 - **Per-tool names** — `work` can exist for Claude, Codex, Cursor, etc.; pass
   `--tool` when a bare profile name is ambiguous.
 - **Local-first** — registry at `~/.hasna/accounts/`. No network, no telemetry.
@@ -59,6 +59,30 @@ After `accounts login <name>`, `accounts` snapshots the auth Claude wrote,
 updates the detected email, and applies that profile to live `~/.claude` paths
 automatically. `accounts apply` still refuses profiles without auth so live OAuth
 is not wiped.
+
+## Codex App profiles on macOS
+
+Codex CLI profiles use `--tool codex`. The macOS desktop app needs its own tool
+because it also needs an isolated Electron user data directory:
+
+```bash
+# Create/sign into a desktop app profile. Quit Codex.app after login finishes.
+accounts login personal --tool codex-app
+accounts login work --tool codex-app
+
+# Switch by launching the desired app profile.
+accounts launch personal --tool codex-app
+accounts launch work --tool codex-app
+
+# Or print/launch the exact handoff command.
+accounts switch work --tool codex-app
+accounts switch work --tool codex-app --launch
+```
+
+Each `codex-app` profile gets its own `CODEX_HOME` and
+`--user-data-dir=<profile>/electron-user-data`. New profiles also get
+`cli_auth_credentials_store = "file"` in `config.toml` so ChatGPT auth stays in
+that profile directory instead of sharing one macOS Keychain credential.
 
 ## Three pointers (active, applied, isolated)
 
@@ -224,9 +248,10 @@ JSON by default; auth snapshots stay local.
 
 | Tool | id | Env var | Default dir |
 |------|----|---------|-------------|
-| Claude Code | `claude` | `CLAUDE_CONFIG_DIR` | `~/.claude` |
+| Claude Code | `claude` | `CLAUDE_CONFIG_DIR`, `TELEGRAM_STATE_DIR` | `~/.claude` |
 | Takumi | `takumi` | `TAKUMI_CONFIG_DIR` | `~/.takumi` |
 | Codex CLI | `codex` | `CODEX_HOME` | `~/.codex` |
+| Codex App | `codex-app` | `CODEX_HOME` + `--user-data-dir` | `~/.codex` |
 | Gemini CLI | `gemini` | `GEMINI_CONFIG_DIR` | `~/.gemini` |
 | opencode | `opencode` | `OPENCODE_CONFIG_DIR`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME` | `~/.config/opencode` |
 | Cursor Agent | `cursor` | `CURSOR_CONFIG_DIR` | `~/.cursor` |
@@ -241,6 +266,9 @@ globally is intentionally not recommended.
 
 Custom tools can join supervised resume switching with `accounts tools add ... --resume-arg <arg>`.
 They can also define permission presets with `--permission-arg preset=--flag`.
+Use `--launch-arg` for app-level arguments that should be prepended to every
+login/launch/run command; templates support `{profileDir}`, `{profileName}`, and
+`{toolId}`.
 
 ## Library
 

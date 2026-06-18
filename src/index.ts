@@ -10,6 +10,7 @@ export {
   addCustomTool,
   removeCustomTool,
   mergeToolArgs,
+  launchArgsFor,
   normalizePermissionPreset,
   permissionArgsFor,
 } from "./lib/tools.js";

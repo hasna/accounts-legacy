@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { type ToolDef, AccountsError, toolDefSchema } from "../types.js";
+import { type Profile, type ToolDef, AccountsError, toolDefSchema } from "../types.js";
 import { loadStore, saveStore } from "../storage.js";
 
 /**
@@ -13,6 +13,9 @@ export const BUILTIN_TOOLS: ToolDef[] = [
     id: "claude",
     label: "Claude Code",
     envVar: "CLAUDE_CONFIG_DIR",
+    extraEnv: {
+      TELEGRAM_STATE_DIR: "{profileDir}/channels/telegram",
+    },
     defaultDir: join(homedir(), ".claude"),
     bin: "claude",
     loginHint: "run /login inside Claude, then /exit when done",
@@ -28,6 +31,16 @@ export const BUILTIN_TOOLS: ToolDef[] = [
     },
     accountFile: ".claude.json",
     emailPath: ["oauthAccount", "emailAddress"],
+  },
+  {
+    id: "codex-app",
+    label: "Codex App",
+    envVar: "CODEX_HOME",
+    defaultDir: join(homedir(), ".codex"),
+    bin: "/Applications/Codex.app/Contents/MacOS/Codex",
+    loginHint: "sign in inside Codex.app, then quit the app when the profile is ready",
+    launchArgs: ["--user-data-dir={profileDir}/electron-user-data"],
+    accountFile: "auth.json",
   },
   {
     id: "codex",
@@ -149,6 +162,7 @@ export const DEFAULT_TOOL = "claude";
 
 export interface ToolArgOptions {
   permissions?: string;
+  profile?: Profile;
 }
 
 const PERMISSION_ALIASES = new Map<string, string>([
@@ -185,9 +199,22 @@ export function permissionArgsFor(tool: ToolDef, permissions?: string): string[]
   return args;
 }
 
+function renderToolArg(value: string, profile: Profile): string {
+  return value
+    .replaceAll("{profileDir}", profile.dir)
+    .replaceAll("{profileName}", profile.name)
+    .replaceAll("{toolId}", profile.tool);
+}
+
+export function launchArgsFor(tool: ToolDef, profile?: Profile): string[] {
+  const args = tool.launchArgs ?? [];
+  return profile ? args.map((arg) => renderToolArg(arg, profile)) : args;
+}
+
 export function mergeToolArgs(tool: ToolDef, args: string[], opts: ToolArgOptions = {}): string[] {
+  const launchArgs = launchArgsFor(tool, opts.profile).filter((arg) => !args.includes(arg));
   const permissionArgs = permissionArgsFor(tool, opts.permissions).filter((arg) => !args.includes(arg));
-  return [...permissionArgs, ...args];
+  return [...permissionArgs, ...launchArgs, ...args];
 }
 
 const BUILTIN_IDS = new Set(BUILTIN_TOOLS.map((t) => t.id));

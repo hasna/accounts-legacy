@@ -1,5 +1,6 @@
 import type { Profile, ToolDef } from "../types.js";
 import { CLAUDE_API_AUTH_ENV_KEYS, sanitizeClaudeProfileApiSettings } from "./claude-auth.js";
+import { ensureCodexAppProfileConfig } from "./codex-app.js";
 
 function renderTemplate(value: string, profile: Profile): string {
   return value.replaceAll("{profileDir}", profile.dir).replaceAll("{profileName}", profile.name).replaceAll("{toolId}", profile.tool);
@@ -16,6 +17,7 @@ export function profileEnv(profile: Profile, tool: ToolDef): Record<string, stri
     sanitizeClaudeProfileApiSettings(profile.dir, tool);
     for (const key of CLAUDE_API_AUTH_ENV_KEYS) env[key] = "";
   }
+  if (tool.id === "codex-app") ensureCodexAppProfileConfig(profile.dir);
   return env;
 }
 

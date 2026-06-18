@@ -1,5 +1,5 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -77,6 +77,7 @@ test("built-in tools cover major coding agents", () => {
   const ids = listTools().map((t) => t.id);
   expect(ids).toContain("claude");
   expect(ids).toContain("codex");
+  expect(ids).toContain("codex-app");
   expect(ids).toContain("takumi");
   expect(ids).toContain("gemini");
   expect(ids).toContain("opencode");
@@ -113,6 +114,13 @@ test("mergeToolArgs prepends permission args without duplicating explicit flags"
   ]);
 });
 
+test("mergeToolArgs prepends templated launch args", () => {
+  const p = addProfile({ name: "desktop", tool: "codex-app" });
+  expect(mergeToolArgs(getTool("codex-app"), [], { profile: p })).toEqual([
+    `--user-data-dir=${join(p.dir, "electron-user-data")}`,
+  ]);
+});
+
 test("unsupported permission preset fails clearly", () => {
   expect(() => permissionArgsFor(getTool("opencode"), "dangerous")).toThrow(AccountsError);
   expect(permissionArgsFor(getTool("opencode"), "none")).toEqual([]);
@@ -135,6 +143,21 @@ test("profileEnv renders extra per-tool environment templates", () => {
   expect(env.XDG_CONFIG_HOME).toBe(join(p.dir, "xdg-config"));
   expect(env.XDG_DATA_HOME).toBe(join(p.dir, "xdg-data"));
   expect(formatExportLines(env)).toContain("export OPENCODE_CONFIG_DIR=");
+});
+
+test("claude profile env isolates Telegram channel state", () => {
+  const p = addProfile({ name: "telegram", tool: "claude" });
+  const env = profileEnv(p, getTool("claude"));
+  expect(env.CLAUDE_CONFIG_DIR).toBe(p.dir);
+  expect(env.TELEGRAM_STATE_DIR).toBe(join(p.dir, "channels", "telegram"));
+  expect(formatExportLines(env)).toContain("export TELEGRAM_STATE_DIR=");
+});
+
+test("codex app profile env isolates CODEX_HOME and file credentials", () => {
+  const p = addProfile({ name: "desktop", tool: "codex-app" });
+  const env = profileEnv(p, getTool("codex-app"));
+  expect(env.CODEX_HOME).toBe(p.dir);
+  expect(readFileSync(join(p.dir, "config.toml"), "utf8")).toContain('cli_auth_credentials_store = "file"');
 });
 
 test("getProfile throws for missing", () => {

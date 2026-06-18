@@ -6,6 +6,20 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.1.16] - 2026-06-18
+
+### Added
+
+- Built-in `codex-app` tool for macOS Codex.app profile switching. It isolates
+  both `CODEX_HOME` and Electron `--user-data-dir` per profile.
+- Tool `launchArgs` templates for app-level launch arguments, including
+  `{profileDir}`, `{profileName}`, and `{toolId}`.
+
+### Fixed
+
+- New Codex App profiles default to file-based Codex credential caching so
+  ChatGPT auth stays inside the selected profile directory.
+
 ## [0.1.15] - 2026-06-17
 
 ### Changed

@@ -38,9 +38,9 @@ function commandLine(env: Record<string, string>, command: string[]): string {
   return `${formatEnvAssignments(env)} ${command.map(shellQuote).join(" ")}`.trim();
 }
 
-function commandFor(tool: ToolDef, opts: SwitchOptions): string[] {
+function commandFor(profile: Profile, tool: ToolDef, opts: SwitchOptions): string[] {
   const args = [...(opts.resume ? (tool.resumeArgs ?? []) : []), ...(opts.args ?? [])];
-  return [tool.bin, ...mergeToolArgs(tool, args, { permissions: opts.permissions })];
+  return [tool.bin, ...mergeToolArgs(tool, args, { permissions: opts.permissions, profile })];
 }
 
 export function switchProfile(name: string, opts: SwitchOptions = {}): SwitchResult {
@@ -60,7 +60,7 @@ export function switchProfile(name: string, opts: SwitchOptions = {}): SwitchRes
     useProfile(name, tool.id);
   }
 
-  const command = commandFor(tool, opts);
+  const command = commandFor(profile, tool, opts);
   const restartRequired = opts.resume === true || applied || mode === "env";
   const message = applied
     ? `${profile.name} is now the live/default ${tool.label} profile`

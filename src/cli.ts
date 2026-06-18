@@ -298,7 +298,7 @@ program
       if (tool.id === "claude") {
         console.log(chalk.dim("  After Claude exits, accounts will make this the live/default Claude account."));
       }
-      const res = spawnSync(tool.bin, loginArgs, {
+      const res = spawnSync(tool.bin, mergeToolArgs(tool, loginArgs, { profile }), {
         stdio: "inherit",
         env: { ...process.env, ...env },
       });
@@ -508,7 +508,7 @@ program
       const profile = getProfile(name, opts.tool);
       const tool = getTool(profile.tool);
       const env = profileEnv(profile, tool);
-      const launchArgs = mergeToolArgs(tool, args, { permissions: opts.permissions });
+      const launchArgs = mergeToolArgs(tool, args, { permissions: opts.permissions, profile });
       useProfile(name, tool.id); // mark active + bump lastUsedAt
       console.log(chalk.dim(`→ ${formatEnvAssignments(env)} ${tool.bin} ${launchArgs.join(" ")}`));
       const res = spawnSync(tool.bin, launchArgs, {
@@ -534,6 +534,7 @@ program
       const plan = resolveSupervisorLaunch(target, { profile: opts.profile, tool: opts.tool });
       const runArgs = mergeToolArgs(plan.tool, [...(opts.resume ? (plan.tool.resumeArgs ?? []) : []), ...args], {
         permissions: opts.permissions,
+        profile: plan.profile,
       });
       console.error(chalk.green(`✓ accounts supervisor running ${plan.tool.label} as ${chalk.bold(plan.profile.name)}`));
       console.error(chalk.dim(`  control: accounts supervisor status ${plan.tool.id}`));
@@ -873,6 +874,7 @@ tools
   .option("--default-dir <path>", "default config dir (default: ~/.<id>)")
   .option("--extra-env <VAR=VALUE...>", "additional env var templates; supports {profileDir}, {profileName}, {toolId}")
   .option("--login-arg <arg...>", "arguments for `accounts login <profile> --tool <id>`")
+  .option("--launch-arg <arg...>", "arguments prepended when launching; supports {profileDir}, {profileName}, {toolId}")
   .option("--resume-arg <arg...>", "arguments for supervised resume/restart, e.g. --continue")
   .option("--permission-arg <preset=arg...>", "tool permission preset args, e.g. dangerous=--yolo")
   .option("--account-file <file>", "file inside the config dir holding the email")
@@ -888,6 +890,7 @@ tools
           defaultDir?: string;
           extraEnv?: string[];
           loginArg?: string[];
+          launchArg?: string[];
           resumeArg?: string[];
           permissionArg?: string[];
           accountFile?: string;
@@ -909,6 +912,7 @@ tools
           defaultDir: opts.defaultDir ? expandPath(opts.defaultDir) : join(homedir(), `.${id}`),
           ...(Object.keys(extraEnv).length > 0 ? { extraEnv } : {}),
           ...(opts.loginArg ? { loginArgs: opts.loginArg } : {}),
+          ...(opts.launchArg ? { launchArgs: opts.launchArg } : {}),
           ...(opts.resumeArg ? { resumeArgs: opts.resumeArg } : {}),
           ...(Object.keys(permissionArgs).length > 0 ? { permissionArgs } : {}),
           ...(opts.accountFile ? { accountFile: opts.accountFile } : {}),
