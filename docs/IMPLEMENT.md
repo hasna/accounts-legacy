@@ -31,7 +31,7 @@ Registry file: `~/.hasna/accounts/accounts.json` (fields `current` and `applied`
 | Path | Role |
 |------|------|
 | `src/storage.ts` | `ACCOUNTS_HOME`, load/save store, sanitize stale pointers |
-| `src/lib/profiles.ts` | CRUD, `useProfile` → `current`, rename/remove pointer hygiene |
+| `src/lib/profiles.ts` | CRUD, profile metadata/identity/card-last4 validation, `useProfile` → `current`, rename/remove pointer hygiene |
 | `src/lib/tools.ts` | Built-in and custom tool registry |
 | `src/lib/env.ts` | Per-tool env rendering (`{profileDir}`, `{profileName}`, `{toolId}` templates), including Claude channel state |
 | `src/lib/codex-app.ts` | Codex App profile preparation, including file-based credential cache defaults |
@@ -57,6 +57,20 @@ Registry file: `~/.hasna/accounts/accounts.json` (fields `current` and `applied`
 - `applied.<tool>` or `current.<tool>` points at a removed profile
 
 Warnings (exit 0): no email, no auth snapshot, active ≠ applied drift.
+
+## Profile metadata
+
+The store keeps account ownership metadata directly on each profile:
+
+- `email` — account email, auto-detected for tools with an account file.
+- `displayName` — human-readable account owner/name.
+- `identity` — identity identifier/ref from `identities`.
+- `cardLast4` — optional payment card last four digits only, validated as `^\d{4}$`.
+- `metadata` — JSON-safe string/finite-number/boolean/null map for operational tags;
+  reserved object prototype keys are rejected.
+
+Never store secrets, access tokens, full card numbers, billing addresses, or
+private identity documents in `metadata`.
 
 ## Tests
 

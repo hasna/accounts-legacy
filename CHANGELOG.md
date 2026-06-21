@@ -6,6 +6,43 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.1.21] - 2026-06-21
+
+### Added
+
+- Profile ownership metadata: `displayName`, `identity`, `cardLast4`, and
+  JSON-safe `metadata` fields, with CLI support via `accounts add` and
+  `accounts set`.
+
+### Fixed
+
+- Profile metadata updates now reject empty identity/name fields, reserved
+  prototype keys, and non-finite numbers before writing the registry.
+
+## [0.1.20] - 2026-06-21
+
+### Fixed
+
+- Hardened safe write-path symlink handling for account store writes.
+
+## [0.1.19] - 2026-06-21
+
+### Fixed
+
+- Hardened account store file permissions.
+
+## [0.1.18] - 2026-06-21
+
+### Fixed
+
+- Hardened profile purge path boundary checks.
+
+## [0.1.17] - 2026-06-20
+
+### Fixed
+
+- Disambiguated active profile lookup by tool.
+
 ## [0.1.16] - 2026-06-18
 
 ### Added
@@ -39,6 +76,11 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 - macOS keychain write failures now report sanitized stderr/status instead of command arguments.
 
+## [0.1.13] - 2026-06-17
+
+### Changed
+
+- Maintenance publish; no user-facing change note was recorded for this release.
 
 ## [0.1.12] - 2026-06-17
 
@@ -46,6 +88,41 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 - Claude OAuth profiles now strip `apiKeyHelper` and API auth env settings before login, env, launch, supervisor restart, and apply so subscription profiles do not fall back to API-key auth.
 
+## [0.1.11] - 2026-06-16
+
+### Changed
+
+- Maintenance publish; no user-facing change note was recorded for this release.
+
+## [0.1.10] - 2026-06-16
+
+### Changed
+
+- Maintenance publish; no user-facing change note was recorded for this release.
+
+## [0.1.9] - 2026-06-16
+
+### Changed
+
+- Maintenance publish; no user-facing change note was recorded for this release.
+
+## [0.1.8] - 2026-06-11
+
+### Changed
+
+- Maintenance publish; no user-facing change note was recorded for this release.
+
+## [0.1.7] - 2026-06-10
+
+### Changed
+
+- Maintenance publish; no user-facing change note was recorded for this release.
+
+## [0.1.6] - 2026-06-04
+
+### Changed
+
+- Maintenance publish; no user-facing change note was recorded for this release.
 
 ## [0.1.5] - 2026-06-04
 

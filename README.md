@@ -116,7 +116,7 @@ Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
 
 | Command | Description |
 |---------|-------------|
-| `accounts add <name>` | Create a profile. `--tool`, `--email`, `--dir`, `--description`. |
+| `accounts add <name>` | Create a profile. `--tool`, `--email`, `--display-name`, `--identity`, `--card-last4`, `--metadata key=value`, `--dir`, `--description`. |
 | `accounts import [name]` | Import existing config dir (default `~/.claude`). `--copy` for managed copy. |
 | `accounts login <name>` | Launch the profile's tool login flow in an isolated profile dir. Use `--tool` only for new or ambiguous profiles. |
 | `accounts apply <name>` | Apply profile auth to live Claude paths (requires snapshot; Claude-only). |
@@ -144,6 +144,29 @@ Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
 | `accounts doctor` | Check registry and dirs (exits 1 on errors). |
 
 See `accounts --help` for `set`, `rename`, `remove`, `tools`, etc.
+
+## Account Metadata
+
+Profiles can carry non-secret ownership metadata alongside their isolated config
+directory:
+
+```bash
+accounts add account001 \
+  --email owner@example.com \
+  --display-name "Owner Name" \
+  --identity agent:owner-name \
+  --card-last4 4242 \
+  --metadata machine=spark02
+
+accounts set account001 --identity identity_abc123 --metadata source=spark01
+accounts show account001 --json
+```
+
+`cardLast4` is validated as exactly four digits. `metadata` accepts repeated
+`key=value` pairs with string, finite number, boolean, or null values. Metadata
+keys may use letters, digits, `_`, `.`, `:`, and `-`; object prototype keys such
+as `__proto__`, `prototype`, and `constructor` are rejected. Do not store
+secrets, tokens, full card numbers, or billing addresses in profile metadata.
 
 ## Agent / MCP Switching
 

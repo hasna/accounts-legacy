@@ -29,7 +29,7 @@ export {
   useProfile,
   currentProfile,
 } from "./lib/profiles.js";
-export type { AddOptions, RemoveOptions, UpdateOptions } from "./lib/profiles.js";
+export type { AddOptions, RemoveOptions, UpdateOptions, ProfileMetadata, ProfileMetadataValue } from "./lib/profiles.js";
 export { applyProfile, appliedProfile } from "./lib/apply.js";
 export { importProfile, ensureProfileForLogin } from "./lib/import-profile.js";
 export type { ImportOptions } from "./lib/import-profile.js";

@@ -37,10 +37,71 @@ export const toolDefSchema = z.object({
  */
 export type ToolDef = z.infer<typeof toolDefSchema>;
 
+const metadataKeyPattern = /^[A-Za-z0-9_.:-]{1,64}$/;
+const reservedMetadataKeys = new Set(["__proto__", "prototype", "constructor"]);
+const metadataValueSchema = z.union([
+  z.string(),
+  z.number().refine(Number.isFinite, "metadata numbers must be finite"),
+  z.boolean(),
+  z.null(),
+]);
+type MetadataValue = z.infer<typeof metadataValueSchema>;
+const metadataSchema = z
+  .unknown()
+  .superRefine((value, ctx) => {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "metadata must be an object" });
+      return;
+    }
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "metadata must be a plain object" });
+      return;
+    }
+    for (const key of Reflect.ownKeys(value)) {
+      if (typeof key !== "string") {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: "metadata keys must be strings" });
+        continue;
+      }
+      if (!metadataKeyPattern.test(key)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: `invalid metadata key "${key}"` });
+        continue;
+      }
+      if (reservedMetadataKeys.has(key)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: [key], message: `reserved metadata key "${key}"` });
+        continue;
+      }
+      const parsed = metadataValueSchema.safeParse((value as Record<string, unknown>)[key]);
+      if (!parsed.success) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: [key],
+          message: `metadata "${key}" must be a string, finite number, boolean, or null`,
+        });
+      }
+    }
+  })
+  .transform((value) => {
+    const out: Record<string, MetadataValue> = Object.create(null);
+    const record = value as Record<string, MetadataValue>;
+    for (const key of Reflect.ownKeys(value as object)) {
+      if (typeof key === "string") out[key] = record[key] as MetadataValue;
+    }
+    return out;
+  });
+
+function nonBlankStringSchema(label: string) {
+  return z.string().refine((value) => value.trim().length > 0, `${label} must not be empty`);
+}
+
 export const profileSchema = z.object({
-  name: z.string(),
-  tool: z.string(),
+  name: profileNameSchema,
+  tool: slugSchema,
   email: z.string().email().optional(),
+  displayName: nonBlankStringSchema("display name").optional(),
+  identity: nonBlankStringSchema("identity").optional(),
+  cardLast4: z.string().regex(/^\d{4}$/, "cardLast4 must be exactly 4 digits").optional(),
+  metadata: metadataSchema.optional(),
   dir: z.string(),
   description: z.string().optional(),
   createdAt: z.string(),

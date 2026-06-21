@@ -1,6 +1,6 @@
 {
   "name": "@hasna/accounts",
-  "version": "0.1.20",
+  "version": "0.1.21",
   "description": "Manage and switch between multiple Claude Code (and other AI coding tool) profiles/accounts locally — isolated config dirs, per-account email, one-command switching.",
   "type": "module",
   "main": "dist/index.js",
@@ -21,12 +21,15 @@
   },
   "files": [
     "dist",
+    "docs",
+    "CHANGELOG.md",
     "LICENSE",
     "README.md"
   ],
   "scripts": {
     "build": "rm -rf dist && bun build src/cli.ts --outdir dist --target node && bun build src/mcp.ts --outdir dist --target node && bun build src/index.ts --outdir dist --target node && bun build src/storage.ts --outdir dist --target node --external @aws-sdk/client-s3 && tsc --emitDeclarationOnly --outDir dist",
     "dev": "bun run src/cli.ts",
+    "prepack": "bun run build",
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },

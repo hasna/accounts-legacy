@@ -142,10 +142,14 @@ export function loadStore(): Store {
 
 export function saveStore(store: Store): void {
   const path = storePath();
+  const parsed = storeSchema.safeParse(store);
+  if (!parsed.success) {
+    throw new AccountsError(`invalid store: ${parsed.error.issues.map((i) => i.message).join("; ")}`);
+  }
   assertSafeWritePath(path, { mustStayUnder: accountsHome() });
   mkdirSync(join(path, ".."), { recursive: true });
   if (existsSync(path)) chmodSync(path, 0o600);
-  writeFileSync(path, JSON.stringify(store, null, 2) + "\n", { mode: 0o600 });
+  writeFileSync(path, JSON.stringify(parsed.data, null, 2) + "\n", { mode: 0o600 });
   chmodSync(path, 0o600);
 }
 

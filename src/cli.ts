@@ -29,6 +29,7 @@ import {
   renameProfile,
   updateProfile,
   useProfile,
+  type ProfileMetadata,
 } from "./lib/profiles.js";
 import {
   accountsHome,
@@ -100,8 +101,37 @@ function fmtProfile(p: Profile, active: boolean, applied = false): string {
           : chalk.bold(p.name);
   const tool = chalk.cyan(p.tool);
   const email = p.email ? chalk.yellow(p.email) : chalk.dim("(no email)");
+  const displayName = p.displayName ? chalk.dim(` (${p.displayName})`) : "";
   const desc = p.description ? chalk.dim(` — ${p.description}`) : "";
-  return `${marker} ${name}  ${tool}  ${email}${desc}`;
+  return `${marker} ${name}${displayName}  ${tool}  ${email}${desc}`;
+}
+
+function collectMetadata(value: string, previous: string[] = []): string[] {
+  return [...previous, value];
+}
+
+function parseMetadataValue(value: string): string | number | boolean | null {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  if (value === "null") return null;
+  if (/^-?(0|[1-9]\d*)(\.\d+)?$/.test(value)) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : value;
+  }
+  return value;
+}
+
+function parseMetadataPairs(pairs: string[] | undefined): ProfileMetadata | undefined {
+  if (!pairs || pairs.length === 0) return undefined;
+  const metadata = Object.create(null) as ProfileMetadata;
+  for (const pair of pairs) {
+    const idx = pair.indexOf("=");
+    if (idx <= 0) die(`invalid metadata "${pair}" — expected key=value`);
+    const key = pair.slice(0, idx);
+    const value = pair.slice(idx + 1);
+    metadata[key] = parseMetadataValue(value);
+  }
+  return metadata;
 }
 
 function printStorageStatus(status: AccountsStorageStatus, json?: boolean): void {
@@ -158,17 +188,48 @@ program
   .description("create a new profile with an isolated config dir")
   .option("-t, --tool <tool>", "tool the profile is for", DEFAULT_TOOL)
   .option("-e, --email <email>", "account email (auto-detected when omitted)")
+  .option("--display-name <name>", "human-readable account owner/name")
+  .option("--identity <id>", "identity identifier or ref from the identities CLI")
+  .option("--card-last4 <digits>", "payment card last four digits")
+  .option("--metadata <key=value>", "arbitrary JSON-safe metadata key=value (repeatable)", collectMetadata, [])
   .option("-d, --dir <path>", "config dir to use (default: managed dir under ~/.hasna/accounts)")
   .option("--description <text>", "free-text description")
   .action(
-    action((name: string, opts: { tool: string; email?: string; dir?: string; description?: string }) => {
-      const p = addProfile({ name, tool: opts.tool, email: opts.email, dir: opts.dir, description: opts.description });
+    action(
+      (
+        name: string,
+        opts: {
+          tool: string;
+          email?: string;
+          displayName?: string;
+          identity?: string;
+          cardLast4?: string;
+          metadata?: string[];
+          dir?: string;
+          description?: string;
+        },
+      ) => {
+        const p = addProfile({
+          name,
+          tool: opts.tool,
+          email: opts.email,
+          displayName: opts.displayName,
+          identity: opts.identity,
+          cardLast4: opts.cardLast4,
+          metadata: parseMetadataPairs(opts.metadata),
+          dir: opts.dir,
+          description: opts.description,
+        });
       console.log(chalk.green(`✓ created profile ${chalk.bold(p.name)} for ${chalk.cyan(p.tool)}`));
       console.log(`  config dir: ${p.dir}`);
       console.log(`  email:      ${p.email ?? chalk.dim("(none — set with `accounts set " + p.name + " --email ...`)")}`);
+      if (p.displayName) console.log(`  name:       ${p.displayName}`);
+      if (p.identity) console.log(`  identity:   ${p.identity}`);
+      if (p.cardLast4) console.log(`  card:       ****${p.cardLast4}`);
       const tool = getTool(p.tool);
       console.log(chalk.dim(`  launch it:  accounts launch ${p.name}    (sets ${tool.envVar} and runs ${tool.bin})`));
-    }),
+      },
+    ),
   );
 
 program
@@ -217,6 +278,12 @@ program
       console.log(`  applied:    ${isApplied ? chalk.magenta("yes") : chalk.dim("no")}`);
       console.log(`  config dir: ${p.dir}${existsSync(p.dir) ? "" : chalk.red("  [missing]")}`);
       console.log(`  email:      ${p.email ?? chalk.dim("(none)")}`);
+      if (p.displayName) console.log(`  name:       ${p.displayName}`);
+      if (p.identity) console.log(`  identity:   ${p.identity}`);
+      if (p.cardLast4) console.log(`  card:       ****${p.cardLast4}`);
+      if (p.metadata && Object.keys(p.metadata).length > 0) {
+        console.log(`  metadata:   ${JSON.stringify(p.metadata)}`);
+      }
       console.log(`  created:    ${p.createdAt}`);
       if (p.lastUsedAt) console.log(`  last used:  ${p.lastUsedAt}`);
     }),
@@ -772,19 +839,54 @@ storage
 program
   .command("set")
   .argument("<name>", "profile name")
-  .description("update a profile's email, description, or config dir")
+  .description("update a profile's email, metadata, description, or config dir")
   .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .option("-e, --email <email>", "set the account email")
+  .option("--display-name <name>", "set the human-readable account owner/name")
+  .option("--identity <id>", "set the identity identifier or ref from the identities CLI")
+  .option("--card-last4 <digits>", "set the payment card last four digits")
+  .option("--metadata <key=value>", "merge arbitrary JSON-safe metadata key=value (repeatable)", collectMetadata, [])
   .option("--description <text>", "set the description")
   .option("-d, --dir <path>", "set the config dir")
   .action(
-    action((name: string, opts: { tool?: string; email?: string; description?: string; dir?: string }) => {
-      if (opts.email === undefined && opts.description === undefined && opts.dir === undefined) {
-        die("nothing to set — pass --email, --description, or --dir");
+    action(
+      (
+        name: string,
+        opts: {
+          tool?: string;
+          email?: string;
+          displayName?: string;
+          identity?: string;
+          cardLast4?: string;
+          metadata?: string[];
+          description?: string;
+          dir?: string;
+        },
+      ) => {
+        if (
+          opts.email === undefined &&
+          opts.displayName === undefined &&
+          opts.identity === undefined &&
+          opts.cardLast4 === undefined &&
+          (!opts.metadata || opts.metadata.length === 0) &&
+          opts.description === undefined &&
+          opts.dir === undefined
+        ) {
+          die("nothing to set — pass --email, --display-name, --identity, --card-last4, --metadata, --description, or --dir");
+        }
+        const p = updateProfile(name, {
+          tool: opts.tool,
+          email: opts.email,
+          displayName: opts.displayName,
+          identity: opts.identity,
+          cardLast4: opts.cardLast4,
+          metadata: parseMetadataPairs(opts.metadata),
+          description: opts.description,
+          dir: opts.dir,
+        });
+        console.log(chalk.green(`✓ updated ${chalk.bold(p.name)}`));
       }
-      const p = updateProfile(name, opts);
-      console.log(chalk.green(`✓ updated ${chalk.bold(p.name)}`));
-    }),
+    ),
   );
 
 program

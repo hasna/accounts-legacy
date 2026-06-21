@@ -197,6 +197,74 @@ test("update sets email and description", () => {
   expect(p.description).toBe("main");
 });
 
+test("add and update preserve account metadata and identity links", () => {
+  const p = addProfile({
+    name: "work",
+    email: "work@example.com",
+    displayName: "Work Owner",
+    identity: "agent:work-owner",
+    cardLast4: "4242",
+    metadata: { machine: "spark02", priority: 3, primary: true, note: null },
+  });
+  expect(p.displayName).toBe("Work Owner");
+  expect(p.identity).toBe("agent:work-owner");
+  expect(p.cardLast4).toBe("4242");
+  expect(p.metadata).toEqual({ machine: "spark02", priority: 3, primary: true, note: null });
+
+  const updated = updateProfile("work", {
+    displayName: "Updated Owner",
+    identity: "identity_abc123",
+    metadata: { machine: "spark01", cardIssuer: "visa" },
+  });
+  expect(updated.displayName).toBe("Updated Owner");
+  expect(updated.identity).toBe("identity_abc123");
+  expect(updated.cardLast4).toBe("4242");
+  expect(updated.metadata).toEqual({ machine: "spark01", priority: 3, primary: true, note: null, cardIssuer: "visa" });
+});
+
+test("card last4 must be exactly four digits", () => {
+  expect(() => addProfile({ name: "bad", cardLast4: "123" })).toThrow(AccountsError);
+  addProfile({ name: "work" });
+  expect(() => updateProfile("work", { cardLast4: "12ab" })).toThrow(AccountsError);
+});
+
+test("display name and identity must not be empty", () => {
+  expect(() => addProfile({ name: "bad", displayName: "" })).toThrow(AccountsError);
+  addProfile({ name: "work" });
+  expect(() => updateProfile("work", { displayName: "" })).toThrow(AccountsError);
+  expect(() => updateProfile("work", { identity: " " })).toThrow(AccountsError);
+  expect(loadStore().profiles[0]?.name).toBe("work");
+});
+
+test("metadata values and keys are validated", () => {
+  expect(() => addProfile({ name: "bad", metadata: { "bad key": "value" } })).toThrow(AccountsError);
+  expect(() => addProfile({ name: "proto", metadata: { ["__proto__"]: "value" } })).toThrow(AccountsError);
+  expect(() => addProfile({ name: "ctor", metadata: { constructor: "value" } })).toThrow(AccountsError);
+  expect(() => addProfile({ name: "nan", metadata: { score: Number.NaN } })).toThrow(AccountsError);
+  expect(() => addProfile({ name: "inf", metadata: { score: Number.POSITIVE_INFINITY } })).toThrow(AccountsError);
+  expect(() => addProfile({ name: "array", metadata: ["value"] as never })).toThrow(AccountsError);
+  expect(() => addProfile({ name: "custom", metadata: Object.create({ inherited: "value" }) as never })).toThrow(AccountsError);
+});
+
+test("saveStore validates raw profile metadata and ownership fields", () => {
+  const storeWith = (profile: Record<string, unknown>) =>
+    ({
+      version: 1,
+      current: {},
+      applied: {},
+      profiles: [{ name: "work", tool: "claude", dir: join(home, "work"), createdAt: "2026-06-21T00:00:00.000Z", ...profile }],
+      tools: [],
+    }) as never;
+
+  expect(() => saveStore(storeWith({ name: "BAD NAME" }))).toThrow(AccountsError);
+  expect(() => saveStore(storeWith({ displayName: " " }))).toThrow(AccountsError);
+  expect(() => saveStore(storeWith({ identity: "\t" }))).toThrow(AccountsError);
+  expect(() => saveStore(storeWith({ metadata: { score: Number.POSITIVE_INFINITY } }))).toThrow(AccountsError);
+  expect(() => saveStore(storeWith({ metadata: { "bad key": "value" } }))).toThrow(AccountsError);
+  expect(() => saveStore(storeWith({ metadata: { constructor: "value" } }))).toThrow(AccountsError);
+  expect(() => saveStore(storeWith({ metadata: JSON.parse('{"__proto__":"value"}') }))).toThrow(AccountsError);
+});
+
 test("remove clears the current pointer", () => {
   addProfile({ name: "work" });
   useProfile("work");

@@ -6,8 +6,50 @@ import { loadStore, saveStore, profilesDir } from "../storage.js";
 import { DEFAULT_TOOL, getTool } from "./tools.js";
 import { detectEmail } from "./detect.js";
 
+export type ProfileMetadataValue = string | number | boolean | null;
+export type ProfileMetadata = Record<string, ProfileMetadataValue>;
+const RESERVED_METADATA_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function assertCardLast4(value: string): void {
+  if (!/^\d{4}$/.test(value)) throw new AccountsError("card last4 must be exactly 4 digits");
+}
+
+function normalizeNonEmptyText(value: string | undefined, label: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (value.trim().length === 0) throw new AccountsError(`${label} must not be empty`);
+  return value;
+}
+
+function normalizeMetadata(metadata: ProfileMetadata | undefined): ProfileMetadata | undefined {
+  if (metadata === undefined) return undefined;
+  if (metadata === null || typeof metadata !== "object" || Array.isArray(metadata)) {
+    throw new AccountsError("metadata must be a plain object");
+  }
+  const prototype = Object.getPrototypeOf(metadata);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new AccountsError("metadata must be a plain object");
+  }
+  const out: ProfileMetadata = Object.create(null) as ProfileMetadata;
+  for (const [key, value] of Object.entries(metadata)) {
+    if (!/^[A-Za-z0-9_.:-]{1,64}$/.test(key)) {
+      throw new AccountsError(`invalid metadata key "${key}"`);
+    }
+    if (RESERVED_METADATA_KEYS.has(key)) {
+      throw new AccountsError(`reserved metadata key "${key}"`);
+    }
+    if (value !== null && !["string", "number", "boolean"].includes(typeof value)) {
+      throw new AccountsError(`metadata "${key}" must be a string, number, boolean, or null`);
+    }
+    if (typeof value === "number" && !Number.isFinite(value)) {
+      throw new AccountsError(`metadata "${key}" must be a finite number`);
+    }
+    out[key] = value;
+  }
+  return out;
 }
 
 /** Expand a leading `~` and resolve to an absolute path. */
@@ -57,6 +99,10 @@ export interface AddOptions {
   name: string;
   tool?: string;
   email?: string;
+  displayName?: string;
+  identity?: string;
+  cardLast4?: string;
+  metadata?: ProfileMetadata;
   dir?: string;
   description?: string;
 }
@@ -81,10 +127,18 @@ export function addProfile(opts: AddOptions): Profile {
   mkdirSync(dir, { recursive: true });
 
   const email = opts.email ?? detectEmail(dir, tool);
+  if (opts.cardLast4) assertCardLast4(opts.cardLast4);
+  const displayName = normalizeNonEmptyText(opts.displayName, "display name");
+  const identity = normalizeNonEmptyText(opts.identity, "identity");
+  const metadata = normalizeMetadata(opts.metadata);
   const profile: Profile = {
     name,
     tool: toolId,
     ...(email ? { email } : {}),
+    ...(displayName !== undefined ? { displayName } : {}),
+    ...(identity !== undefined ? { identity } : {}),
+    ...(opts.cardLast4 ? { cardLast4: opts.cardLast4 } : {}),
+    ...(metadata && Object.keys(metadata).length > 0 ? { metadata } : {}),
     dir,
     ...(opts.description ? { description: opts.description } : {}),
     createdAt: nowIso(),
@@ -171,6 +225,10 @@ export function renameProfile(oldName: string, newName: string, toolId?: string)
 export interface UpdateOptions {
   tool?: string;
   email?: string;
+  displayName?: string;
+  identity?: string;
+  cardLast4?: string;
+  metadata?: ProfileMetadata;
   description?: string;
   dir?: string;
 }
@@ -189,6 +247,16 @@ export function updateProfile(name: string, opts: UpdateOptions): Profile {
   }
   const profile = matches[0]!;
   if (opts.email !== undefined) profile.email = opts.email;
+  if (opts.displayName !== undefined) profile.displayName = normalizeNonEmptyText(opts.displayName, "display name");
+  if (opts.identity !== undefined) profile.identity = normalizeNonEmptyText(opts.identity, "identity");
+  if (opts.cardLast4 !== undefined) {
+    assertCardLast4(opts.cardLast4);
+    profile.cardLast4 = opts.cardLast4;
+  }
+  if (opts.metadata !== undefined) {
+    const metadata = normalizeMetadata(opts.metadata);
+    profile.metadata = { ...(profile.metadata ?? {}), ...(metadata ?? {}) };
+  }
   if (opts.description !== undefined) profile.description = opts.description;
   if (opts.dir !== undefined) {
     const dir = expandPath(opts.dir);

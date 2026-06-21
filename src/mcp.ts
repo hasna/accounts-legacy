@@ -18,7 +18,7 @@ function fail(message: string) {
 }
 
 const server = new Server(
-  { name: "accounts", version: "0.1.16" },
+  { name: "accounts", version: "0.1.21" },
   { capabilities: { tools: {} } },
 );
 
