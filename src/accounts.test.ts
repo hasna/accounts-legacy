@@ -224,6 +224,15 @@ test("remove --purge refuses to delete an unmanaged dir", () => {
   rmSync(external, { recursive: true, force: true });
 });
 
+test("remove --purge refuses managed-dir prefix siblings", () => {
+  const sibling = join(home, "profiles-evil");
+  addProfile({ name: "sibling", dir: sibling });
+  const res = removeProfile("sibling", true);
+  expect(res.purged).toBe(false);
+  expect(res.purgeNote).toBeDefined();
+  expect(existsSync(sibling)).toBe(true);
+});
+
 test("detectEmail reads claude oauthAccount.emailAddress", () => {
   const dir = mkdtempSync(join(tmpdir(), "claudedir-"));
   writeFileSync(join(dir, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "auto@example.com" } }));

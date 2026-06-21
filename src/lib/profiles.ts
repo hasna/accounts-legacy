@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { type Profile, AccountsError, profileNameSchema } from "../types.js";
 import { loadStore, saveStore, profilesDir } from "../storage.js";
@@ -26,6 +26,11 @@ export function listProfiles(toolId?: string): Profile[] {
 
 function profileMatches(name: string, toolId?: string): Profile[] {
   return loadStore().profiles.filter((p) => p.name === name && (!toolId || p.tool === toolId));
+}
+
+function isManagedProfileDir(dir: string): boolean {
+  const rel = relative(resolve(profilesDir()), resolve(dir));
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
 }
 
 export function findProfile(name: string, toolId?: string): Profile | undefined {
@@ -124,7 +129,7 @@ export function removeProfile(
   let purged = false;
   let purgeNote: string | undefined;
   if (options.purge) {
-    const managed = profile.dir.startsWith(profilesDir());
+    const managed = isManagedProfileDir(profile.dir);
     const isDefault = profile.dir === getTool(profile.tool).defaultDir;
     if (managed && !isDefault && existsSync(profile.dir)) {
       rmSync(profile.dir, { recursive: true, force: true });
