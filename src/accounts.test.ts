@@ -1,5 +1,5 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -195,6 +195,45 @@ test("update sets email and description", () => {
   const p = updateProfile("work", { email: "new@example.com", description: "main" });
   expect(p.email).toBe("new@example.com");
   expect(p.description).toBe("main");
+});
+
+test("update rejects a config dir already used by another profile", () => {
+  const first = addProfile({ name: "first" });
+  const second = addProfile({ name: "second" });
+
+  expect(() => updateProfile("second", { dir: first.dir })).toThrow(AccountsError);
+  expect(getProfile("second").dir).toBe(second.dir);
+  expect(() => updateProfile("second", { dir: `${first.dir}/` })).toThrow(AccountsError);
+  expect(getProfile("second").dir).toBe(second.dir);
+});
+
+test("update rejects a config dir already stored with legacy path spelling", () => {
+  const dir = join(home, "legacy-dir");
+  const secondDir = join(home, "second-dir");
+  saveStore({
+    version: 1,
+    current: {},
+    applied: {},
+    profiles: [
+      { name: "first", tool: "claude", dir: `${dir}/`, createdAt: "2026-06-21T00:00:00.000Z" },
+      { name: "second", tool: "claude", dir: secondDir, createdAt: "2026-06-21T00:00:00.000Z" },
+    ],
+    tools: [],
+  });
+
+  expect(() => updateProfile("second", { dir })).toThrow(AccountsError);
+  expect(getProfile("second").dir).toBe(secondDir);
+});
+
+test("add and update reject symlink aliases for an existing config dir", () => {
+  const first = addProfile({ name: "first" });
+  const second = addProfile({ name: "second" });
+  const link = join(home, "link-to-first");
+  symlinkSync(first.dir, link, "dir");
+
+  expect(() => addProfile({ name: "alias", dir: link })).toThrow(AccountsError);
+  expect(() => updateProfile("second", { dir: link })).toThrow(AccountsError);
+  expect(getProfile("second").dir).toBe(second.dir);
 });
 
 test("add and update preserve account metadata and identity links", () => {

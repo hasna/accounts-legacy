@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
-import { isAbsolute, join, relative, resolve } from "node:path";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { type Profile, AccountsError, profileNameSchema } from "../types.js";
 import { loadStore, saveStore, profilesDir } from "../storage.js";
 import { DEFAULT_TOOL, getTool } from "./tools.js";
@@ -57,7 +57,7 @@ export function expandPath(p: string): string {
   let out = p;
   if (out === "~") out = homedir();
   else if (out.startsWith("~/")) out = join(homedir(), out.slice(2));
-  return isAbsolute(out) ? out : resolve(process.cwd(), out);
+  return resolve(out);
 }
 
 export function listProfiles(toolId?: string): Profile[] {
@@ -73,6 +73,29 @@ function profileMatches(name: string, toolId?: string): Profile[] {
 function isManagedProfileDir(dir: string): boolean {
   const rel = relative(resolve(profilesDir()), resolve(dir));
   return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+}
+
+function canonicalConfigDir(dir: string): string {
+  const resolved = resolve(dir);
+  const missing: string[] = [];
+  let cursor = resolved;
+
+  while (!existsSync(cursor)) {
+    const parent = dirname(cursor);
+    if (parent === cursor) return resolved;
+    missing.unshift(basename(cursor));
+    cursor = parent;
+  }
+
+  try {
+    return join(realpathSync(cursor), ...missing);
+  } catch {
+    return resolved;
+  }
+}
+
+function sameConfigDir(a: string, b: string): boolean {
+  return canonicalConfigDir(a) === canonicalConfigDir(b);
 }
 
 export function findProfile(name: string, toolId?: string): Profile | undefined {
@@ -121,7 +144,7 @@ export function addProfile(opts: AddOptions): Profile {
   }
 
   const dir = opts.dir ? expandPath(opts.dir) : join(profilesDir(), toolId, name);
-  if (store.profiles.some((p) => p.dir === dir)) {
+  if (store.profiles.some((p) => sameConfigDir(p.dir, dir))) {
     throw new AccountsError(`a profile already uses config dir ${dir}`);
   }
   mkdirSync(dir, { recursive: true });
@@ -260,6 +283,9 @@ export function updateProfile(name: string, opts: UpdateOptions): Profile {
   if (opts.description !== undefined) profile.description = opts.description;
   if (opts.dir !== undefined) {
     const dir = expandPath(opts.dir);
+    if (store.profiles.some((p) => p !== profile && sameConfigDir(p.dir, dir))) {
+      throw new AccountsError(`a profile already uses config dir ${dir}`);
+    }
     mkdirSync(dir, { recursive: true });
     profile.dir = dir;
   }
