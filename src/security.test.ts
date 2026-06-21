@@ -47,6 +47,81 @@ test("assertSafeWritePath refuses symlink directory under profile", () => {
   rmSync(outside, { recursive: true, force: true });
 });
 
+test("assertSafeWritePath refuses symlinked mustStayUnder root", () => {
+  const profiles = join(home, "profiles", "claude");
+  const profile = join(profiles, "work");
+  const outside = mkdtempSync(join(tmpdir(), "outside-"));
+  mkdirSync(profiles, { recursive: true });
+  symlinkSync(outside, profile);
+  expect(() =>
+    assertSafeWritePath(join(profile, ".accounts-auth", "oauth-account.json"), { mustStayUnder: profile }),
+  ).toThrow(AccountsError);
+  rmSync(outside, { recursive: true, force: true });
+});
+
+test("assertSafeWritePath refuses dangling symlink mustStayUnder root", () => {
+  const profiles = join(home, "profiles", "claude");
+  const profile = join(profiles, "work");
+  mkdirSync(profiles, { recursive: true });
+  symlinkSync(join(home, "missing-target"), profile);
+  expect(() =>
+    assertSafeWritePath(join(profile, ".accounts-auth", "oauth-account.json"), { mustStayUnder: profile }),
+  ).toThrow(AccountsError);
+});
+
+test("assertSafeWritePath refuses symlink ancestors before creating mustStayUnder root", () => {
+  const profiles = join(home, "profiles");
+  const outside = mkdtempSync(join(tmpdir(), "outside-"));
+  const toolDir = join(profiles, "claude");
+  const profile = join(toolDir, "work");
+  mkdirSync(profiles, { recursive: true });
+  symlinkSync(outside, toolDir);
+
+  expect(() =>
+    assertSafeWritePath(join(profile, ".accounts-auth", "oauth-account.json"), { mustStayUnder: profile }),
+  ).toThrow(AccountsError);
+  expect(existsSync(join(outside, "work"))).toBe(false);
+  rmSync(outside, { recursive: true, force: true });
+});
+
+test("assertSafeWritePath refuses existing symlink ancestors under mustStayUnder root", () => {
+  const profiles = join(home, "profiles");
+  const outside = mkdtempSync(join(tmpdir(), "outside-"));
+  const toolDir = join(profiles, "claude");
+  const profile = join(toolDir, "work");
+  mkdirSync(profiles, { recursive: true });
+  mkdirSync(join(outside, "work"), { recursive: true });
+  symlinkSync(outside, toolDir);
+
+  expect(() =>
+    assertSafeWritePath(join(profile, "created", "oauth-account.json"), { mustStayUnder: profile }),
+  ).toThrow(AccountsError);
+  expect(existsSync(join(outside, "work", "created"))).toBe(false);
+  rmSync(outside, { recursive: true, force: true });
+});
+
+test("assertSafeWritePath refuses symlink directories before creating nested parents", () => {
+  const profile = join(home, "profiles", "claude", "work");
+  const outside = mkdtempSync(join(tmpdir(), "outside-"));
+  const link = join(profile, "link");
+  mkdirSync(profile, { recursive: true });
+  symlinkSync(outside, link);
+
+  expect(() =>
+    assertSafeWritePath(join(link, "nested", "oauth-account.json"), { mustStayUnder: profile }),
+  ).toThrow(AccountsError);
+  expect(existsSync(join(outside, "nested"))).toBe(false);
+  rmSync(outside, { recursive: true, force: true });
+});
+
+test("assertSafeWritePath allows descendant names that start with two dots", () => {
+  const profile = join(home, "profiles", "claude", "work");
+  const target = join(profile, "..legit", "oauth-account.json");
+  mkdirSync(profile, { recursive: true });
+
+  expect(assertSafeWritePath(target, { mustStayUnder: profile })).toBe(join(profile, "..legit"));
+});
+
 test("assertSafeWritePath refuses writes outside mustStayUnder", () => {
   const profile = join(home, "profiles", "claude", "work");
   mkdirSync(profile, { recursive: true });

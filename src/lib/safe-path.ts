@@ -1,40 +1,106 @@
 import { existsSync, lstatSync, mkdirSync, realpathSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, isAbsolute, join, parse, relative, resolve, sep } from "node:path";
 import { AccountsError } from "../types.js";
 
+function lstatIfExists(path: string) {
+  try {
+    return lstatSync(path);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    return undefined;
+  }
+}
+
 function throwIfSymlink(path: string, label: string): void {
-  if (existsSync(path) && lstatSync(path).isSymbolicLink()) {
+  if (lstatIfExists(path)?.isSymbolicLink()) {
     throw new AccountsError(`${label}: ${path}`);
   }
 }
 
-/** Walk directory components from root/base through parent; refuse symlinks and `..`. */
-function assertDirChainSafe(targetFile: string, mustStayUnder?: string): void {
-  const absFile = resolve(targetFile);
-  const parent = dirname(absFile);
-  const base = mustStayUnder ? resolve(mustStayUnder) : undefined;
+function isAllowedSystemDirectorySymlink(path: string): boolean {
+  if (path !== "/var" && path !== "/tmp") return false;
+  try {
+    return realpathSync(path) === `/private${path}`;
+  } catch {
+    return false;
+  }
+}
 
-  if (base) {
-    const rel = absFile.startsWith(base + "/") ? absFile.slice(base.length + 1) : "";
-    if (!rel && absFile !== base) {
-      throw new AccountsError(`refusing to write outside profile directory: ${targetFile}`);
+function assertDirectory(path: string, label: string, opts?: { allowSystemSymlink?: boolean }): void {
+  const stat = lstatIfExists(path);
+  if (!stat) {
+    throw new AccountsError(`refusing to write under missing directory: ${path}`);
+  }
+  if (stat.isSymbolicLink()) {
+    if (opts?.allowSystemSymlink && isAllowedSystemDirectorySymlink(path)) return;
+    throw new AccountsError(`${label}: ${path}`);
+  }
+  if (!stat.isDirectory()) {
+    throw new AccountsError(`refusing to write under non-directory path: ${path}`);
+  }
+}
+
+function assertInsideBase(absPath: string, base: string, originalPath: string): string {
+  const rel = relative(base, absPath);
+  if (rel === "") return rel;
+  if (rel === ".." || rel.startsWith(".." + sep) || isAbsolute(rel)) {
+    throw new AccountsError(`refusing to write outside profile directory: ${originalPath}`);
+  }
+  return rel;
+}
+
+function assertExistingDirectoryComponentsSafe(path: string, label: string): void {
+  const root = parse(path).root;
+  const rel = relative(root, path);
+  const segments = rel ? rel.split(sep).filter(Boolean) : [];
+  let cursor = root;
+
+  assertDirectory(cursor, label, { allowSystemSymlink: true });
+  for (const segment of segments) {
+    cursor = join(cursor, segment);
+    if (!lstatIfExists(cursor)) return;
+    assertDirectory(cursor, label, { allowSystemSymlink: true });
+  }
+}
+
+function ensureBoundaryRootSafe(base: string): void {
+  const missing: string[] = [];
+  let cursor = base;
+
+  while (!lstatIfExists(cursor)) {
+    missing.unshift(cursor);
+    const parent = dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+
+  assertDirectory(cursor, "refusing to use symlink base directory");
+  for (const dir of missing) {
+    if (lstatIfExists(dir)) {
+      assertDirectory(dir, "refusing to use symlink base directory");
+    } else {
+      mkdirSync(dir);
+      assertDirectory(dir, "refusing to use symlink base directory");
     }
-    const segments = rel.split("/").filter(Boolean);
-    if (segments.some((s) => s === "..")) {
-      throw new AccountsError(`refusing path traversal: ${targetFile}`);
-    }
-    let cursor = base;
-    for (let i = 0; i < segments.length - 1; i++) {
-      cursor = resolve(cursor, segments[i]!);
-      throwIfSymlink(cursor, "refusing to write under symlink directory");
-    }
-  } else {
-    let cursor = parent;
-    for (;;) {
-      throwIfSymlink(cursor, "refusing to write under symlink directory");
-      const next = dirname(cursor);
-      if (next === cursor) break;
-      cursor = next;
+  }
+  assertDirectory(base, "refusing to use symlink base directory");
+}
+
+function ensureDirectoryChainSafe(parent: string, startAt?: string): void {
+  const root = startAt ?? parse(parent).root;
+  const rel = relative(root, parent);
+  const segments = rel ? rel.split(sep).filter(Boolean) : [];
+  let cursor = root;
+
+  if (startAt) assertDirectory(startAt, "refusing to write under symlink directory");
+
+  for (const segment of segments) {
+    cursor = join(cursor, segment);
+    if (lstatIfExists(cursor)) {
+      assertDirectory(cursor, "refusing to write under symlink directory");
+    } else {
+      mkdirSync(cursor);
+      assertDirectory(cursor, "refusing to write under symlink directory");
     }
   }
 }
@@ -43,16 +109,22 @@ function assertDirChainSafe(targetFile: string, mustStayUnder?: string): void {
 export function assertSafeWritePath(filePath: string, opts?: { mustStayUnder?: string }): string {
   const absFile = resolve(filePath);
   const parent = dirname(absFile);
+  const base = opts?.mustStayUnder ? resolve(opts.mustStayUnder) : undefined;
 
-  if (!existsSync(parent)) mkdirSync(parent, { recursive: true });
+  if (base) {
+    assertInsideBase(absFile, base, filePath);
+    assertExistingDirectoryComponentsSafe(base, "refusing to use symlink base directory");
+    ensureBoundaryRootSafe(base);
+    ensureDirectoryChainSafe(parent, base);
+  } else {
+    ensureDirectoryChainSafe(parent);
+  }
 
   throwIfSymlink(absFile, "refusing to write through symlink");
-  assertDirChainSafe(absFile, opts?.mustStayUnder);
-
   const resolved = realpathSync(existsSync(absFile) ? absFile : parent);
-  if (opts?.mustStayUnder) {
-    const base = realpathSync(resolve(opts.mustStayUnder));
-    if (resolved !== base && !resolved.startsWith(base + "/")) {
+  if (base) {
+    const realBase = realpathSync(base);
+    if (resolved !== realBase && !resolved.startsWith(realBase + sep)) {
       throw new AccountsError(`refusing to write outside profile directory: ${filePath}`);
     }
   }
