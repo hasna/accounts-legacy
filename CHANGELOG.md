@@ -6,6 +6,16 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.1.28] - 2026-06-24
+
+### Fixed
+
+- Claude apply-mode handoff commands now use live/default auth instead of
+  relaunching with `CLAUDE_CONFIG_DIR`, preventing restarts into isolated
+  profile dirs that Claude reports as logged out.
+- Applying a Claude profile no longer fails solely because macOS denies a
+  non-interactive keychain write when file credentials were already restored.
+
 ## [0.1.27] - 2026-06-24
 
 ### Fixed

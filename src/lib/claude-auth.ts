@@ -293,11 +293,17 @@ export function restoreClaudeAuthFromProfile(
         secret: kcRaw.secret,
       };
       assertAllowedKeychainCredential(cred);
-      writeClaudeKeychain({
-        service: CLAUDE_KEYCHAIN_SERVICE,
-        account: cred.account,
-        secret: cred.secret,
-      });
+      try {
+        writeClaudeKeychain({
+          service: CLAUDE_KEYCHAIN_SERVICE,
+          account: cred.account,
+          secret: cred.secret,
+        });
+      } catch {
+        // Claude Code can authenticate from the restored credentials file.
+        // Some macOS sessions deny non-interactive keychain writes; do not
+        // turn a valid file-credential restore into a failed switch.
+      }
     }
   }
 }

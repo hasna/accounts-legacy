@@ -1,7 +1,7 @@
 import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
 import { applyProfile } from "./apply.js";
-import { formatEnvAssignments, formatExportLines, profileEnv } from "./env.js";
+import { claudeApiAuthClearingEnv, formatEnvAssignments, formatExportLines, profileEnv } from "./env.js";
 import { getProfile, useProfile } from "./profiles.js";
 import { getTool, mergeToolArgs, normalizePermissionPreset } from "./tools.js";
 
@@ -50,7 +50,6 @@ export function switchProfile(name: string, opts: SwitchOptions = {}): SwitchRes
   if (!["auto", "apply", "env", "active"].includes(mode)) {
     throw new AccountsError(`invalid switch mode "${mode}"`);
   }
-  const env = profileEnv(profile, tool);
   let applied = false;
 
   if (mode === "apply" || (mode === "auto" && tool.id === "claude")) {
@@ -60,6 +59,7 @@ export function switchProfile(name: string, opts: SwitchOptions = {}): SwitchRes
     useProfile(name, tool.id);
   }
 
+  const env = applied && tool.id === "claude" ? claudeApiAuthClearingEnv() : profileEnv(profile, tool);
   const command = commandFor(profile, tool, opts);
   const restartRequired = opts.resume === true || applied || mode === "env";
   const message = applied

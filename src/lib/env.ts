@@ -21,6 +21,10 @@ export function profileEnv(profile: Profile, tool: ToolDef): Record<string, stri
   return env;
 }
 
+export function claudeApiAuthClearingEnv(): Record<string, string> {
+  return Object.fromEntries(CLAUDE_API_AUTH_ENV_KEYS.map((key) => [key, ""]));
+}
+
 export function formatEnvAssignments(env: Record<string, string>): string {
   return Object.entries(env)
     .map(([name, value]) => `${name}=${JSON.stringify(value)}`)

@@ -348,7 +348,10 @@ test("switchProfile applies Claude and returns a continue handoff command", () =
   expect(result.applied).toBe(true);
   expect(result.restartRequired).toBe(true);
   expect(result.command).toEqual(["claude", "--continue"]);
-  expect(result.commandLine).toContain("CLAUDE_CONFIG_DIR=");
+  expect(result.commandLine).not.toContain("CLAUDE_CONFIG_DIR=");
+  expect(result.commandLine).toContain('ANTHROPIC_API_KEY=""');
+  expect(result.env.CLAUDE_CONFIG_DIR).toBeUndefined();
+  expect(result.env.ANTHROPIC_API_KEY).toBe("");
   expect(appliedProfile("claude")?.name).toBe("switcher");
   const live = JSON.parse(readFileSync(liveClaudePaths().homeJson, "utf8")) as {
     oauthAccount: { emailAddress: string };
