@@ -4,9 +4,9 @@ import { loadStore, saveStore } from "../storage.js";
 import { getTool } from "./tools.js";
 import { getProfile, useProfile } from "./profiles.js";
 import {
+  assertRestorableProfileAuth,
   ensureProfileAuthSnapshot,
   liveOAuthEmail,
-  profileHasAuth,
   restoreClaudeAuthFromProfile,
   snapshotLiveAuthToProfile,
 } from "./claude-auth.js";
@@ -41,11 +41,7 @@ function applyProfileUnlocked(name: string, toolId?: string): { profile: Profile
     );
   }
 
-  if (!profileHasAuth(profile.dir, tool)) {
-    throw new AccountsError(
-      `profile "${name}" has no auth to apply — run \`accounts login ${name}\` then \`accounts detect ${name}\` first`,
-    );
-  }
+  assertRestorableProfileAuth(profile.dir, tool, name);
 
   const store = loadStore();
   const previous = store.applied[tool.id];

@@ -41,6 +41,16 @@ afterEach(() => {
 
 function writeOAuth(dir: string, email: string) {
   writeFileSync(join(dir, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: email } }));
+  writeFileSync(
+    join(dir, ".credentials.json"),
+    JSON.stringify({
+      claudeAiOauth: {
+        accessToken: `${email}-access-token`,
+        refreshToken: `${email}-refresh-token`,
+        expiresAt: Date.now() + 60_000,
+      },
+    }),
+  );
 }
 
 test("import snapshots oauth from profile dir not live", () => {
@@ -62,6 +72,18 @@ test("apply rejects profile without auth", () => {
   addProfile({ name: "empty", dir: emptyDir });
   expect(() => applyProfile("empty")).toThrow(AccountsError);
   rmSync(emptyDir, { recursive: true, force: true });
+});
+
+test("apply rejects OAuth-only profiles without restorable Claude credentials", () => {
+  const oauthOnlyDir = mkdtempSync(join(tmpdir(), "oauth-only-"));
+  writeFileSync(join(oauthOnlyDir, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: "oauth@example.com" } }));
+  addProfile({ name: "oauthonly", dir: oauthOnlyDir });
+  ensureProfileAuthSnapshot(oauthOnlyDir, getTool("claude"));
+
+  expect(() => applyProfile("oauthonly")).toThrow("has no Claude credentials to apply");
+  expect(appliedProfile("claude")).toBeUndefined();
+  expect(currentProfile("claude")).toBeUndefined();
+  rmSync(oauthOnlyDir, { recursive: true, force: true });
 });
 
 test("apply does not wipe live oauth when profile empty", () => {

@@ -7,6 +7,10 @@ export function keychainSupported(): boolean {
   return platform() === "darwin";
 }
 
+export function securityExecutable(): string {
+  return keychainSupported() ? "/usr/bin/security" : "security";
+}
+
 export interface KeychainCredential {
   service: string;
   account: string;
@@ -33,7 +37,7 @@ export function readClaudeKeychain(): KeychainCredential | undefined {
   if (!keychainSupported()) return undefined;
   try {
     const secret = execFileSync(
-      "security",
+      securityExecutable(),
       ["find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE, "-w"],
       { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
     ).trim();
@@ -50,7 +54,7 @@ export function readClaudeKeychain(): KeychainCredential | undefined {
 function readKeychainAccount(): string | undefined {
   try {
     const out = execFileSync(
-      "security",
+      securityExecutable(),
       ["find-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE],
       { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
     );
@@ -88,7 +92,7 @@ export function writeClaudeKeychain(cred: KeychainCredential): void {
   assertAllowedKeychainCredential(cred);
   try {
     execFileSync(
-      "security",
+      securityExecutable(),
       ["delete-generic-password", "-s", cred.service, "-a", cred.account],
       { stdio: "ignore" },
     );
@@ -96,9 +100,13 @@ export function writeClaudeKeychain(cred: KeychainCredential): void {
     /* not found */
   }
   try {
-    execFileSync("security", ["add-generic-password", "-U", "-s", cred.service, "-a", cred.account, "-w", cred.secret], {
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    execFileSync(
+      securityExecutable(),
+      ["add-generic-password", "-U", "-s", cred.service, "-a", cred.account, "-w", cred.secret],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
   } catch (err) {
     throw new AccountsError(`keychain write failed: ${keychainWriteFailureMessage(err)}`);
   }

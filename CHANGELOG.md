@@ -6,6 +6,16 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.1.27] - 2026-06-24
+
+### Fixed
+
+- Claude keychain operations now call `/usr/bin/security` on macOS, avoiding
+  failures when another `security` CLI appears earlier in `PATH`.
+- `accounts apply` and Claude auto-switching now reject OAuth-only profiles
+  without restorable credentials instead of marking them applied and launching
+  a logged-out Claude session.
+
 ## [0.1.26] - 2026-06-22
 
 ### Added

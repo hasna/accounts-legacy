@@ -58,6 +58,32 @@ function readOAuthSnapshot(profileDir: string): JsonRecord | undefined {
   return oauth && typeof oauth === "object" ? (oauth as JsonRecord) : undefined;
 }
 
+function profileCredentialFile(profileDir: string): string {
+  return join(profileDir, ".credentials.json");
+}
+
+function profileHasOAuthAccount(profileDir: string, tool: ToolDef): boolean {
+  return !!readOAuthSnapshot(profileDir) || !!readOAuthFromPaths(profileAccountJsonPaths(profileDir, tool));
+}
+
+function profileHasCredentialPayload(profileDir: string): boolean {
+  return existsSync(profileCredentialFile(profileDir)) || existsSync(profileCredentialsSnapshot(profileDir));
+}
+
+export function assertRestorableProfileAuth(profileDir: string, tool: ToolDef, profileName?: string): void {
+  const label = profileName ?? "NAME";
+  if (!profileHasOAuthAccount(profileDir, tool)) {
+    throw new AccountsError(
+      `profile "${label}" has no auth to apply — run \`accounts login ${label}\` then \`accounts detect ${label}\` first`,
+    );
+  }
+  if (!profileHasCredentialPayload(profileDir)) {
+    throw new AccountsError(
+      `profile "${label}" has no Claude credentials to apply — run \`accounts login ${label}\` and complete /login first`,
+    );
+  }
+}
+
 function findOAuthSource(paths: string[]): { path: string; oauth: JsonRecord } | undefined {
   for (const p of paths) {
     const data = readJsonFile(p);
@@ -170,11 +196,11 @@ export function snapshotLiveAuthToProfile(profileDir: string, _tool: ToolDef): v
     const dest = profileCredentialsSnapshot(profileDir);
     assertSafeWritePath(dest, { mustStayUnder: profileDir });
     copyFileSync(live.credentialsFile, dest);
-  }
 
-  if (keychainSupported()) {
-    const kc = readClaudeKeychain();
-    if (kc) writeJsonFile(profileKeychainSnapshot(profileDir), kc as unknown as JsonRecord, profileDir);
+    if (keychainSupported()) {
+      const kc = readClaudeKeychain();
+      if (kc) writeJsonFile(profileKeychainSnapshot(profileDir), kc as unknown as JsonRecord, profileDir);
+    }
   }
 }
 
@@ -205,7 +231,7 @@ export function ensureProfileAuthSnapshot(
     writeJsonFile(oauthSnap, { oauthAccount: oauthSource.oauth }, profileDir);
   }
 
-  const credFile = join(profileDir, ".credentials.json");
+  const credFile = profileCredentialFile(profileDir);
   const credSnap = profileCredentialsSnapshot(profileDir);
   if (existsSync(credFile) && (opts.overwrite || snapshotIsStale(credFile, credSnap))) {
     assertSafeWritePath(credSnap, { mustStayUnder: profileDir });
@@ -216,7 +242,7 @@ export function ensureProfileAuthSnapshot(
 }
 
 export function profileHasAuth(profileDir: string, tool: ToolDef): boolean {
-  return hasAuthSnapshot(profileDir) || !!readOAuthFromPaths(profileAccountJsonPaths(profileDir, tool));
+  return profileHasOAuthAccount(profileDir, tool) && profileHasCredentialPayload(profileDir);
 }
 
 /** Restore profile auth snapshots onto live Claude paths. */
@@ -225,14 +251,8 @@ export function restoreClaudeAuthFromProfile(
   tool: ToolDef,
   profileName?: string,
 ): void {
-  if (!profileHasAuth(profileDir, tool)) {
-    const label = profileName ?? "NAME";
-    throw new AccountsError(
-      `profile has no auth to apply — run \`accounts login ${label}\` then \`accounts detect ${label}\` first`,
-    );
-  }
-
   ensureProfileAuthSnapshot(profileDir, tool);
+  assertRestorableProfileAuth(profileDir, tool, profileName);
 
   const live = liveClaudePaths();
   const liveRoot = liveClaudeBase();

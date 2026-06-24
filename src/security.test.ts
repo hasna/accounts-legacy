@@ -1,10 +1,16 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
 import { execSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync, existsSync, chmodSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import { assertSafeWritePath } from "./lib/safe-path.js";
-import { assertAllowedKeychainCredential, keychainWriteFailureMessage, writeClaudeKeychain } from "./lib/keychain.js";
+import {
+  assertAllowedKeychainCredential,
+  keychainWriteFailureMessage,
+  readClaudeKeychain,
+  securityExecutable,
+  writeClaudeKeychain,
+} from "./lib/keychain.js";
 import { CLAUDE_KEYCHAIN_SERVICE } from "./lib/claude-layout.js";
 import { saveStore, loadStore } from "./storage.js";
 import { shellQuotePath, hookScript } from "./lib/hook.js";
@@ -163,6 +169,35 @@ test("keychain write failure messages do not include command arguments", () => {
   });
   expect(message).toBe("security: SecKeychainItemCreateFromContent: User interaction is not allowed.");
   expect(message).not.toContain("secret-token");
+});
+
+test.skipIf(platform() !== "darwin")("keychain commands use the macOS security executable", () => {
+  expect(securityExecutable()).toBe("/usr/bin/security");
+});
+
+test.skipIf(platform() !== "darwin")("keychain reads use macOS security when PATH is shadowed", () => {
+  const fakeBinDir = mkdtempSync(join(tmpdir(), "fake-security-bin-"));
+  const fakeSecurity = join(fakeBinDir, "security");
+  const fakeLog = join(fakeBinDir, "called.log");
+  writeFileSync(
+    fakeSecurity,
+    ["#!/usr/bin/env bash", `printf 'shadowed security called\\n' >> ${JSON.stringify(fakeLog)}`, "exit 1"].join("\n"),
+  );
+  chmodSync(fakeSecurity, 0o755);
+
+  const originalPath = process.env.PATH;
+  process.env.PATH = `${fakeBinDir}:${originalPath ?? ""}`;
+  let fakeCalled = false;
+  try {
+    readClaudeKeychain();
+    fakeCalled = existsSync(fakeLog);
+  } finally {
+    if (originalPath === undefined) delete process.env.PATH;
+    else process.env.PATH = originalPath;
+    rmSync(fakeBinDir, { recursive: true, force: true });
+  }
+
+  expect(fakeCalled).toBe(false);
 });
 
 test.skipIf(!existsSync("/var/folders"))("saveStore works when ACCOUNTS_HOME is under /var/folders temp", () => {
