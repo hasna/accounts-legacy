@@ -6,6 +6,7 @@ import {
   addProfile,
   listProfiles,
   getProfile,
+  getProfileToolLock,
   findProfile,
   useProfile,
   currentProfile,
@@ -245,10 +246,23 @@ test("use sets the active profile per tool and bumps lastUsedAt", () => {
   addProfile({ name: "play", tool: "codex" });
   useProfile("work");
   expect(currentProfile("claude")?.name).toBe("work");
+  expect(getProfileToolLock("work")).toBe("claude");
   expect(currentProfile("codex")).toBeUndefined();
   expect(getProfile("work").lastUsedAt).toBeDefined();
   useProfile("play");
   expect(currentProfile("codex")?.name).toBe("play");
+  expect(getProfileToolLock("play")).toBe("codex");
+});
+
+test("tool lock resolves shared profile names for bare commands", () => {
+  addProfile({ name: "work", tool: "claude" });
+  addProfile({ name: "work", tool: "codex" });
+  expect(() => getProfile("work")).toThrow(AccountsError);
+
+  useProfile("work", "codex");
+
+  expect(getProfileToolLock("work")).toBe("codex");
+  expect(getProfile("work").tool).toBe("codex");
 });
 
 test("rename updates the current pointer too", () => {
@@ -257,6 +271,8 @@ test("rename updates the current pointer too", () => {
   renameProfile("work", "job");
   expect(findProfile("work")).toBeUndefined();
   expect(currentProfile("claude")?.name).toBe("job");
+  expect(getProfileToolLock("work")).toBeUndefined();
+  expect(getProfileToolLock("job")).toBe("claude");
 });
 
 test("rename rejects collisions", () => {
@@ -289,6 +305,7 @@ test("update rejects a config dir already stored with legacy path spelling", () 
     version: 1,
     current: {},
     applied: {},
+    toolLocks: {},
     profiles: [
       { name: "first", tool: "claude", dir: `${dir}/`, createdAt: "2026-06-21T00:00:00.000Z" },
       { name: "second", tool: "claude", dir: secondDir, createdAt: "2026-06-21T00:00:00.000Z" },
@@ -385,6 +402,7 @@ test("remove clears the current pointer", () => {
   const { profile } = removeProfile("work");
   expect(profile.name).toBe("work");
   expect(currentProfile("claude")).toBeUndefined();
+  expect(getProfileToolLock("work")).toBeUndefined();
   expect(findProfile("work")).toBeUndefined();
 });
 
@@ -471,6 +489,7 @@ test("store persists across loads", () => {
   const store = loadStore();
   expect(store.profiles.length).toBe(1);
   expect(store.current.claude).toBe("work");
+  expect(store.toolLocks.work).toBe("claude");
 });
 
 test("custom tools: register, use for a profile, and list", () => {
@@ -540,11 +559,14 @@ test("loadStore prunes stale current and applied pointers", () => {
   const store = loadStore();
   store.current = { claude: "ghost", codex: "codexprof" };
   store.applied = { claude: "ghost" };
+  store.toolLocks = { ghost: "claude", codexprof: "codex" };
   saveStore(store);
   const reloaded = loadStore();
   expect(reloaded.current.claude).toBeUndefined();
   expect(reloaded.applied.claude).toBeUndefined();
   expect(reloaded.current.codex).toBe("codexprof");
+  expect(reloaded.toolLocks.ghost).toBeUndefined();
+  expect(reloaded.toolLocks.codexprof).toBe("codex");
 });
 
 test("explicit dir is honored and created", () => {

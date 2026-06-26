@@ -119,6 +119,8 @@ export const storeSchema = z.object({
    * (e.g. ~/.claude + ~/.claude.json on disk for IDE use).
    */
   applied: z.record(z.string(), z.string()).default({}),
+  /** Map of profile/account name -> preferred tool id for bare commands. */
+  toolLocks: z.record(slugSchema, slugSchema).default({}),
   profiles: z.array(profileSchema).default([]),
   /** User-registered tools (apps) added at runtime, on top of built-ins. */
   tools: z.array(toolDefSchema).default([]),

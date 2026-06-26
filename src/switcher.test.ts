@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { addProfile, useProfile, renameProfile, removeProfile, currentProfile, getProfile } from "./lib/profiles.js";
+import { addProfile, useProfile, renameProfile, removeProfile, currentProfile, getProfile, getProfileToolLock } from "./lib/profiles.js";
 import { applyProfile, appliedProfile } from "./lib/apply.js";
 import { importProfile, ensureProfileForLogin } from "./lib/import-profile.js";
 import { finalizeLogin } from "./lib/login.js";
@@ -149,6 +149,7 @@ test("ensureProfileForLogin creates profile when missing", () => {
   const p = ensureProfileForLogin("newlogin");
   expect(p.name).toBe("newlogin");
   expect(p.tool).toBe("claude");
+  expect(getProfileToolLock("newlogin")).toBe("claude");
   expect(existsSync(p.dir)).toBe(true);
   expect(ensureProfileForLogin("newlogin").dir).toBe(p.dir);
 });
@@ -158,13 +159,16 @@ test("ensureProfileForLogin infers an existing profile tool", () => {
 
   expect(ensureProfileForLogin("codexlogin").tool).toBe("codex");
   expect(ensureProfileForLogin("codexlogin").dir).toBe(p.dir);
+  expect(getProfileToolLock("codexlogin")).toBe("codex");
 });
 
-test("ensureProfileForLogin prefers Claude when an existing profile name is shared with other tools", () => {
+test("ensureProfileForLogin uses a lock when an existing profile name is shared with other tools", () => {
   addProfile({ name: "shared", tool: "claude" });
   addProfile({ name: "shared", tool: "codex" });
 
-  expect(ensureProfileForLogin("shared").tool).toBe("claude");
+  useProfile("shared", "codex");
+
+  expect(ensureProfileForLogin("shared").tool).toBe("codex");
   expect(ensureProfileForLogin("shared", "codex").tool).toBe("codex");
 });
 
