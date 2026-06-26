@@ -21,6 +21,8 @@ export {
   listProfiles,
   findProfile,
   getProfile,
+  getProfileToolLock,
+  lockProfileTool,
   addProfile,
   removeProfile,
   renameProfile,
@@ -33,8 +35,24 @@ export type { AddOptions, RemoveOptions, UpdateOptions, ProfileMetadata, Profile
 export { applyProfile, appliedProfile } from "./lib/apply.js";
 export { importProfile, ensureProfileForLogin } from "./lib/import-profile.js";
 export type { ImportOptions } from "./lib/import-profile.js";
-export { finalizeLogin } from "./lib/login.js";
-export type { FinalizeLoginResult } from "./lib/login.js";
+export {
+  detectToolAvailability,
+  finalizeLogin,
+  installInstructions,
+  loginToolChoices,
+  nonInteractiveToolSelectionMessage,
+  prepareLogin,
+  unavailableToolMessage,
+} from "./lib/login.js";
+export type {
+  FinalizeLoginResult,
+  LoginPreparation,
+  LoginPreparationReady,
+  LoginPreparationStopped,
+  LoginToolChoice,
+  PrepareLoginOptions,
+  ToolAvailability,
+} from "./lib/login.js";
 export { switchProfile } from "./lib/switch.js";
 export type { SwitchMode, SwitchOptions, SwitchResult } from "./lib/switch.js";
 export {

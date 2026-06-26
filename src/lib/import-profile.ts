@@ -2,7 +2,7 @@ import { cpSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { profilesDir } from "../storage.js";
 import { AccountsError } from "../types.js";
-import { addProfile, expandPath, listProfiles, type AddOptions } from "./profiles.js";
+import { addProfile, expandPath, getProfileToolLock, listProfiles, lockProfileTool, type AddOptions } from "./profiles.js";
 import { getTool, DEFAULT_TOOL } from "./tools.js";
 import { ensureProfileAuthSnapshot } from "./claude-auth.js";
 import { detectEmail } from "./detect.js";
@@ -61,16 +61,24 @@ export function importProfile(opts: ImportOptions) {
 
 export function ensureProfileForLogin(name: string, toolId?: string) {
   const existing = findProfileByName(name, toolId);
-  if (existing) return existing;
-  return addProfile({ name, tool: toolId ?? DEFAULT_TOOL, description: "created for login" });
+  if (existing) {
+    lockProfileTool(existing.name, existing.tool);
+    return existing;
+  }
+  const profile = addProfile({ name, tool: toolId ?? DEFAULT_TOOL, description: "created for login" });
+  lockProfileTool(profile.name, profile.tool);
+  return profile;
 }
 
 function findProfileByName(name: string, toolId?: string) {
   const matches = listProfiles(toolId).filter((profile) => profile.name === name);
   if (matches.length === 0) return undefined;
   if (!toolId) {
-    const defaultProfile = matches.find((profile) => profile.tool === DEFAULT_TOOL);
-    if (defaultProfile) return defaultProfile;
+    const lockedTool = getProfileToolLock(name);
+    if (lockedTool) {
+      const lockedProfile = matches.find((profile) => profile.tool === lockedTool);
+      if (lockedProfile) return lockedProfile;
+    }
   }
   if (matches.length > 1) {
     throw new AccountsError(

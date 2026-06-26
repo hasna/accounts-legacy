@@ -44,12 +44,12 @@ import {
 } from "./storage.js";
 import { applyProfile, appliedProfile } from "./lib/apply.js";
 import { listAgentsAcrossProfiles } from "./lib/agents.js";
-import { importProfile, ensureProfileForLogin } from "./lib/import-profile.js";
+import { importProfile } from "./lib/import-profile.js";
 import { pickProfile, resolvePickMode } from "./lib/pick.js";
 import { installHook, uninstallHook, shellSnippet, hookPath } from "./lib/hook.js";
 import { profileHasAuth } from "./lib/claude-auth.js";
 import { formatEnvAssignments, formatExportLines, profileEnv } from "./lib/env.js";
-import { finalizeLogin } from "./lib/login.js";
+import { finalizeLogin, prepareLogin } from "./lib/login.js";
 import { switchProfile, type SwitchMode } from "./lib/switch.js";
 import {
   listSupervisorStates,
@@ -413,14 +413,18 @@ program
 program
   .command("login")
   .argument("<name>", "profile name")
-  .description("launch the tool's login flow inside an isolated profile dir")
-  .option("-t, --tool <tool>", "tool when creating a missing profile or when the profile name is ambiguous")
+  .description("choose or launch a tool login flow inside an isolated profile dir")
+  .option("-t, --tool <tool>", "tool to use for this profile; locks bare commands to that tool")
   .action(
-    action((name: string, opts: { tool?: string }) => {
-      const profile = ensureProfileForLogin(name, opts.tool);
-      const tool = getTool(profile.tool);
+    action(async (name: string, opts: { tool?: string }) => {
+      const prepared = await prepareLogin(name, { toolId: opts.tool, input: process.stdin, output: process.stderr, env: process.env });
+      if (prepared.status === "stopped") {
+        console.error(chalk.yellow(prepared.message));
+        console.error(chalk.dim(`Selected tool kept: ${prepared.tool.id}`));
+        process.exit(1);
+      }
+      const { profile, tool, args: loginArgs } = prepared;
       const env = profileEnv(profile, tool);
-      const loginArgs = tool.loginArgs ?? [];
       useProfile(name, tool.id);
       console.log(chalk.green(`→ launching ${tool.bin} for profile ${chalk.bold(name)}`));
       console.log(chalk.dim(`  config dir: ${profile.dir}`));
@@ -429,7 +433,7 @@ program
       if (tool.id === "claude") {
         console.log(chalk.dim("  After Claude exits, accounts will make this the live/default Claude account."));
       }
-      const res = spawnSync(tool.bin, mergeToolArgs(tool, loginArgs, { profile }), {
+      const res = spawnSync(tool.bin, loginArgs, {
         stdio: "inherit",
         env: { ...process.env, ...env },
       });

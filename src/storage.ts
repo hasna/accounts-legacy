@@ -105,7 +105,7 @@ export function profilesDir(): string {
   return join(accountsHome(), "profiles");
 }
 
-const EMPTY_STORE: Store = { version: 1, current: {}, applied: {}, profiles: [], tools: [] };
+const EMPTY_STORE: Store = { version: 1, current: {}, applied: {}, toolLocks: {}, profiles: [], tools: [] };
 
 export function loadStore(): Store {
   const path = storePath();
@@ -136,6 +136,11 @@ export function loadStore(): Store {
     const name = store.applied[toolId];
     if (!name || !profileNameSchema.safeParse(name).success) delete store.applied[toolId];
     else if (!store.profiles.some((p) => p.name === name && p.tool === toolId)) delete store.applied[toolId];
+  }
+  for (const name of Object.keys(store.toolLocks)) {
+    const toolId = store.toolLocks[name];
+    if (!profileNameSchema.safeParse(name).success || !toolId) delete store.toolLocks[name];
+    else if (!store.profiles.some((p) => p.name === name && p.tool === toolId)) delete store.toolLocks[name];
   }
   return store;
 }

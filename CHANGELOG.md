@@ -6,6 +6,25 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.1.29] - 2026-06-26
+
+### Added
+
+- `accounts login <name>` now prompts for a registry-driven tool choice when a
+  profile name is not already locked, including built-in and custom registered
+  tool variants.
+- Profile names now persist a selected tool lock so bare `login`, `show`, `use`,
+  and `launch` commands resolve to the chosen tool when duplicate names exist
+  across tools.
+
+### Fixed
+
+- Missing Cursor installs are handled before launching `cursor-agent`, with
+  accounts-level guidance to choose another tool, keep Cursor selected with
+  install instructions, or cancel without partial state.
+- Non-interactive login commands now fail clearly with explicit `--tool`
+  commands instead of waiting on prompts.
+
 ## [0.1.28] - 2026-06-24
 
 ### Fixed

@@ -14,8 +14,8 @@ Switch **in the terminal** with `CLAUDE_CONFIG_DIR`, or **in Cursor / VS Code** 
 - **Multi-tool** — first-class built-ins for Claude, Takumi, Codex CLI, Codex
   App, Gemini, opencode, Cursor Agent, Pi, Hermes, Kimi Code, and Grok Build;
   custom tools via `accounts tools add`.
-- **Per-tool names** — `work` can exist for Claude, Codex, Cursor, etc.; pass
-  `--tool` when a bare profile name is ambiguous.
+- **Tool lock-in** — first login/use chooses the tool for a profile name, so
+  later bare commands like `accounts launch work` keep using that tool.
 - **Local-first** — registry at `~/.hasna/accounts/`. No network, no telemetry.
 
 ## Install
@@ -38,8 +38,8 @@ accounts add work --email work@company.com
 accounts add personal --email me@gmail.com
 
 # 3. Log in once per profile (isolated dir)
-accounts login work        # run /login inside Claude, then /exit; accounts auto-applies it
-accounts login personal    # same: login, exit; it becomes the live/default account
+accounts login work --tool claude        # or omit --tool and choose Claude in the prompt
+accounts login personal --tool claude    # login, exit; it becomes the live/default account
 
 # 4. Switch
 accounts apply work                 # Cursor / VS Code — live ~/.claude auth
@@ -81,6 +81,14 @@ accounts switch work --tool codex-app --launch
 # Or run a native macOS menu-bar switcher.
 accounts codex-app menubar
 ```
+
+`codex` and `codex-app` are separate tool ids for the same account name. If you
+run `accounts login personal` before either profile is locked, the chooser shows
+both options; choosing one locks bare commands for `personal` to that tool. Use
+`--tool codex` or `--tool codex-app` when you want to bypass or change that
+choice explicitly. The same rule applies to future registered variants such as a
+custom `claude-app` or `claude-cowork`: each tool id gets its own profile
+directory and can be selected without changing the account name.
 
 Each `codex-app` profile gets its own `CODEX_HOME` and
 `--user-data-dir=<profile>/electron-user-data`. Before login, launch, switch, or
@@ -127,7 +135,7 @@ Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
 |---------|-------------|
 | `accounts add <name>` | Create a profile. `--tool`, `--email`, `--display-name`, `--identity`, `--card-last4`, `--metadata key=value`, `--dir`, `--description`. |
 | `accounts import [name]` | Import existing config dir (default `~/.claude`). `--copy` for managed copy. |
-| `accounts login <name>` | Launch the profile's tool login flow in an isolated profile dir. Use `--tool` only for new or ambiguous profiles. |
+| `accounts login <name>` | Choose a tool when needed, lock the profile name to that tool, then launch that tool's login flow in an isolated profile dir. Use `--tool` to bypass or change the chooser. |
 | `accounts apply <name>` | Apply profile auth to live Claude paths (requires snapshot; Claude-only). |
 | `accounts pick` | Interactive picker; default applies. `--env`, `--no-act`. |
 | `accounts switch <name>` | Switch profile and print a restart/resume command. Add `--resume`, `--launch`, or `--permissions <preset>`. Use `--tool` only when ambiguous. |
@@ -301,6 +309,12 @@ They can also define permission presets with `--permission-arg preset=--flag`.
 Use `--launch-arg` for app-level arguments that should be prepended to every
 login/launch/run command; templates support `{profileDir}`, `{profileName}`, and
 `{toolId}`.
+
+`accounts login <name>` builds its chooser from this registry, including custom
+tools. Installed tools are listed first; tools whose binary or required app
+install is missing are marked as requiring installation. In non-interactive
+shells, `accounts` does not prompt and instead prints explicit `--tool` commands
+to run.
 
 ## Library
 

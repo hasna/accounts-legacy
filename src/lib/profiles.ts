@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
-import { type Profile, AccountsError, profileNameSchema } from "../types.js";
+import { type Profile, type Store, AccountsError, profileNameSchema } from "../types.js";
 import { loadStore, saveStore, profilesDir } from "../storage.js";
 import { DEFAULT_TOOL, getTool } from "./tools.js";
 import { detectEmail } from "./detect.js";
@@ -70,6 +70,27 @@ function profileMatches(name: string, toolId?: string): Profile[] {
   return loadStore().profiles.filter((p) => p.name === name && (!toolId || p.tool === toolId));
 }
 
+function resolveProfileFromStore(store: Store, name: string, toolId?: string): Profile {
+  const matches = store.profiles.filter((p) => p.name === name && (!toolId || p.tool === toolId));
+  if (matches.length === 0) {
+    const suffix = toolId ? ` for tool "${toolId}"` : "";
+    throw new AccountsError(`no profile named "${name}"${suffix}. Run \`accounts list\` to see profiles.`);
+  }
+  if (!toolId) {
+    const lockedTool = store.toolLocks[name];
+    if (lockedTool) {
+      const locked = matches.find((p) => p.tool === lockedTool);
+      if (locked) return locked;
+    }
+  }
+  if (matches.length > 1) {
+    throw new AccountsError(
+      `profile "${name}" exists for multiple tools (${matches.map((p) => p.tool).join(", ")}); pass --tool`,
+    );
+  }
+  return matches[0]!;
+}
+
 function isManagedProfileDir(dir: string): boolean {
   const rel = relative(resolve(profilesDir()), resolve(dir));
   return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
@@ -104,18 +125,23 @@ export function findProfile(name: string, toolId?: string): Profile | undefined 
 }
 
 export function getProfile(name: string, toolId?: string): Profile {
-  const matches = profileMatches(name, toolId);
-  if (matches.length === 0) {
-    const suffix = toolId ? ` for tool "${toolId}"` : "";
-    throw new AccountsError(`no profile named "${name}"${suffix}. Run \`accounts list\` to see profiles.`);
+  return resolveProfileFromStore(loadStore(), name, toolId);
+}
+
+export function getProfileToolLock(name: string): string | undefined {
+  return loadStore().toolLocks[name];
+}
+
+export function lockProfileTool(name: string, toolId: string): void {
+  getTool(toolId);
+  const nameCheck = profileNameSchema.safeParse(name);
+  if (!nameCheck.success) throw new AccountsError(nameCheck.error.issues[0]?.message ?? "invalid profile name");
+  const store = loadStore();
+  if (!store.profiles.some((p) => p.name === name && p.tool === toolId)) {
+    throw new AccountsError(`no profile named "${name}" for tool "${toolId}"`);
   }
-  if (matches.length > 1) {
-    throw new AccountsError(
-      `profile "${name}" exists for multiple tools (${matches.map((p) => p.tool).join(", ")}); pass --tool`,
-    );
-  }
-  const profile = matches[0]!;
-  return profile;
+  store.toolLocks[name] = toolId;
+  saveStore(store);
 }
 
 export interface AddOptions {
@@ -201,6 +227,7 @@ export function removeProfile(
   store.profiles.splice(idx, 1);
   if (store.current[profile.tool] === name) delete store.current[profile.tool];
   if (store.applied[profile.tool] === name) delete store.applied[profile.tool];
+  if (store.toolLocks[profile.name] === profile.tool) delete store.toolLocks[profile.name];
   saveStore(store);
 
   let purged = false;
@@ -240,6 +267,10 @@ export function renameProfile(oldName: string, newName: string, toolId?: string)
 
   if (store.current[profile.tool] === oldName) store.current[profile.tool] = newName;
   if (store.applied[profile.tool] === oldName) store.applied[profile.tool] = newName;
+  if (store.toolLocks[oldName] === profile.tool) {
+    delete store.toolLocks[oldName];
+    if (!store.toolLocks[newName]) store.toolLocks[newName] = profile.tool;
+  }
   profile.name = newName;
   saveStore(store);
   return profile;
@@ -316,18 +347,9 @@ export function redetectEmail(name: string, toolId?: string): Profile {
 /** Mark a profile as the active one for its tool. */
 export function useProfile(name: string, toolId?: string): { profile: Profile; toolId: string } {
   const store = loadStore();
-  const matches = store.profiles.filter((p) => p.name === name && (!toolId || p.tool === toolId));
-  if (matches.length === 0) {
-    const suffix = toolId ? ` for tool "${toolId}"` : "";
-    throw new AccountsError(`no profile named "${name}"${suffix}`);
-  }
-  if (matches.length > 1) {
-    throw new AccountsError(
-      `profile "${name}" exists for multiple tools (${matches.map((p) => p.tool).join(", ")}); pass --tool`,
-    );
-  }
-  const profile = matches[0]!;
+  const profile = resolveProfileFromStore(store, name, toolId);
   store.current[profile.tool] = name;
+  store.toolLocks[profile.name] = profile.tool;
   profile.lastUsedAt = nowIso();
   saveStore(store);
   return { profile, toolId: profile.tool };
