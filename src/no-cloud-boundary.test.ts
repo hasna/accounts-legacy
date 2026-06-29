@@ -11,11 +11,20 @@ const checkedFiles = [
 ];
 
 describe("no shared cloud package boundary", () => {
-  test("runtime package files do not depend on @hasna/cloud or open-cloud", () => {
+  test("runtime package files do not depend on retired shared cloud markers", () => {
     const combined = checkedFiles
       .map((file) => readFileSync(join(process.cwd(), file), "utf8"))
       .join("\n");
 
-    expect(combined).not.toMatch(/@hasna\/cloud|open-cloud|HASNA_ACCOUNTS_CLOUD|ACCOUNTS_CLOUD/);
+    const retiredMarkers = [
+      ["@hasna", "cloud"].join("/"),
+      ["@hasna", ["open", "cloud"].join("-")].join("/"),
+      ["open", "cloud"].join("-"),
+      ["cloud", "tool"].join("-"),
+      ["HASNA", "ACCOUNTS", "CLOUD"].join("_"),
+      ["ACCOUNTS", "CLOUD"].join("_"),
+    ];
+
+    expect(combined).not.toMatch(new RegExp(retiredMarkers.join("|")));
   });
 });
