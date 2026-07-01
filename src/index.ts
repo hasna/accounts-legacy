@@ -88,6 +88,33 @@ export type {
   SupervisorResponse,
   SupervisorState,
 } from "./lib/supervisor.js";
+export {
+  configsSessionToolFor,
+  configsPrelaunchCommand,
+  runConfigsPrelaunch,
+} from "./lib/configs-prelaunch.js";
+export type {
+  ConfigsPrelaunchMode,
+  ConfigsPrelaunchOptions,
+  ConfigsPrelaunchResult,
+  ConfigsRunner,
+} from "./lib/configs-prelaunch.js";
+export {
+  assessConfigsManifest,
+  configsManifestPath,
+  configsPrelaunchAuditPath,
+  getConfigsPrelaunchSummary,
+  readConfigsPrelaunchAudit,
+  recordConfigsPrelaunchAudit,
+} from "./lib/configs-prelaunch-status.js";
+export type {
+  ConfigsManifestDrift,
+  ConfigsPrelaunchAudit,
+  ConfigsPrelaunchAuditResult,
+  ConfigsPrelaunchManifestStatus,
+  ConfigsPrelaunchStatus,
+  ConfigsPrelaunchSummary,
+} from "./lib/configs-prelaunch-status.js";
 export { pickProfile } from "./lib/pick.js";
 export type { PickOptions, PickResult } from "./lib/pick.js";
 export { installHook, uninstallHook, hookPath, hookScript, shellSnippet } from "./lib/hook.js";

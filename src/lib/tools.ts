@@ -56,6 +56,23 @@ export const BUILTIN_TOOLS: ToolDef[] = [
     },
   },
   {
+    id: "codewith",
+    label: "Codewith",
+    envVar: "CODEWITH_HOME",
+    extraEnv: {
+      CODEX_HOME: "{profileDir}",
+    },
+    defaultDir: join(homedir(), ".codewith"),
+    bin: "codewith",
+    loginArgs: ["login"],
+    loginHint: "complete Codewith login for this CODEWITH_HOME",
+    resumeArgs: ["resume", "--last"],
+    permissionArgs: {
+      dangerous: ["--dangerously-bypass-approvals-and-sandbox"],
+    },
+    accountFile: "auth.json",
+  },
+  {
     id: "takumi",
     label: "Takumi",
     envVar: "TAKUMI_CONFIG_DIR",

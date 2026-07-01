@@ -229,6 +229,28 @@ accounts switch codex-work --tool codex --resume
 accounts switch ops --tool opencode --resume
 ```
 
+`launch`, `run`, and `switch --launch` run a configs prelaunch step by default
+for supported tools (`claude`, `codex`, `codewith`, `opencode`, `cursor`). The
+prelaunch call applies into the profile's locked tool and isolated config dir:
+
+```bash
+accounts launch account001
+accounts run account001
+accounts switch account001 --launch
+```
+
+Use `--configs-dry-run` or `--configs plan` to preview without writing,
+`--skip-configs` for legacy/no-configs runs, and `--allow-configs-failure` only
+when intentionally bypassing a failed prelaunch check. If the account profile has
+`identity: agent:marcus`, accounts exports that OpenIdentities overlay into the
+profile home and passes it to `configs session apply` as `--identity-export`.
+Repeat `--identity-export <path>` to add prebuilt global/tool/account exports.
+
+`accounts list`, `accounts show`, and `accounts supervisor status --json`
+include redacted prelaunch diagnostics: last run mode/result, audited
+skip/bypass reason, OpenConfigs manifest path/hash, generated timestamp, source
+ids/counts, and missing/stale/drift status.
+
 `--permissions <preset>` maps a permission mode to the tool's own flags. For
 example, `--permissions dangerous` launches Claude/Takumi with
 `--dangerously-skip-permissions`, Codex with

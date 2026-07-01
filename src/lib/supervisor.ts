@@ -12,6 +12,8 @@ import { profileEnv } from "./env.js";
 import { currentProfile, getProfile, useProfile } from "./profiles.js";
 import { switchProfile, type SwitchMode, type SwitchResult } from "./switch.js";
 import { getTool } from "./tools.js";
+import { configsSessionToolFor, runConfigsPrelaunch, type ConfigsPrelaunchOptions, type ConfigsPrelaunchResult } from "./configs-prelaunch.js";
+import { getConfigsPrelaunchSummary, type ConfigsPrelaunchSummary } from "./configs-prelaunch-status.js";
 
 export interface SupervisorState {
   version: 1;
@@ -23,6 +25,7 @@ export interface SupervisorState {
   command: string[];
   startedAt: string;
   updatedAt: string;
+  prelaunch?: ConfigsPrelaunchSummary;
 }
 
 export type SupervisorRequest =
@@ -35,6 +38,7 @@ export type SupervisorRequest =
       resume?: boolean;
       args?: string[];
       permissions?: string;
+      configsPrelaunch?: ConfigsPrelaunchOptions;
     }
   | { type: "stop" };
 
@@ -54,6 +58,7 @@ export interface RunSupervisorOptions {
   stdio?: StdioOptions;
   restartDelayMs?: number;
   log?: (message: string) => void;
+  configsPrelaunch?: ConfigsPrelaunchOptions;
 }
 
 export interface SupervisorClientOptions {
@@ -306,6 +311,7 @@ export async function runSupervisedTool(
     command: [tool.bin, ...childArgs],
     startedAt,
     updatedAt: nowIso(),
+    prelaunch: getConfigsPrelaunchSummary(profile, tool, configsSessionToolFor(tool)),
   });
 
   const persist = () => writeSupervisorState(state());
@@ -356,7 +362,30 @@ export async function runSupervisedTool(
     resolveRun(code);
   };
 
-  const startChild = (nextProfile: Profile, nextArgs: string[]): void => {
+  const configsOptionsFor = (request?: { configsPrelaunch?: ConfigsPrelaunchOptions }): ConfigsPrelaunchOptions | undefined => ({
+    ...(opts.configsPrelaunch ?? {}),
+    ...(request?.configsPrelaunch ?? {}),
+  });
+
+  const logConfigsResult = (configs: ConfigsPrelaunchResult, nextProfile: Profile, configOpts?: ConfigsPrelaunchOptions): void => {
+    const mode = configOpts?.mode ?? "apply";
+    if (configs.result === "applied" || configs.result === "planned") {
+      log(`accounts supervisor: configs ${mode} ${configs.result} for ${tool.id}/${nextProfile.name}`);
+      return;
+    }
+    if (configs.result === "skipped") {
+      log(`accounts supervisor: configs skipped for ${tool.id}/${nextProfile.name}: ${configs.reason ?? "skip requested"}`);
+      return;
+    }
+    if (configs.result === "bypassed") {
+      log(`accounts supervisor: configs bypassed for ${tool.id}/${nextProfile.name}: ${configs.reason ?? "allow-failure"}`);
+    }
+  };
+
+  const startChild = (nextProfile: Profile, nextArgs: string[], preflightedConfigs?: ConfigsPrelaunchResult): void => {
+    const configOpts = configsOptionsFor();
+    const configs = preflightedConfigs ?? runConfigsPrelaunch(nextProfile, tool, configOpts);
+    logConfigsResult(configs, nextProfile, configOpts);
     profile = nextProfile;
     childArgs = nextArgs;
     useProfile(profile.name, tool.id);
@@ -384,12 +413,12 @@ export async function runSupervisedTool(
     });
   };
 
-  const restartWith = async (result: SwitchResult): Promise<void> => {
+  const restartWith = async (result: SwitchResult, preflightedConfigs: ConfigsPrelaunchResult): Promise<void> => {
     restarting = true;
     try {
       await wait(restartDelayMs);
       await stopChild();
-      startChild(getProfile(result.profile.name, tool.id), result.command.slice(1));
+      startChild(result.profile, result.command.slice(1), preflightedConfigs);
     } finally {
       restarting = false;
     }
@@ -413,6 +442,9 @@ export async function runSupervisedTool(
       return { ok: false, error: `this supervisor runs ${tool.id}, not ${request.tool}` };
     }
     try {
+      const nextProfile = getProfile(request.name, tool.id);
+      const configOpts = configsOptionsFor(request);
+      const preflightedConfigs = runConfigsPrelaunch(nextProfile, tool, configOpts);
       const result = switchProfile(request.name, {
         tool: tool.id,
         mode: request.mode ?? "auto",
@@ -421,7 +453,7 @@ export async function runSupervisedTool(
         permissions: request.permissions,
       });
       log(`accounts supervisor: switching ${tool.id} to ${result.profile.name}`);
-      setTimeout(() => void restartWith(result), 0);
+      setTimeout(() => void restartWith(result, preflightedConfigs), 0);
       return { ok: true, queued: true, result, state: state(), restartDelayMs };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };

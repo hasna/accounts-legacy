@@ -51,6 +51,8 @@ import { prepareClaudeProfileKeychain, profileHasAuth } from "./lib/claude-auth.
 import { formatEnvAssignments, formatExportLines, profileEnv } from "./lib/env.js";
 import { finalizeLogin, prepareLogin } from "./lib/login.js";
 import { switchProfile, type SwitchMode } from "./lib/switch.js";
+import { configsSessionToolFor, runConfigsPrelaunch, type ConfigsPrelaunchMode, type ConfigsPrelaunchOptions } from "./lib/configs-prelaunch.js";
+import { getConfigsPrelaunchSummary, type ConfigsPrelaunchSummary } from "./lib/configs-prelaunch-status.js";
 import {
   listSupervisorStates,
   readSupervisorState,
@@ -88,7 +90,20 @@ function action<A extends unknown[]>(fn: (...args: A) => void | Promise<void>) {
   };
 }
 
-function fmtProfile(p: Profile, active: boolean, applied = false): string {
+function formatPrelaunchLabel(prelaunch?: ConfigsPrelaunchSummary): string {
+  if (!prelaunch || !prelaunch.supported) return "";
+  const status = prelaunch.status;
+  const drift = prelaunch.manifest.drift;
+  const label = drift !== "ok" && drift !== "unsupported" && drift !== status ? `${status}/${drift}` : status;
+  const color =
+    status === "ok" ? chalk.green :
+      status === "skipped" || status === "planned" ? chalk.yellow :
+        status === "bypassed" || status === "missing" || status === "stale" ? chalk.yellow :
+          chalk.red;
+  return `  ${chalk.dim("configs:")}${color(label)}`;
+}
+
+function fmtProfile(p: Profile, active: boolean, applied = false, prelaunch?: ConfigsPrelaunchSummary): string {
   const marker =
     active && applied
       ? chalk.green("●") + chalk.magenta("◉")
@@ -109,10 +124,52 @@ function fmtProfile(p: Profile, active: boolean, applied = false): string {
   const email = p.email ? chalk.yellow(p.email) : chalk.dim("(no email)");
   const displayName = p.displayName ? chalk.dim(` (${p.displayName})`) : "";
   const desc = p.description ? chalk.dim(` — ${p.description}`) : "";
-  return `${marker} ${name}${displayName}  ${tool}  ${email}${desc}`;
+  return `${marker} ${name}${displayName}  ${tool}  ${email}${desc}${formatPrelaunchLabel(prelaunch)}`;
+}
+
+function prelaunchSummaryFor(p: Profile): ConfigsPrelaunchSummary {
+  const tool = getTool(p.tool);
+  return getConfigsPrelaunchSummary(p, tool, configsSessionToolFor(tool));
+}
+
+function profileDetails(p: Profile): Profile & { active: boolean; applied: boolean; prelaunch: ConfigsPrelaunchSummary } {
+  return {
+    ...p,
+    active: currentProfile(p.tool)?.name === p.name,
+    applied: appliedProfile(p.tool)?.name === p.name,
+    prelaunch: prelaunchSummaryFor(p),
+  };
+}
+
+function printPrelaunchDetails(prelaunch: ConfigsPrelaunchSummary): void {
+  if (!prelaunch.supported) {
+    console.log(`  prelaunch: ${chalk.dim("unsupported")}`);
+    return;
+  }
+  const statusColor =
+    prelaunch.status === "ok" ? chalk.green :
+      prelaunch.status === "failed" || prelaunch.status === "invalid" || prelaunch.status === "mismatch" ? chalk.red :
+        chalk.yellow;
+  console.log(`  prelaunch: ${statusColor(prelaunch.status)}`);
+  if (prelaunch.reasons.length > 0) console.log(`    reason:    ${prelaunch.reasons.join("; ")}`);
+  const manifest = prelaunch.manifest;
+  console.log(`    manifest:  ${manifest.path}${manifest.exists ? "" : chalk.red("  [missing]")}`);
+  if (manifest.hash) console.log(`    hash:      ${manifest.hash}`);
+  if (manifest.generatedAt) console.log(`    generated: ${manifest.generatedAt}`);
+  const ids = manifest.sourceIds.length > 0 ? ` (${manifest.sourceIds.join(", ")}${manifest.sourceIdsTruncated ? ", ..." : ""})` : "";
+  console.log(`    sources:   ${manifest.sourceCount}${ids}`);
+  if (prelaunch.lastRun) {
+    const run = prelaunch.lastRun;
+    const reason = run.reason ? `  ${run.reason}` : "";
+    console.log(`    last run:  ${run.mode}/${run.result} at ${run.updatedAt}${reason}`);
+  }
 }
 
 function collectMetadata(value: string, previous: string[] = []): string[] {
+  return [...previous, value];
+}
+
+function collectRepeated(value: string, previous: string[] = []): string[] {
   return [...previous, value];
 }
 
@@ -181,6 +238,40 @@ function parsePermissionArgs(entries?: string[]): Record<string, string[]> {
     (permissionArgs[preset] ??= []).push(arg);
   }
   return permissionArgs;
+}
+
+interface ConfigsCliOptions {
+  configs?: ConfigsPrelaunchMode;
+  configsDryRun?: boolean;
+  skipConfigs?: boolean;
+  allowConfigsFailure?: boolean;
+  configsBin?: string;
+  identitiesBin?: string;
+  identityExport?: string[];
+}
+
+function configsPrelaunchOptions(opts: ConfigsCliOptions): ConfigsPrelaunchOptions {
+  const mode = opts.skipConfigs ? "skip" : opts.configsDryRun ? "plan" : opts.configs ?? "apply";
+  if (!["plan", "apply", "skip"].includes(mode)) die(`invalid --configs "${mode}" (expected plan, apply, or skip)`);
+  return {
+    mode,
+    allowFailure: opts.allowConfigsFailure,
+    configsBin: opts.configsBin,
+    identitiesBin: opts.identitiesBin,
+    identityExports: opts.identityExport,
+    skipReason: opts.skipConfigs ? "--skip-configs" : mode === "skip" ? "--configs skip" : undefined,
+  };
+}
+
+function addConfigsOptions(command: Command): Command {
+  return command
+    .option("--configs <mode>", "prelaunch configs mode: apply, plan, or skip", "apply")
+    .option("--configs-dry-run", "run the configs prelaunch render plan without applying")
+    .option("--skip-configs", "skip configs prelaunch")
+    .option("--allow-configs-failure", "continue launch/run even if configs prelaunch fails")
+    .option("--configs-bin <path>", "configs CLI binary", "configs")
+    .option("--identities-bin <path>", "identities CLI binary used for profile identity exports", "identities")
+    .option("--identity-export <path>", "OpenIdentities configs instruction export JSON; repeatable", collectRepeated, []);
 }
 
 program
@@ -306,7 +397,7 @@ program
     action((opts: { tool?: string; json?: boolean }) => {
       const profiles = listProfiles(opts.tool);
       if (opts.json) {
-        console.log(JSON.stringify(profiles, null, 2));
+        console.log(JSON.stringify(profiles.map(profileDetails), null, 2));
         return;
       }
       if (profiles.length === 0) {
@@ -316,7 +407,7 @@ program
       for (const p of profiles) {
         const active = currentProfile(p.tool)?.name === p.name;
         const isApplied = appliedProfile(p.tool)?.name === p.name;
-        console.log(fmtProfile(p, active, isApplied));
+        console.log(fmtProfile(p, active, isApplied, prelaunchSummaryFor(p)));
       }
     }),
   );
@@ -330,13 +421,14 @@ program
   .action(
     action((name: string, opts: { tool?: string; json?: boolean }) => {
       const p = getProfile(name, opts.tool);
+      const details = profileDetails(p);
       if (opts.json) {
-        console.log(JSON.stringify(p, null, 2));
+        console.log(JSON.stringify(details, null, 2));
         return;
       }
-      const active = currentProfile(p.tool)?.name === p.name;
-      const isApplied = appliedProfile(p.tool)?.name === p.name;
-      console.log(fmtProfile(p, active, isApplied));
+      const active = details.active;
+      const isApplied = details.applied;
+      console.log(fmtProfile(p, active, isApplied, details.prelaunch));
       console.log(`  tool:       ${p.tool} (${getTool(p.tool).label})`);
       console.log(`  active:     ${active ? chalk.green("yes") : chalk.dim("no")}`);
       console.log(`  applied:    ${isApplied ? chalk.magenta("yes") : chalk.dim("no")}`);
@@ -350,6 +442,7 @@ program
       }
       console.log(`  created:    ${p.createdAt}`);
       if (p.lastUsedAt) console.log(`  last used:  ${p.lastUsedAt}`);
+      printPrelaunchDetails(details.prelaunch);
     }),
   );
 
@@ -498,8 +591,8 @@ program
     }),
   );
 
-program
-  .command("switch")
+addConfigsOptions(program
+  .command("switch"))
   .argument("<name>", "profile name")
   .argument("[args...]", "extra args passed when printing/launching the tool")
   .description("switch to a profile and print a restart/resume command; use --launch to run it")
@@ -523,7 +616,7 @@ program
           launch?: boolean;
           supervisor?: boolean;
           json?: boolean;
-        },
+        } & ConfigsCliOptions,
       ) => {
         if (opts.supervisor && opts.launch) die("--supervisor and --launch cannot be used together");
         if (opts.supervisor) {
@@ -538,6 +631,7 @@ program
               resume: opts.resume ?? true,
               args,
               permissions: opts.permissions,
+              configsPrelaunch: configsPrelaunchOptions(opts),
             },
             { allowMissing: true },
           );
@@ -574,6 +668,7 @@ program
           }
         }
         if (opts.launch) {
+          runConfigsPrelaunch(result.profile, result.tool, configsPrelaunchOptions(opts));
           const [bin, ...launchArgs] = result.command;
           const res = spawnSync(bin!, launchArgs, {
             stdio: "inherit",
@@ -634,17 +729,18 @@ program
     }),
   );
 
-program
-  .command("launch")
+addConfigsOptions(program
+  .command("launch"))
   .argument("<name>", "profile name")
   .argument("[args...]", "extra args passed to the tool binary")
   .description("launch the tool's binary with the profile's config dir active")
   .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .option("--permissions <preset>", "tool-specific permission preset, e.g. dangerous")
   .action(
-    action((name: string, args: string[], opts: { tool?: string; permissions?: string }) => {
+    action((name: string, args: string[], opts: { tool?: string; permissions?: string } & ConfigsCliOptions) => {
       const profile = getProfile(name, opts.tool);
       const tool = getTool(profile.tool);
+      runConfigsPrelaunch(profile, tool, configsPrelaunchOptions(opts));
       const env = profileEnv(profile, tool);
       const launchArgs = mergeToolArgs(tool, args, { permissions: opts.permissions, profile });
       useProfile(name, tool.id); // mark active + bump lastUsedAt
@@ -659,8 +755,8 @@ program
     }),
   );
 
-program
-  .command("run")
+addConfigsOptions(program
+  .command("run"))
   .argument("<target>", "tool id to supervise (claude, codex, opencode...) or a profile name")
   .argument("[args...]", "extra args passed to the tool binary")
   .description("run a tool under the accounts supervisor so MCP can switch/restart it")
@@ -669,7 +765,7 @@ program
   .option("--resume", "start with the tool's resume/continue args")
   .option("--permissions <preset>", "tool-specific permission preset, e.g. dangerous")
   .action(
-    action(async (target: string, args: string[], opts: { profile?: string; tool?: string; resume?: boolean; permissions?: string }) => {
+    action(async (target: string, args: string[], opts: { profile?: string; tool?: string; resume?: boolean; permissions?: string } & ConfigsCliOptions) => {
       const plan = resolveSupervisorLaunch(target, { profile: opts.profile, tool: opts.tool });
       const runArgs = mergeToolArgs(plan.tool, [...(opts.resume ? (plan.tool.resumeArgs ?? []) : []), ...args], {
         permissions: opts.permissions,
@@ -679,6 +775,7 @@ program
       console.error(chalk.dim(`  control: accounts supervisor status ${plan.tool.id}`));
       console.error(chalk.dim(`  switch:  accounts switch <profile> --tool ${plan.tool.id} --supervisor`));
       const code = await runSupervisedTool(plan.profile, plan.tool, runArgs, {
+        configsPrelaunch: configsPrelaunchOptions(opts),
         log: (message) => console.error(chalk.dim(message)),
       });
       process.exit(code);
@@ -712,13 +809,15 @@ supervisor
       for (const state of live) {
         const stale = "stale" in state ? chalk.yellow(" stale") : "";
         const child = state.childPid ? ` child:${state.childPid}` : "";
+        const configs = state.prelaunch?.supported ? formatPrelaunchLabel(state.prelaunch).trim() : "";
         console.log(`${chalk.cyan(state.tool.padEnd(10))} ${chalk.bold(state.profile)} pid:${state.pid}${child}${stale}`);
+        if (configs) console.log(`  ${configs}`);
         console.log(chalk.dim(`  ${state.command.join(" ")}`));
       }
     }),
   );
 
-supervisor
+addConfigsOptions(supervisor
   .command("switch")
   .argument("<name>", "profile name")
   .argument("[args...]", "extra args passed after resume/continue args")
@@ -727,13 +826,13 @@ supervisor
   .option("--mode <mode>", "switch mode: auto, apply, env, active", "auto")
   .option("--no-resume", "restart without the tool's resume/continue args")
   .option("--permissions <preset>", "tool-specific permission preset, e.g. dangerous")
-  .option("--json", "output JSON")
+  .option("--json", "output JSON"))
   .action(
     action(
       async (
         name: string,
         args: string[],
-        opts: { tool?: string; mode: SwitchMode; resume?: boolean; permissions?: string; json?: boolean },
+        opts: { tool?: string; mode: SwitchMode; resume?: boolean; permissions?: string; json?: boolean } & ConfigsCliOptions,
       ) => {
       const profile = getProfile(name, opts.tool);
       const response = await sendSupervisorRequest(
@@ -746,6 +845,7 @@ supervisor
           resume: opts.resume !== false,
           args,
           permissions: opts.permissions,
+          configsPrelaunch: configsPrelaunchOptions(opts),
         },
         { allowMissing: true },
       );

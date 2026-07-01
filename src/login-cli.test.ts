@@ -59,6 +59,35 @@ function writeFakeTool(binName: string, envVar: string, toolName = binName, exit
   chmodSync(fakeBin, 0o755);
 }
 
+function writeFakeConfigs() {
+  const fakeBin = join(binDir, "configs");
+  writeFileSync(
+    fakeBin,
+    [
+      "#!/bin/sh",
+      'printf \'%s\\n\' "$*" >> "$FAKE_CONFIGS_LOG"',
+      'mode="${2:-}"',
+      'tool=""',
+      'profile=""',
+      'target=""',
+      'while [ "$#" -gt 0 ]; do',
+      '  case "$1" in',
+      '    --tool) shift; tool="${1:-}" ;;',
+      '    --profile) shift; profile="${1:-}" ;;',
+      '    --target-home) shift; target="${1:-}" ;;',
+      '  esac',
+      '  shift || true',
+      'done',
+      'if [ "$mode" = "apply" ] && [ -n "$target" ]; then',
+      '  mkdir -p "$target/.hasna"',
+      '  printf \'{"schema":"hasna.configs.session-render/v1","tool":"%s","profile":"%s","targetHome":"%s","generatedAt":"2026-07-01T00:00:00.000Z","sources":[{"id":"global-codewith"}],"files":[]}\\n\' "$tool" "$profile" "$target" > "$target/.hasna/session-render-manifest.json"',
+      'fi',
+      "exit 0",
+    ].join("\n"),
+  );
+  chmodSync(fakeBin, 0o755);
+}
+
 function writeFakeSecurity() {
   const fakeSecurity = join(binDir, "fake-security");
   writeFileSync(
@@ -147,7 +176,7 @@ test("launch syncs Claude profile credentials into keychain before spawning", ()
   expect(profile).toBeTruthy();
   writeClaudeAuth(profile!.dir, "acct@example.com");
 
-  const result = runCliWith(["launch", "acct", "--tool", "claude", "--", "--version"], {
+  const result = runCliWith(["launch", "acct", "--tool", "claude", "--skip-configs", "--", "--version"], {
     env: {
       ACCOUNTS_TEST_KEYCHAIN: "1",
       ACCOUNTS_TEST_SECURITY_BIN: fakeSecurity,
@@ -163,6 +192,44 @@ test("launch syncs Claude profile credentials into keychain before spawning", ()
   expect(keychainLog).toContain("add-generic-password");
   expect(keychainPayload).toContain("account=acct");
   expect(keychainPayload).toContain("acct@example.com-access-token");
+});
+
+test("launch runs configs apply by default before spawning", () => {
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
+  writeFakeConfigs();
+  const configsLog = join(home, "fake-configs.log");
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  const profile = readStore().profiles?.find((entry) => entry.name === "acct" && entry.tool === "claude");
+  expect(profile).toBeTruthy();
+
+  const result = runCliWith(["launch", "acct", "--tool", "claude", "--", "--version"], {
+    env: { FAKE_CONFIGS_LOG: configsLog },
+  });
+
+  expect(result.status).toBe(0);
+  const configsCall = readFileSync(configsLog, "utf8");
+  expect(configsCall).toContain("session apply --tool claude --profile acct");
+  expect(configsCall).toContain(`--target-home ${profile!.dir}`);
+  expect(readLogEntries()[0]?.tool).toBe("claude");
+});
+
+test("switch --launch runs configs apply by default before spawning", () => {
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
+  writeFakeConfigs();
+  const configsLog = join(home, "fake-configs.log");
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  const profile = readStore().profiles?.find((entry) => entry.name === "acct" && entry.tool === "claude");
+  expect(profile).toBeTruthy();
+
+  const result = runCliWith(["switch", "acct", "--tool", "claude", "--mode", "active", "--launch", "--", "--version"], {
+    env: { FAKE_CONFIGS_LOG: configsLog },
+  });
+
+  expect(result.status).toBe(0);
+  const configsCall = readFileSync(configsLog, "utf8");
+  expect(configsCall).toContain("session apply --tool claude --profile acct");
+  expect(configsCall).toContain(`--target-home ${profile!.dir}`);
+  expect(readLogEntries()[0]?.tool).toBe("claude");
 });
 
 test("env syncs Claude profile credentials into keychain before printing exports", () => {
