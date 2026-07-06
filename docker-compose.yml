@@ -1,0 +1,26 @@
+# Local/self-host compose for accounts-serve.
+#
+# PURE REMOTE (Amendment A1): the service talks to a cloud Postgres. Provide the
+# DSN + signing secret via env (never commit them). Example:
+#   HASNA_ACCOUNTS_DATABASE_URL=postgresql://accounts_app:***@host:5432/accounts?sslmode=require
+#   HASNA_ACCOUNTS_API_SIGNING_KEY=***
+# Then: docker compose up --build
+services:
+  accounts-serve:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hasna/accounts:local
+    ports:
+      - "8080:8080"
+    environment:
+      HASNA_ACCOUNTS_STORAGE_MODE: cloud
+      HASNA_ACCOUNTS_DATABASE_URL: ${HASNA_ACCOUNTS_DATABASE_URL:?set the cloud Postgres DSN}
+      HASNA_ACCOUNTS_API_SIGNING_KEY: ${HASNA_ACCOUNTS_API_SIGNING_KEY:?set the API-key signing secret}
+      PORT: "8080"
+    healthcheck:
+      test: ["CMD", "bun", "-e", "await fetch('http://127.0.0.1:8080/health').then(r=>{if(!r.ok)process.exit(1)})"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
