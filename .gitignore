@@ -12,3 +12,7 @@ coverage/
 
 # projects CLI generates a machine-specific CLAUDE.md (local only)
 CLAUDE.md
+
+# Bun auto-writes these for the release-age quarantine; not part of this bun project
+pnpm-lock.yaml
+pnpm-workspace.yaml
