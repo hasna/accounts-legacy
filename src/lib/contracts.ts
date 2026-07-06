@@ -8,8 +8,6 @@ import type { RunSupervisorOptions } from "./supervisor.js";
 
 const PACKAGE_NAME = "@hasna/accounts";
 const PACKAGE_VERSION = "0.1.31";
-const DEFAULT_CREATED_AT = "2026-07-06T00:00:00.000Z";
-
 type ActorObject = Record<string, unknown>;
 
 function slug(value: string): string {
@@ -17,7 +15,7 @@ function slug(value: string): string {
 }
 
 function createdAt(now?: string): string {
-  return now ?? DEFAULT_CREATED_AT;
+  return now ?? new Date().toISOString();
 }
 
 function packageVersion(): string {
@@ -75,23 +73,24 @@ function actorRefFromObject(value: ActorObject, now?: string): ActorRef {
   return parseContract(SCHEMA_IDS.actorRef, draft);
 }
 
-function validateActorField(value: unknown, path: string, now?: string): void {
+function validateActorField(value: unknown, path: string, options: { allowScalar?: boolean; now?: string } = {}): void {
   if (value === undefined || value === null) return;
   if (typeof value !== "object" || Array.isArray(value)) {
+    if (options.allowScalar) return;
     throw new Error(`${path} must be an actor_ref-compatible object`);
   }
-  actorRefFromObject(value as ActorObject, now);
+  actorRefFromObject(value as ActorObject, options.now);
 }
 
 export function validateEventActorRefs<TData extends Record<string, unknown>>(input: EventInput<TData>, now?: string): EventInput<TData> {
   const data = input.data as Record<string, unknown> | undefined;
   const metadata = input.metadata;
-  validateActorField(data?.actor, "data.actor", now);
-  validateActorField(data?.actorRef, "data.actorRef", now);
-  validateActorField(data?.actor_ref, "data.actor_ref", now);
-  validateActorField(metadata?.actor, "metadata.actor", now);
-  validateActorField(metadata?.actorRef, "metadata.actorRef", now);
-  validateActorField(metadata?.actor_ref, "metadata.actor_ref", now);
+  validateActorField(data?.actor, "data.actor", { allowScalar: true, now });
+  validateActorField(data?.actorRef, "data.actorRef", { now });
+  validateActorField(data?.actor_ref, "data.actor_ref", { now });
+  validateActorField(metadata?.actor, "metadata.actor", { allowScalar: true, now });
+  validateActorField(metadata?.actorRef, "metadata.actorRef", { now });
+  validateActorField(metadata?.actor_ref, "metadata.actor_ref", { now });
   return input;
 }
 

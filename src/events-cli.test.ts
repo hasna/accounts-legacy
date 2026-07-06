@@ -60,4 +60,10 @@ describe("accounts events CLI", () => {
     expect(result.exitCode).not.toBe(0);
     expect(stderr).toContain("Contract validation failed for hasna.actor_ref.v1");
   });
+
+  test("events emit accepts ordinary scalar actor fields", () => {
+    const result = runEventsEmit(JSON.stringify({ actor: "alice" }));
+
+    expect(result.exitCode).toBe(0);
+  });
 });

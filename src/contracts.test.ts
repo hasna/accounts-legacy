@@ -59,6 +59,31 @@ describe("accounts contract adapters", () => {
     expect(validateEventActorRefs(input)).toBe(input);
   });
 
+  test("leaves ordinary scalar actor payload fields untouched", () => {
+    const input = {
+      source: "accounts",
+      type: "accounts.test",
+      data: {
+        actor: "alice",
+        actorRef: null,
+      },
+    };
+
+    expect(validateEventActorRefs(input)).toBe(input);
+  });
+
+  test("rejects scalar actor_ref aliases", () => {
+    expect(() =>
+      validateEventActorRefs({
+        source: "accounts",
+        type: "accounts.test",
+        data: {
+          actorRef: "alice",
+        },
+      }),
+    ).toThrow("data.actorRef must be an actor_ref-compatible object");
+  });
+
   test("events client wrapper rejects invalid actor refs before publish", async () => {
     const client = new AccountsEventsClient();
 
@@ -101,5 +126,15 @@ describe("accounts contract adapters", () => {
     expect(card.capabilities).toContain("event-emission");
     expect(pack.schema).toBe(SCHEMA_IDS.noCloudEvidencePack);
     expect(pack.packageName).toBe("@hasna/accounts");
+  });
+
+  test("uses live timestamps by default for generated contracts", () => {
+    const before = Date.now();
+    const actor = toAccountsActorRef({ name: "@hasna/accounts" });
+    const after = Date.now();
+
+    const created = Date.parse(actor.createdAt);
+    expect(created).toBeGreaterThanOrEqual(before);
+    expect(created).toBeLessThanOrEqual(after);
   });
 });
