@@ -1,0 +1,9 @@
+node_modules
+dist
+.git
+*.log
+.DS_Store
+docs
+test
+**/*.test.ts
+coverage
