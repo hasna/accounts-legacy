@@ -1,7 +1,7 @@
 {
   "name": "@hasna/accounts",
-  "version": "0.1.32",
-  "description": "Manage and switch between multiple Claude Code (and other AI coding tool) profiles/accounts locally — isolated config dirs, per-account email, one-command switching.",
+  "version": "0.1.33",
+  "description": "Manage and switch between multiple Claude Code (and other AI coding tool) profiles/accounts locally \u2014 isolated config dirs, per-account email, one-command switching.",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -88,7 +88,7 @@
   "license": "Apache-2.0",
   "dependencies": {
     "@aws-sdk/client-s3": "^3.985.0",
-    "@hasna/contracts": "^0.4.1",
+    "@hasna/contracts": "0.5.0",
     "@hasna/events": "^0.1.7",
     "@modelcontextprotocol/sdk": "^1.27.1",
     "chalk": "^5.4.1",

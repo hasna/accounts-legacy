@@ -31,6 +31,7 @@ import {
   useProfile,
   type ProfileMetadata,
 } from "./lib/profiles.js";
+import { resolveAccountsCloud } from "./lib/cloud-accounts.js";
 import {
   accountsHome,
   getAccountsStorageStatus,
@@ -385,7 +386,7 @@ program
   .option("--description <text>", "free-text description")
   .action(
     action(
-      (
+      async (
         name: string,
         opts: {
           tool: string;
@@ -398,7 +399,20 @@ program
           description?: string;
         },
       ) => {
-        const p = addProfile({
+        const cloud = resolveAccountsCloud();
+        const p = cloud.transport === "cloud-http"
+          ? await cloud.api.create({
+              name,
+              tool: opts.tool,
+              email: opts.email,
+              displayName: opts.displayName,
+              identity: opts.identity,
+              cardLast4: opts.cardLast4,
+              metadata: parseMetadataPairs(opts.metadata),
+              dir: opts.dir,
+              description: opts.description,
+            })
+          : addProfile({
           name,
           tool: opts.tool,
           email: opts.email,
@@ -428,7 +442,29 @@ program
   .option("-t, --tool <tool>", "filter by tool")
   .option("--json", "output JSON")
   .action(
-    action((opts: { tool?: string; json?: boolean }) => {
+    action(async (opts: { tool?: string; json?: boolean }) => {
+      const cloud = resolveAccountsCloud();
+      if (cloud.transport === "cloud-http") {
+        const profiles = await cloud.api.list(opts.tool);
+        const current = await cloud.api.listCurrent();
+        const activeFor = (tool: string) => current.find((c) => c.tool === tool)?.name;
+        if (opts.json) {
+          console.log(JSON.stringify(profiles.map((p) => ({
+            ...profileDetails(p),
+            active: activeFor(p.tool) === p.name,
+            applied: false,
+          })), null, 2));
+          return;
+        }
+        if (profiles.length === 0) {
+          console.log(chalk.dim("no profiles yet — create one with `accounts add <name> --email you@example.com`"));
+          return;
+        }
+        for (const p of profiles) {
+          console.log(fmtProfile(p, activeFor(p.tool) === p.name, false, undefined));
+        }
+        return;
+      }
       const profiles = listProfiles(opts.tool);
       if (opts.json) {
         console.log(JSON.stringify(profiles.map(profileDetails), null, 2));
@@ -453,7 +489,28 @@ program
   .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .option("--json", "output JSON")
   .action(
-    action((name: string, opts: { tool?: string; json?: boolean }) => {
+    action(async (name: string, opts: { tool?: string; json?: boolean }) => {
+      const cloud = resolveAccountsCloud();
+      if (cloud.transport === "cloud-http") {
+        const p = await cloud.api.get(name, opts.tool);
+        if (!p) die(`no profile named "${name}"${opts.tool ? ` for tool "${opts.tool}"` : ""}. Run \`accounts list\` to see profiles.`);
+        const active = (await cloud.api.getCurrent(p!.tool))?.name === p!.name;
+        if (opts.json) {
+          console.log(JSON.stringify({ ...profileDetails(p!), active, applied: false }, null, 2));
+          return;
+        }
+        console.log(fmtProfile(p!, active, false, undefined));
+        console.log(`  tool:       ${p!.tool} (${getTool(p!.tool).label})`);
+        console.log(`  active:     ${active ? chalk.green("yes") : chalk.dim("no")}`);
+        console.log(`  email:      ${p!.email ?? chalk.dim("(none)")}`);
+        if (p!.displayName) console.log(`  name:       ${p!.displayName}`);
+        if (p!.identity) console.log(`  identity:   ${p!.identity}`);
+        if (p!.cardLast4) console.log(`  card:       ****${p!.cardLast4}`);
+        if (p!.metadata && Object.keys(p!.metadata).length > 0) console.log(`  metadata:   ${JSON.stringify(p!.metadata)}`);
+        console.log(`  created:    ${p!.createdAt}`);
+        if (p!.lastUsedAt) console.log(`  last used:  ${p!.lastUsedAt}`);
+        return;
+      }
       const p = getProfile(name, opts.tool);
       const details = profileDetails(p);
       if (opts.json) {
@@ -486,8 +543,21 @@ program
   .description("set a profile as the active one for its tool")
   .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .action(
-    action((name: string, opts: { tool?: string }) => {
-      const { profile, toolId } = useProfile(name, opts.tool);
+    action(async (name: string, opts: { tool?: string }) => {
+      const cloud = resolveAccountsCloud();
+      let profile: { name: string; tool: string };
+      let toolId: string;
+      if (cloud.transport === "cloud-http") {
+        const p = await cloud.api.get(name, opts.tool);
+        if (!p) die(`no profile named "${name}"${opts.tool ? ` for tool "${opts.tool}"` : ""}. Run \`accounts list\` to see profiles.`);
+        await cloud.api.setCurrent(p!.tool, p!.name);
+        profile = { name: p!.name, tool: p!.tool };
+        toolId = p!.tool;
+      } else {
+        const r = useProfile(name, opts.tool);
+        profile = r.profile;
+        toolId = r.toolId;
+      }
       const tool = getTool(toolId);
       console.log(chalk.green(`✓ ${chalk.bold(profile.name)} is now the active ${tool.label} profile`));
       console.log(chalk.dim("  this CLI can't change your current shell's env, so either:"));
@@ -604,8 +674,15 @@ program
   .argument("[tool]", "tool id (default: claude)")
   .description("print the active profile name (for scripting)")
   .action(
-    action((toolId: string | undefined) => {
+    action(async (toolId: string | undefined) => {
       const tool = toolId ?? DEFAULT_TOOL;
+      const cloud = resolveAccountsCloud();
+      if (cloud.transport === "cloud-http") {
+        const c = await cloud.api.getCurrent(tool);
+        if (!c) die(`no active profile for "${tool}". Run \`accounts use <name>\` first.`);
+        console.log(c!.name);
+        return;
+      }
       const p = currentProfile(tool);
       if (!p) die(`no active profile for "${tool}". Run \`accounts use <name>\` first.`);
       console.log(p.name);
@@ -1146,7 +1223,14 @@ program
   .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .option("--purge", "also delete the managed config dir on disk")
   .action(
-    action((name: string, opts: { tool?: string; purge?: boolean }) => {
+    action(async (name: string, opts: { tool?: string; purge?: boolean }) => {
+      const cloud = resolveAccountsCloud();
+      if (cloud.transport === "cloud-http") {
+        const profile = await cloud.api.remove(name, opts.tool);
+        console.log(chalk.green(`✓ removed ${chalk.bold(profile.name)}`));
+        if (opts.purge) console.log(chalk.yellow("  --purge is a local-only operation; the config dir (if any) was not touched in self_hosted mode"));
+        return;
+      }
       const { profile, purged, purgeNote } = removeProfile(name, { tool: opts.tool, purge: opts.purge });
       console.log(chalk.green(`✓ removed ${chalk.bold(profile.name)}`));
       if (purged) console.log(chalk.dim(`  deleted ${profile.dir}`));
