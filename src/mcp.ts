@@ -8,6 +8,7 @@ import { switchProfile, type SwitchMode } from "./lib/switch.js";
 import { listTools } from "./lib/tools.js";
 import { AccountsError } from "./types.js";
 import { listSupervisorStates, sendSupervisorRequest } from "./lib/supervisor.js";
+import { resolveAccountsCloud } from "./lib/cloud-accounts.js";
 
 function ok(data: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
@@ -70,11 +71,22 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     switch (req.params.name) {
       case "list_tools":
         return ok(listTools());
-      case "list_profiles":
-        return ok(listProfiles(typeof args["tool"] === "string" ? args["tool"] : undefined));
+      case "list_profiles": {
+        const tool = typeof args["tool"] === "string" ? (args["tool"] as string) : undefined;
+        const cloud = resolveAccountsCloud();
+        if (cloud.transport === "cloud-http") return ok(await cloud.api.list(tool));
+        return ok(listProfiles(tool));
+      }
       case "current_profile": {
         const tool = args["tool"];
         if (typeof tool !== "string") return fail("tool is required");
+        const cloud = resolveAccountsCloud();
+        if (cloud.transport === "cloud-http") {
+          const sel = await cloud.api.getCurrent(tool);
+          const active = sel ? (await cloud.api.get(sel.name, tool)) ?? null : null;
+          // `applied` reflects live auth on THIS machine's ~/.claude paths and stays local.
+          return ok({ tool, active, applied: appliedProfile(tool) ?? null });
+        }
         return ok({ tool, active: currentProfile(tool) ?? null, applied: appliedProfile(tool) ?? null });
       }
       case "supervisor_status": {
