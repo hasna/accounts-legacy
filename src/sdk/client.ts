@@ -28,7 +28,9 @@ export interface SetCurrentInput { "name": string }
 
 export interface RenameAccountInput { "name": string }
 
-export interface Tool { "id": string; "label": string; "envVar"?: string; "bin"?: string; "builtin"?: boolean }
+export interface Tool { "id": string; "label": string; "envVar": string; "extraEnv"?: Record<string, string>; "defaultDir": string; "bin": string; "loginArgs"?: Array<string>; "loginHint"?: string; "resumeArgs"?: Array<string>; "permissionArgs"?: Record<string, Array<string>>; "launchArgs"?: Array<string>; "accountFile"?: string; "emailPath"?: Array<string>; "builtin"?: boolean }
+
+export interface ToolDefInput { "id": string; "label": string; "envVar": string; "extraEnv"?: Record<string, string>; "defaultDir": string; "bin": string; "loginArgs"?: Array<string>; "loginHint"?: string; "resumeArgs"?: Array<string>; "permissionArgs"?: Record<string, Array<string>>; "launchArgs"?: Array<string>; "accountFile"?: string; "emailPath"?: Array<string> }
 
 export interface ToolList { "tools": Array<Tool> }
 
@@ -189,6 +191,24 @@ export class AccountsClient {
     /** List known tools (builtin + custom) */
     async listTools(init?: RequestInit): Promise<ToolList> {
       return this.request("GET", `/v1/tools`, {
+        body: undefined,
+        query: undefined,
+        init,
+      });
+    }
+
+    /** Register a custom tool */
+    async addTool(body: ToolDefInput, init?: RequestInit): Promise<Tool> {
+      return this.request("POST", `/v1/tools`, {
+        body,
+        query: undefined,
+        init,
+      });
+    }
+
+    /** Remove a custom tool */
+    async removeTool(id: string, init?: RequestInit): Promise<void> {
+      return this.request("DELETE", `/v1/tools/${encodeURIComponent(String(id))}`, {
         body: undefined,
         query: undefined,
         init,

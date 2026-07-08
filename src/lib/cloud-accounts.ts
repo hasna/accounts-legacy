@@ -21,7 +21,7 @@
 // SAFETY: the API key never appears in logs or return values; it lives only
 // inside the contracts transport.
 
-import type { Profile } from "../types.js";
+import type { Profile, ToolDef } from "../types.js";
 import { resolveStorageClient, type HasnaStorageClient } from "@hasna/contracts";
 
 const APP_SLUG = "accounts";
@@ -71,6 +71,9 @@ export interface CloudUpdateInput {
   lastUsedAt?: string;
 }
 
+/** A tool as returned by `GET /v1/tools` — a full ToolDef plus a builtin flag. */
+export type CloudTool = ToolDef & { builtin: boolean };
+
 /** Registry surface backed by `<API_URL>/v1`. */
 export interface AccountsCloudApi {
   readonly baseUrl: string;
@@ -83,6 +86,9 @@ export interface AccountsCloudApi {
   listCurrent(): Promise<CloudCurrentSelection[]>;
   getCurrent(tool: string): Promise<CloudCurrentSelection | null>;
   setCurrent(tool: string, name: string): Promise<CloudCurrentSelection>;
+  listTools(): Promise<CloudTool[]>;
+  createTool(def: ToolDef): Promise<ToolDef>;
+  removeTool(id: string): Promise<void>;
 }
 
 export type ResolveAccountsCloudResult =
@@ -267,6 +273,21 @@ function makeApi(client: HasnaStorageClient): AccountsCloudApi {
 
     async setCurrent(tool: string, name: string): Promise<CloudCurrentSelection> {
       return t.put<CloudCurrentSelection>(`/current/${encodeURIComponent(tool)}`, { name });
+    },
+
+    async listTools(): Promise<CloudTool[]> {
+      const raw = await t.get<{ tools?: CloudTool[] }>("/tools");
+      return Array.isArray(raw?.tools) ? raw.tools : [];
+    },
+
+    async createTool(def: ToolDef): Promise<ToolDef> {
+      const created = await t.post<CloudTool>("/tools", def);
+      const { builtin: _builtin, ...toolDef } = created;
+      return toolDef;
+    },
+
+    async removeTool(id: string): Promise<void> {
+      await t.del(`/tools/${encodeURIComponent(id)}`);
     },
   };
   return api;

@@ -23,10 +23,19 @@
 
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import type { Profile } from "../types.js";
+import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
 import { profilesDir } from "../storage.js";
-import { DEFAULT_TOOL, getTool } from "./tools.js";
+import {
+  DEFAULT_TOOL,
+  getTool,
+  isBuiltinTool,
+  listTools as localListTools,
+  addCustomTool as localAddCustomTool,
+  removeCustomTool as localRemoveCustomTool,
+  setCustomToolsCache,
+  BUILTIN_TOOLS,
+} from "./tools.js";
 import { detectEmail } from "./detect.js";
 import {
   addProfile as localAdd,
@@ -72,6 +81,12 @@ export interface AccountsStore {
   useProfile(name: string, tool?: string): Promise<{ profile: Profile; toolId: string }>;
   currentProfile(tool: string): Promise<Profile | undefined>;
   listCurrent(): Promise<CurrentEntry[]>;
+  /** All tools (built-in + custom) known to the active registry. */
+  listTools(): Promise<ToolDef[]>;
+  /** Register (or update) a custom tool in the active registry. */
+  addTool(def: ToolDef): Promise<ToolDef>;
+  /** Remove a custom tool from the active registry. */
+  removeTool(id: string): Promise<void>;
 }
 
 /** On-box JSON registry. Delegates to the core profile library. */
@@ -111,6 +126,15 @@ class LocalStore implements AccountsStore {
   async listCurrent(): Promise<CurrentEntry[]> {
     const current = loadStore().current;
     return Object.entries(current).map(([tool, name]) => ({ tool, name }));
+  }
+  async listTools(): Promise<ToolDef[]> {
+    return localListTools();
+  }
+  async addTool(def: ToolDef): Promise<ToolDef> {
+    return localAddCustomTool(def);
+  }
+  async removeTool(id: string): Promise<void> {
+    localRemoveCustomTool(id);
   }
 }
 
@@ -208,6 +232,39 @@ class ApiStore implements AccountsStore {
   async listCurrent(): Promise<CurrentEntry[]> {
     const current = await this.api.listCurrent();
     return current.map((c) => ({ tool: c.tool, name: c.name }));
+  }
+
+  async listTools(): Promise<ToolDef[]> {
+    const cloud = await this.api.listTools();
+    const custom = cloud.filter((t) => !t.builtin).map(({ builtin: _b, ...def }) => def as ToolDef);
+    // Refresh the machine-local cache so synchronous getTool/listTools (used by
+    // launch/apply/detect) can resolve cloud-registered tools on this machine.
+    setCustomToolsCache(custom);
+    const byId = new Map<string, ToolDef>();
+    for (const t of BUILTIN_TOOLS) byId.set(t.id, t);
+    for (const t of custom) byId.set(t.id, t);
+    return [...byId.values()].sort((a, b) => a.id.localeCompare(b.id));
+  }
+
+  async addTool(def: ToolDef): Promise<ToolDef> {
+    if (isBuiltinTool(def.id)) throw new AccountsError(`"${def.id}" is a built-in tool and cannot be redefined`);
+    const created = await this.api.createTool(def);
+    // Write through to the machine-local cache so this machine can launch it now.
+    await this.refreshToolCache();
+    return created;
+  }
+
+  async removeTool(id: string): Promise<void> {
+    if (isBuiltinTool(id)) throw new AccountsError(`"${id}" is a built-in tool and cannot be removed`);
+    await this.api.removeTool(id);
+    await this.refreshToolCache();
+  }
+
+  /** Pull the cloud custom-tool set into the machine-local resolution cache. */
+  private async refreshToolCache(): Promise<void> {
+    const cloud = await this.api.listTools();
+    const custom = cloud.filter((t) => !t.builtin).map(({ builtin: _b, ...def }) => def as ToolDef);
+    setCustomToolsCache(custom);
   }
 
   /** Resolve a profile by name (+optional tool), mirroring local error text. */

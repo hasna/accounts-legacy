@@ -11,10 +11,7 @@ import { AccountsError, type Profile } from "./types.js";
 import {
   DEFAULT_TOOL,
   getTool,
-  listTools,
   isBuiltinTool,
-  addCustomTool,
-  removeCustomTool,
   mergeToolArgs,
   normalizePermissionPreset,
 } from "./lib/tools.js";
@@ -906,7 +903,7 @@ program
   .action(
     action(async (opts: { tool?: string }) => {
       const store = resolveStore();
-      const tools = opts.tool ? [getTool(opts.tool)] : listTools();
+      const tools = opts.tool ? [getTool(opts.tool)] : await store.listTools();
       for (const tool of tools) {
         const p = await store.currentProfile(tool.id);
         const a = appliedProfile(tool.id);
@@ -1102,8 +1099,8 @@ tools
   .description("list supported tools (built-in + custom)")
   .option("--json", "output JSON")
   .action(
-    action((opts: { json?: boolean }) => {
-      const all = listTools();
+    action(async (opts: { json?: boolean }) => {
+      const all = await resolveStore().listTools();
       if (opts.json) {
         console.log(JSON.stringify(all, null, 2));
         return;
@@ -1137,7 +1134,7 @@ tools
   .option("--email-path <path>", "dot-path to the email inside that file (e.g. account.email)")
   .action(
     action(
-      (
+      async (
         id: string,
         opts: {
           label: string;
@@ -1174,7 +1171,7 @@ tools
           ...(opts.accountFile ? { accountFile: opts.accountFile } : {}),
           ...(opts.emailPath ? { emailPath: opts.emailPath.split(".") } : {}),
         };
-        const t = addCustomTool(def);
+        const t = await resolveStore().addTool(def);
         console.log(chalk.green(`✓ registered tool ${chalk.bold(t.id)} (${t.label})`));
         console.log(chalk.dim(`  add a profile: accounts add <name> --tool ${t.id} --email you@example.com`));
       },
@@ -1187,8 +1184,8 @@ tools
   .argument("<id>", "custom tool id")
   .description("remove a custom tool")
   .action(
-    action((id: string) => {
-      removeCustomTool(id);
+    action(async (id: string) => {
+      await resolveStore().removeTool(id);
       console.log(chalk.green(`✓ removed custom tool ${chalk.bold(id)}`));
     }),
   );

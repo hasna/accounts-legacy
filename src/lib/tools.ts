@@ -276,6 +276,21 @@ export function addCustomTool(def: ToolDef): ToolDef {
   return tool;
 }
 
+/**
+ * Replace the machine-local cache of custom tool definitions. In cloud mode the
+ * cloud registry is the source of truth for custom tools, but the synchronous
+ * `getTool`/`listTools` used by machine-local orchestration (launch/apply/detect)
+ * read from this local cache. `ApiStore` refreshes it on list and updates it on
+ * add/remove so this machine can immediately resolve a cloud-registered tool.
+ * Only the `tools` field is rewritten; profiles and selections are untouched.
+ */
+export function setCustomToolsCache(defs: ToolDef[]): void {
+  const custom = defs.filter((d) => !isBuiltinTool(d.id));
+  const store = loadStore();
+  store.tools = custom;
+  saveStore(store);
+}
+
 /** Remove a custom tool. Fails if profiles still reference it. */
 export function removeCustomTool(id: string): void {
   if (isBuiltinTool(id)) throw new AccountsError(`"${id}" is a built-in tool and cannot be removed`);

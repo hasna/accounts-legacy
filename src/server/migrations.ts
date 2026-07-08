@@ -18,7 +18,11 @@ import {
 import { API_KEYS_TABLE } from "./config.js";
 
 /** Ordered app-schema SQL files, applied before the auth table migrations. */
-export const APP_MIGRATION_FILES = ["0001_accounts.sql", "0002_current_selections.sql"] as const;
+export const APP_MIGRATION_FILES = [
+  "0001_accounts.sql",
+  "0002_current_selections.sql",
+  "0003_custom_tools.sql",
+] as const;
 
 function moduleDir(): string {
   try {
