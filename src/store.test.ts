@@ -69,6 +69,59 @@ describe("ApiStore routes registry ops to /v1", () => {
     expect(p?.name).toBe("work");
     expect(calls[0]!.url).toBe(`${BASE}/v1/current/claude`);
   });
+
+  describe("custom tools route to the cloud registry (not the local file)", () => {
+    let home: string;
+    const acme = { id: "acme", label: "Acme", envVar: "ACME_HOME", defaultDir: "/tmp/.acme", bin: "acme" };
+    beforeEach(() => {
+      home = mkdtempSync(join(tmpdir(), "accounts-store-tools-"));
+      process.env.ACCOUNTS_HOME = home;
+      delete process.env.ACCOUNTS_STORE_PATH;
+    });
+    afterEach(() => {
+      rmSync(home, { recursive: true, force: true });
+      delete process.env.ACCOUNTS_HOME;
+    });
+
+    test("addTool POSTs /v1/tools and never writes only-local", async () => {
+      const { calls, fetchImpl } = mockFetch((c) => {
+        if (c.method === "POST" && c.url.endsWith("/tools")) return { status: 201, body: { ...acme, builtin: false } };
+        if (c.method === "GET" && c.url.endsWith("/tools")) return { status: 200, body: { tools: [{ ...acme, builtin: false }] } };
+        return { status: 200, body: {} };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      const created = await store.addTool(acme);
+      expect(created.id).toBe("acme");
+      expect(calls.some((c) => c.method === "POST" && c.url === `${BASE}/v1/tools`)).toBe(true);
+    });
+
+    test("addTool rejects a built-in id before any network call", async () => {
+      const { calls, fetchImpl } = mockFetch(() => ({ status: 500, body: {} }));
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      await expect(store.addTool({ ...acme, id: "claude" })).rejects.toThrow(/built-in/);
+      expect(calls.length).toBe(0);
+    });
+
+    test("removeTool DELETEs /v1/tools/:id", async () => {
+      const { calls, fetchImpl } = mockFetch((c) => {
+        if (c.method === "DELETE") return { status: 204, body: null };
+        if (c.method === "GET" && c.url.endsWith("/tools")) return { status: 200, body: { tools: [] } };
+        return { status: 200, body: {} };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      await store.removeTool("acme");
+      expect(calls.some((c) => c.method === "DELETE" && c.url === `${BASE}/v1/tools/acme`)).toBe(true);
+    });
+
+    test("listTools GETs /v1/tools and merges built-ins", async () => {
+      const { calls, fetchImpl } = mockFetch(() => ({ status: 200, body: { tools: [{ ...acme, builtin: false }] } }));
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      const tools = await store.listTools();
+      expect(calls.some((c) => c.method === "GET" && c.url === `${BASE}/v1/tools`)).toBe(true);
+      expect(tools.some((t) => t.id === "acme")).toBe(true);
+      expect(tools.some((t) => t.id === "claude")).toBe(true);
+    });
+  });
 });
 
 describe("LocalStore reads/writes the on-box registry", () => {

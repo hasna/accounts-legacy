@@ -12,8 +12,8 @@ import {
   resolveStorageMode,
   checkHealth,
 } from "../generated/storage-kit/index.js";
-import { AccountsError } from "../types.js";
-import { listTools, isBuiltinTool } from "../lib/tools.js";
+import { AccountsError, toolDefSchema } from "../types.js";
+import { BUILTIN_TOOLS, isBuiltinTool } from "../lib/tools.js";
 import { AccountsRepo, type AccountsStore } from "./repo.js";
 import { accountsMigrations, readMigrationStatus } from "./migrations.js";
 import { createAccountSchema, updateAccountSchema, renameAccountSchema, setCurrentSchema, toolIdSchema } from "./schema.js";
@@ -267,14 +267,42 @@ export function createHandler(ctx: ServiceContext): (req: Request) => Promise<Re
       if (pathname === "/v1/tools" && method === "GET") {
         const denied = await authorize(req, url, SCOPES.read);
         if (denied) return denied;
-        const tools = listTools().map((t) => ({
-          id: t.id,
-          label: t.label,
-          envVar: t.envVar,
-          bin: t.bin,
-          builtin: isBuiltinTool(t.id),
-        }));
+        const custom = await ctx.repo.listCustomTools();
+        // Built-ins are static code; custom tools live in the cloud registry.
+        // Return full ToolDefs (with a `builtin` flag) so clients can resolve
+        // and cache them for machine-local launch.
+        const byId = new Map<string, Record<string, unknown>>();
+        for (const t of BUILTIN_TOOLS) byId.set(t.id, { ...t, builtin: true });
+        for (const t of custom) byId.set(t.id, { ...t, builtin: false });
+        const tools = [...byId.values()].sort((a, b) => String(a.id).localeCompare(String(b.id)));
         return json({ tools }, 200);
+      }
+
+      if (pathname === "/v1/tools" && method === "POST") {
+        const denied = await authorize(req, url, SCOPES.write);
+        if (denied) return denied;
+        const parsedBody = await parseJson(req);
+        if (!parsedBody.ok) return parsedBody.res;
+        const input = toolDefSchema.safeParse(parsedBody.value);
+        if (!input.success) return json(errorBody(zodMessage(input.error)), 400);
+        if (isBuiltinTool(input.data.id)) {
+          return json(errorBody(`"${input.data.id}" is a built-in tool and cannot be redefined`), 409);
+        }
+        const created = await ctx.repo.addCustomTool(input.data);
+        return json({ ...created, builtin: false }, 201);
+      }
+
+      const toolMatch = pathname.match(/^\/v1\/tools\/([^/]+)$/);
+      if (toolMatch && method === "DELETE") {
+        const denied = await authorize(req, url, SCOPES.write);
+        if (denied) return denied;
+        const id = decodeURIComponent(toolMatch[1]!);
+        if (isBuiltinTool(id)) {
+          return json(errorBody(`"${id}" is a built-in tool and cannot be removed`), 409);
+        }
+        const removed = await ctx.repo.removeCustomTool(id);
+        if (!removed) return json(errorBody(`no custom tool "${id}"`), 404);
+        return new Response(null, { status: 204, headers: SECURITY_HEADERS });
       }
 
       return json(errorBody("not found"), 404);

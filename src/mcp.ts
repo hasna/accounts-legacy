@@ -5,7 +5,6 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { resolveStore } from "./lib/store.js";
 import { appliedProfile } from "./lib/apply.js";
 import { switchProfile, type SwitchMode } from "./lib/switch.js";
-import { listTools } from "./lib/tools.js";
 import { AccountsError } from "./types.js";
 import { listSupervisorStates, sendSupervisorRequest } from "./lib/supervisor.js";
 
@@ -69,7 +68,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   try {
     switch (req.params.name) {
       case "list_tools":
-        return ok(listTools());
+        return ok(await resolveStore().listTools());
       case "list_profiles":
         return ok(await resolveStore().listProfiles(typeof args["tool"] === "string" ? args["tool"] : undefined));
       case "current_profile": {

@@ -6,7 +6,7 @@
 // (tool,name) rejected, delete clears the current selection, set-current
 // requires the account to exist and stamps last_used_at.
 
-import { AccountsError } from "../types.js";
+import { AccountsError, type ToolDef, toolDefSchema } from "../types.js";
 import type { TypedQueryClient } from "../generated/storage-kit/index.js";
 import type { CreateAccountInput, UpdateAccountInput } from "./schema.js";
 
@@ -41,6 +41,9 @@ export interface AccountsStore {
   listCurrent(): Promise<CurrentSelection[]>;
   getCurrent(tool: string): Promise<CurrentSelection | null>;
   setCurrent(tool: string, name: string): Promise<CurrentSelection>;
+  listCustomTools(): Promise<ToolDef[]>;
+  addCustomTool(def: ToolDef): Promise<ToolDef>;
+  removeCustomTool(id: string): Promise<boolean>;
 }
 
 interface AccountRow {
@@ -238,5 +241,60 @@ export class AccountsRepo implements AccountsStore {
       [tool, name],
     );
     return { tool: row.tool, name: row.name, updatedAt: iso(row.updated_at)! };
+  }
+
+  async listCustomTools(): Promise<ToolDef[]> {
+    const rows = await this.client.many<{ definition: unknown }>(
+      "SELECT definition FROM custom_tools ORDER BY id",
+    );
+    const tools: ToolDef[] = [];
+    for (const row of rows) {
+      const raw = typeof row.definition === "string" ? safeJsonParse(row.definition) : row.definition;
+      const parsed = toolDefSchema.safeParse(raw);
+      if (parsed.success) tools.push(parsed.data);
+    }
+    return tools;
+  }
+
+  async addCustomTool(def: ToolDef): Promise<ToolDef> {
+    const parsed = toolDefSchema.safeParse(def);
+    if (!parsed.success) {
+      throw new AccountsError(parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; "));
+    }
+    const tool = parsed.data;
+    const row = await this.client.one<{ definition: unknown }>(
+      `INSERT INTO custom_tools (id, definition)
+       VALUES ($1, $2::jsonb)
+       ON CONFLICT (id) DO UPDATE SET definition = EXCLUDED.definition
+       RETURNING definition`,
+      [tool.id, JSON.stringify(tool)],
+    );
+    const stored = typeof row.definition === "string" ? safeJsonParse(row.definition) : row.definition;
+    return toolDefSchema.parse(stored);
+  }
+
+  async removeCustomTool(id: string): Promise<boolean> {
+    const inUse = await this.client.many<{ name: string }>(
+      "SELECT name FROM accounts WHERE tool = $1 ORDER BY name",
+      [id],
+    );
+    if (inUse.length > 0) {
+      throw new AccountsError(
+        `cannot remove "${id}": still used by profile(s) ${inUse.map((r) => r.name).join(", ")}`,
+      );
+    }
+    const result = await this.client.query<{ id: string }>(
+      "DELETE FROM custom_tools WHERE id = $1 RETURNING id",
+      [id],
+    );
+    return result.rowCount > 0;
+  }
+}
+
+function safeJsonParse(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return undefined;
   }
 }
