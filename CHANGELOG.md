@@ -6,6 +6,23 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-07-09
+
+### Fixed
+
+- **`accounts-serve` OpenAPI `Tool` response schema is wire-additive again.** The
+  refactor that enriched `GET /v1/tools` (returning the full `ToolDef` plus custom
+  tools from the cloud registry) had also grown the `Tool` schema's `required` set
+  to `["id","label","envVar","defaultDir","bin"]`. The deployed (0.1.x) server only
+  guaranteed `["id","label"]` and never emitted `defaultDir`, so the change was a
+  non-additive contract narrowing that the server-redeploy safety gate blocked. The
+  extra `ToolDef` fields are now documented as **optional** and `required` is back to
+  `["id","label"]`, making the HTTP response contract a strict SUPERSET of the
+  deployed version. Runtime behavior is unchanged (the handler still returns the full
+  `ToolDef` + custom tools); old `/v1` clients — which parse the response without
+  strict validation — keep working. No route was removed or renamed; the new
+  `rename` / custom-tool endpoints remain additive alongside the old surface.
+
 ## [0.2.4] - 2026-07-08
 
 ### Changed
