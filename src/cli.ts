@@ -57,18 +57,49 @@ function die(message: string): never {
   process.exit(1);
 }
 
-/** Wrap an action so AccountsError surfaces cleanly without a stack trace. */
+/** True for a cloud-transport HTTP error (`HasnaHttpError`: status/method/path/body). */
+function isHttpError(err: unknown): err is { status: number; method?: string; path?: string; body?: unknown; message?: string } {
+  return Boolean(
+    err &&
+      typeof err === "object" &&
+      typeof (err as { status?: unknown }).status === "number" &&
+      "path" in (err as object) &&
+      "method" in (err as object),
+  );
+}
+
+/** Render a cloud HTTP error as one clean line (no stack trace, no secrets). */
+function formatHttpError(err: { status: number; body?: unknown; message?: string }): string {
+  const body = err.body;
+  const serverMsg =
+    body && typeof body === "object"
+      ? ((body as { error?: unknown }).error ?? (body as { message?: unknown }).message)
+      : undefined;
+  const detail =
+    typeof serverMsg === "string" && serverMsg.length > 0 ? serverMsg : (err.message || "request failed");
+  if (err.status === 404) {
+    return `${detail} — the self-hosted accounts API returned 404 for this endpoint. The server is likely running an older build; redeploy accounts-serve to enable it.`;
+  }
+  return `${detail} (HTTP ${err.status})`;
+}
+
+/**
+ * Wrap an action so known errors surface cleanly without a stack trace:
+ * `AccountsError` (validation / not-found) and cloud `HasnaHttpError` (API
+ * failures) both become a single `error: ...` line + exit 1. Genuinely
+ * unexpected errors still propagate with their stack to aid debugging.
+ */
 function action<A extends unknown[]>(fn: (...args: A) => void | Promise<void>) {
   return (...args: A) => {
-    try {
-      Promise.resolve(fn(...args)).catch((err) => {
+    void (async () => {
+      try {
+        await fn(...args);
+      } catch (err) {
         if (err instanceof AccountsError) die(err.message);
+        if (isHttpError(err)) die(formatHttpError(err));
         throw err;
-      });
-    } catch (err) {
-      if (err instanceof AccountsError) die(err.message);
-      throw err;
-    }
+      }
+    })();
   };
 }
 
@@ -109,8 +140,34 @@ function fmtProfile(p: Profile, active: boolean, applied = false, prelaunch?: Co
   return `${marker} ${name}${displayName}  ${tool}  ${email}${desc}${formatPrelaunchLabel(prelaunch)}`;
 }
 
+/** A profile whose tool is unknown on this machine can't have configs prelaunch;
+ * report it as unsupported rather than throwing (which would abort a whole
+ * listing when the cloud registry holds a tool not resolvable locally). */
+function unsupportedPrelaunchSummary(reason: string): ConfigsPrelaunchSummary {
+  return {
+    supported: false,
+    required: false,
+    status: "unsupported",
+    reasons: [reason],
+    manifest: {
+      path: "",
+      exists: false,
+      sourceIds: [],
+      sourceCount: 0,
+      sourceIdsTruncated: false,
+      drift: "unsupported",
+      reasons: [reason],
+    },
+  };
+}
+
 function prelaunchSummaryFor(p: Profile): ConfigsPrelaunchSummary {
-  const tool = getTool(p.tool);
+  let tool;
+  try {
+    tool = getTool(p.tool);
+  } catch (err) {
+    return unsupportedPrelaunchSummary(err instanceof AccountsError ? err.message : `unknown tool "${p.tool}"`);
+  }
   return getConfigsPrelaunchSummary(p, tool, configsSessionToolFor(tool));
 }
 
@@ -382,6 +439,11 @@ program
   .action(
     action(async (opts: { tool?: string; json?: boolean }) => {
       const store = resolveStore();
+      // Hydrate the machine-local tool cache from the active registry so custom
+      // tools registered in the cloud resolve for per-profile rendering. This is
+      // best-effort: rendering already tolerates an unknown tool, so a failure
+      // here must not abort the listing.
+      await store.listTools().catch(() => {});
       const profiles = await store.listProfiles(opts.tool);
       const current = await store.listCurrent();
       const activeFor = (tool: string) => current.find((c) => c.tool === tool)?.name;
