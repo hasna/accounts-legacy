@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import {
   chmodSync,
@@ -27,31 +27,40 @@ let keychainState: string;
 let keychainLock: string;
 let securityBin: string;
 
+beforeAll(() => {
+  binDir = mkdtempSync(join(tmpdir(), "accounts-claude-bin-"));
+  securityBin = writeExecutable("security", fakeSecuritySource());
+  writeExecutable("claude", fakeClaudeSource());
+});
+
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "accounts-claude-cli-"));
-  binDir = mkdtempSync(join(tmpdir(), "accounts-claude-bin-"));
   launchCwd = mkdtempSync(join(tmpdir(), "accounts-claude-cwd-"));
   claudeLog = join(home, "fake-claude.jsonl");
   securityLog = join(home, "fake-security.jsonl");
   keychainState = join(home, "fake-keychain.json");
   keychainLock = join(home, "keychain.lock");
-  securityBin = writeExecutable("security", fakeSecuritySource());
-  writeExecutable("claude", fakeClaudeSource());
 });
 
 afterEach(() => {
   rmSync(home, { recursive: true, force: true });
-  rmSync(binDir, { recursive: true, force: true });
   rmSync(launchCwd, { recursive: true, force: true });
+});
+
+afterAll(() => {
+  rmSync(binDir, { recursive: true, force: true });
 });
 
 function writeExecutable(name: string, source: string): string {
   const script = join(binDir, `fake-${name}.ts`);
   writeFileSync(script, source);
   if (process.platform === "win32") {
-    const wrapper = join(binDir, `${name}.cmd`);
-    writeFileSync(wrapper, `@echo off\r\n"${process.execPath}" run "%~dp0fake-${name}.ts" %*\r\n`);
-    return wrapper;
+    const executable = join(binDir, `${name}.exe`);
+    const built = spawnSync(process.execPath, ["build", "--compile", script, "--outfile", executable], {
+      encoding: "utf8",
+    });
+    if (built.status !== 0) throw new Error(`failed to compile fake ${name}: ${built.stderr}`);
+    return executable;
   }
   const wrapper = join(binDir, name);
   writeFileSync(wrapper, `#!/bin/sh\nexec "${process.execPath}" run "${script}" "$@"\n`);
