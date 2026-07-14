@@ -41,17 +41,19 @@ import { switchProfile, type SwitchMode } from "./lib/switch.js";
 import { configsSessionToolFor, runConfigsPrelaunch, type ConfigsPrelaunchMode, type ConfigsPrelaunchOptions } from "./lib/configs-prelaunch.js";
 import { getConfigsPrelaunchSummary, type ConfigsPrelaunchSummary } from "./lib/configs-prelaunch-status.js";
 import {
-  clearSupervisorState,
   listSupervisorStates,
-  readBackgroundSupervisorPayload,
   readSupervisorState,
   resolveSupervisorLaunch,
   runSupervisedTool,
   sendSupervisorRequest,
-  startBackgroundSupervisor,
   type SupervisorState,
 } from "./lib/supervisor.js";
-import { planClaudeLaunch, redactArgv, redactText, type ClaudeLaunchOptions } from "./lib/claude-launch.js";
+import {
+  planClaudeLaunch,
+  redactArgv,
+  runClaudeLaunch,
+  type ClaudeLaunchOptions,
+} from "./lib/claude-launch.js";
 import {
   codexAppBinaryExists,
   codexAppMenuState,
@@ -806,48 +808,30 @@ addConfigsOptions(program
   .description("launch the tool's binary with the profile's config dir active")
   .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .option("--permissions <preset>", "tool-specific permission preset, e.g. dangerous")
-  .option("--headless", "run Claude one-shot in foreground print mode")
-  .option("--background", "run Claude under a detached accounts supervisor")
+  .option("--headless", "run Claude in native print mode")
+  .option("--background", "run Claude with its native --bg flag")
   .option("--bg", "alias for --background")
-  .option("--name <name>", "name a supervisor-backed background Claude session")
-  .option("--json", "output background session state as JSON")
+  .option("--name <name>", "pass a validated native name to a background Claude session")
   .action(
-    action(async (name: string, args: string[], opts: { tool?: string; permissions?: string; json?: boolean } & ClaudeLaunchOptions & ConfigsCliOptions) => {
+    action(async (name: string, args: string[], opts: { tool?: string; permissions?: string } & ClaudeLaunchOptions & ConfigsCliOptions) => {
       const store = resolveStore();
       const profile = await store.getProfile(name, opts.tool);
       const tool = getTool(profile.tool);
       const plan = planClaudeLaunch(tool, args, opts);
       runConfigsPrelaunch(profile, tool, configsPrelaunchOptions(opts));
-      const launchArgs = mergeToolArgs(tool, plan.args, { permissions: opts.permissions, profile });
-      if (plan.mode === "background") {
-        const state = await startBackgroundSupervisor(profile, tool, launchArgs, {
-          cwd: process.cwd(),
-          ...(plan.name ? { name: plan.name } : {}),
-          sessionId: plan.sessionId!,
-        });
-        if (opts.json) {
-          console.log(JSON.stringify(state, null, 2));
-        } else {
-          console.log(chalk.green(`✓ background ${tool.label} started as ${chalk.bold(profile.name)}`));
-          if (state.name) console.log(chalk.dim(`  name: ${state.name}`));
-          console.log(chalk.dim(`  session: ${state.sessionId}`));
-          console.log(chalk.dim(`  status: accounts supervisor status ${tool.id}`));
-          console.log(chalk.dim(`  stop:   accounts supervisor stop ${tool.id}`));
-        }
-        return;
-      }
       const env = profileEnv(profile, tool);
+      const launchArgs = mergeToolArgs(tool, plan.args, { permissions: opts.permissions, profile });
       if (!plan.nonInteractive) await store.useProfile(name, tool.id);
-      console.log(chalk.dim(`→ ${formatEnvAssignments(env)} ${redactArgv([tool.bin, ...launchArgs]).join(" ")}`));
-      prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
+      console.error(chalk.dim(`→ ${formatEnvAssignments(env)} ${redactArgv([tool.bin, ...launchArgs]).join(" ")}`));
       const { ACCOUNTS_ACTIVE: _activeProfile, ...parentEnv } = process.env;
-      const res = spawnSync(tool.bin, launchArgs, {
-        stdio: "inherit",
-        env: { ...(plan.nonInteractive ? parentEnv : process.env), ...env },
-        cwd: process.cwd(),
-      });
-      if (res.error) die(`failed to launch ${tool.bin}: ${redactText(res.error.message)}`);
-      process.exit(res.status ?? 0);
+      const code = await runClaudeLaunch(
+        profile,
+        tool,
+        launchArgs,
+        { ...(plan.nonInteractive ? parentEnv : process.env), ...env },
+        process.cwd(),
+      );
+      process.exit(code);
     }),
   );
 
@@ -860,60 +844,38 @@ addConfigsOptions(program
   .option("-t, --tool <tool>", "tool when target is a profile name")
   .option("--resume", "start with the tool's resume/continue args")
   .option("--permissions <preset>", "tool-specific permission preset, e.g. dangerous")
-  .option("--headless", "run Claude one-shot in foreground print mode")
-  .option("--background", "run Claude under a detached accounts supervisor")
+  .option("--headless", "run Claude in native print mode without the Accounts supervisor")
+  .option("--background", "run Claude with its native --bg flag without the Accounts supervisor")
   .option("--bg", "alias for --background")
-  .option("--name <name>", "name a supervisor-backed background Claude session")
-  .option("--json", "output background session state as JSON")
+  .option("--name <name>", "pass a validated native name to a background Claude session")
   .action(
-    action(async (target: string, args: string[], opts: { profile?: string; tool?: string; resume?: boolean; permissions?: string; json?: boolean } & ClaudeLaunchOptions & ConfigsCliOptions) => {
+    action(async (target: string, args: string[], opts: { profile?: string; tool?: string; resume?: boolean; permissions?: string } & ClaudeLaunchOptions & ConfigsCliOptions) => {
       const plan = await resolveSupervisorLaunch(target, { profile: opts.profile, tool: opts.tool });
       const launch = planClaudeLaunch(plan.tool, [...(opts.resume ? (plan.tool.resumeArgs ?? []) : []), ...args], opts);
       const runArgs = mergeToolArgs(plan.tool, launch.args, {
         permissions: opts.permissions,
         profile: plan.profile,
       });
-      if (launch.mode === "background") {
+      if (launch.nonInteractive) {
         runConfigsPrelaunch(plan.profile, plan.tool, configsPrelaunchOptions(opts));
-        const state = await startBackgroundSupervisor(plan.profile, plan.tool, runArgs, {
-          cwd: process.cwd(),
-          ...(launch.name ? { name: launch.name } : {}),
-          sessionId: launch.sessionId!,
-        });
-        if (opts.json) console.log(JSON.stringify(state, null, 2));
-        else console.log(chalk.green(`✓ background ${plan.tool.label} started (session ${state.sessionId})`));
-        return;
+        const env = profileEnv(plan.profile, plan.tool);
+        const { ACCOUNTS_ACTIVE: _activeProfile, ...parentEnv } = process.env;
+        console.error(chalk.dim(`→ ${formatEnvAssignments(env)} ${redactArgv([plan.tool.bin, ...runArgs]).join(" ")}`));
+        const code = await runClaudeLaunch(
+          plan.profile,
+          plan.tool,
+          runArgs,
+          { ...parentEnv, ...env },
+          process.cwd(),
+        );
+        process.exit(code);
       }
       console.error(chalk.green(`✓ accounts supervisor running ${plan.tool.label} as ${chalk.bold(plan.profile.name)}`));
       console.error(chalk.dim(`  control: accounts supervisor status ${plan.tool.id}`));
       console.error(chalk.dim(`  switch:  accounts switch <profile> --tool ${plan.tool.id} --supervisor`));
       const code = await runSupervisedTool(plan.profile, plan.tool, runArgs, {
         configsPrelaunch: configsPrelaunchOptions(opts),
-        cwd: process.cwd(),
-        markActive: !launch.nonInteractive,
         log: (message) => console.error(chalk.dim(message)),
-      });
-      process.exit(code);
-    }),
-  );
-
-program
-  .command("__background-supervisor", { hidden: true })
-  .action(
-    action(async () => {
-      const payload = readBackgroundSupervisorPayload();
-      const plan = await resolveSupervisorLaunch(payload.profile, { tool: payload.tool });
-      if (plan.tool.id !== payload.tool) throw new AccountsError("background supervisor tool/profile mismatch");
-      const code = await runSupervisedTool(plan.profile, plan.tool, payload.args, {
-        stdio: "ignore",
-        configsPrelaunch: { mode: "skip" },
-        cwd: payload.cwd,
-        markActive: false,
-        preserveFinalState: true,
-        background: {
-          ...(payload.name ? { name: payload.name } : {}),
-          sessionId: payload.sessionId,
-        },
       });
       process.exit(code);
     }),
@@ -933,9 +895,7 @@ supervisor
       const live: Array<SupervisorState & { stale?: boolean }> = [];
       for (const state of states) {
         const response = await sendSupervisorRequest(state.tool, { type: "status" }, { allowMissing: true });
-        if (response?.ok && "state" in response) live.push(response.state);
-        else if (state.status === "exited" || state.status === "failed") live.push(state);
-        else live.push({ ...state, stale: true });
+        live.push(response?.ok && "state" in response ? response.state : { ...state, stale: true });
       }
       if (opts.json) {
         console.log(JSON.stringify(live, null, 2));
@@ -948,15 +908,8 @@ supervisor
       for (const state of live) {
         const stale = "stale" in state ? chalk.yellow(" stale") : "";
         const child = state.childPid ? ` child:${state.childPid}` : "";
-        const status = state.status
-          ? ` ${state.status}${state.exitCode !== undefined ? `:${state.exitCode}` : ""}`
-          : "";
         const configs = state.prelaunch?.supported ? formatPrelaunchLabel(state.prelaunch).trim() : "";
-        console.log(`${chalk.cyan(state.tool.padEnd(10))} ${chalk.bold(state.profile)} pid:${state.pid}${child}${status}${stale}`);
-        if (state.name || state.sessionId) {
-          console.log(chalk.dim(`  name: ${state.name ?? "(unnamed)"}  session: ${state.sessionId ?? "(none)"}`));
-        }
-        if (state.cwd) console.log(chalk.dim(`  cwd: ${state.cwd}`));
+        console.log(`${chalk.cyan(state.tool.padEnd(10))} ${chalk.bold(state.profile)} pid:${state.pid}${child}${stale}`);
         if (configs) console.log(`  ${configs}`);
         console.log(chalk.dim(`  ${state.command.join(" ")}`));
       }
@@ -1016,15 +969,7 @@ supervisor
   .action(
     action(async (toolId: string) => {
       const response = await sendSupervisorRequest(toolId, { type: "stop" }, { allowMissing: true });
-      if (!response) {
-        const state = readSupervisorState(toolId);
-        if (state?.status === "exited" || state?.status === "failed") {
-          clearSupervisorState(toolId);
-          console.log(chalk.green(`✓ cleared completed ${toolId} supervisor state`));
-          return;
-        }
-        die(`no running accounts supervisor for ${toolId}`);
-      }
+      if (!response) die(`no running accounts supervisor for ${toolId}`);
       if (!response.ok) die(response.error);
       console.log(chalk.green(`✓ stopping ${toolId} supervisor`));
     }),

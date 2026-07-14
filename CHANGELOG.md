@@ -6,30 +6,6 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
-## [0.2.8] - 2026-07-14
-
-### Added
-
-- `accounts launch` and `accounts run` now support Claude-only worker modes:
-  `--headless` for a foreground `claude -p` invocation, and
-  `--background`/`--bg` with an optional `--name` for a detached, supervisor
-  backed session. Background state records the generated or explicit session
-  id, name, working directory, terminal status, and exit code.
-
-### Fixed
-
-- Reject conflicting convenience and raw Claude mode flags before prelaunch,
-  profile selection, or process launch. Noninteractive invocations do not
-  update the active-profile selection or inherit `ACCOUNTS_ACTIVE`.
-- `accounts supervisor stop claude` clears a completed background state after
-  its terminal status has been inspected.
-
-### Changed
-
-- Release provenance now identifies the source repository as
-  `hasna/accounts-legacy`. This source release is prepared as
-  `@hasna/accounts@0.2.8`; it has not been published or tagged.
-
 ### Changed
 
 - **Clear diagnostic when the self-hosted server predates an endpoint.** When a
@@ -65,6 +41,34 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 - Deprecated storage exports and CLI commands remain as compatibility shims;
   retired provider-backed sync operations preserve optional environment
   arguments and `--json` parsing, then fail explicitly.
+
+## [0.2.8] - 2026-07-14
+
+### Added
+
+- `accounts launch` and `accounts run` accept Claude-only convenience modes:
+  `--headless` relays native print mode, while `--background`/`--bg` and an
+  optional validated `--name` relay exactly to Claude's native `--bg --name`
+  lifecycle. Claude remains the owner of session ids, status, logs, attach, and
+  stop behavior.
+
+### Fixed
+
+- Validate raw, convenience, alias, duplicate, name, and explicit session UUID
+  conflicts before configs prelaunch, active-profile mutation, keychain access,
+  or process launch. Noninteractive invocations neither select a profile nor
+  inherit `ACCOUNTS_ACTIVE`.
+- Serialize temporary macOS keychain use across processes and restore the prior
+  credential after Claude confirms dispatch or exits, including launch errors
+  and forwarded termination signals. Lock files contain no credential values.
+- Keep Claude stdout unmodified, send Accounts diagnostics to stderr, preserve
+  Claude exit status, and map forwarded termination signals to nonzero exits.
+
+### Changed
+
+- Release provenance identifies the source repository as
+  `hasna/accounts-legacy`. This source prepares `@hasna/accounts@0.2.8`
+  without publishing, tagging, or installing it.
 
 ## [0.1.32] - 2026-07-06
 
