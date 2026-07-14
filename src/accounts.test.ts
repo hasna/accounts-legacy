@@ -23,6 +23,7 @@ import {
   addCustomTool,
   removeCustomTool,
   isBuiltinTool,
+  mergeClaudeWorkerArgs,
   mergeToolArgs,
   normalizePermissionPreset,
   permissionArgsFor,
@@ -120,6 +121,40 @@ test("mergeToolArgs prepends templated launch args", () => {
   expect(mergeToolArgs(getTool("codex-app"), [], { profile: p })).toEqual([
     `--user-data-dir=${join(p.dir, "electron-user-data")}`,
   ]);
+});
+
+test("mergeClaudeWorkerArgs maps one-shot and background worker flags", () => {
+  const claude = getTool("claude");
+  expect(mergeClaudeWorkerArgs(claude, ["Reply OK"], { headless: true })).toEqual(["-p", "Reply OK"]);
+  expect(mergeClaudeWorkerArgs(claude, ["Reply OK"], { background: true, name: "ui-worker" })).toEqual([
+    "--bg",
+    "--name",
+    "ui-worker",
+    "Reply OK",
+  ]);
+  expect(mergeToolArgs(claude, mergeClaudeWorkerArgs(claude, ["Reply OK"], { background: true }), { permissions: "dangerous" })).toEqual([
+    "--dangerously-skip-permissions",
+    "--bg",
+    "Reply OK",
+  ]);
+});
+
+test("mergeClaudeWorkerArgs preserves explicit passthrough flags", () => {
+  const claude = getTool("claude");
+  expect(mergeClaudeWorkerArgs(claude, ["-p", "Already print"], { headless: true })).toEqual(["-p", "Already print"]);
+  expect(mergeClaudeWorkerArgs(claude, ["--bg", "--name", "existing", "Work"], { background: true, name: "ignored" })).toEqual([
+    "--bg",
+    "--name",
+    "existing",
+    "Work",
+  ]);
+});
+
+test("mergeClaudeWorkerArgs rejects invalid Claude worker flag combinations", () => {
+  const claude = getTool("claude");
+  expect(() => mergeClaudeWorkerArgs(claude, ["Work"], { headless: true, background: true })).toThrow(AccountsError);
+  expect(() => mergeClaudeWorkerArgs(claude, ["Work"], { name: "worker" })).toThrow(AccountsError);
+  expect(() => mergeClaudeWorkerArgs(getTool("codex"), ["Work"], { headless: true })).toThrow(AccountsError);
 });
 
 test("unsupported permission preset fails clearly", () => {

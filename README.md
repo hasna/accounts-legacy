@@ -123,6 +123,11 @@ A child process cannot change your parent shell — use `eval "$(accounts env �
 
 Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
 
+Source note: the launcher-era `@hasna/accounts` npm package is maintained from
+`hasna/accounts-legacy`. The clean `hasna/accounts` repository is a separate
+capacity-service product line and is not the provenance source for the 0.2.x
+launcher CLI releases.
+
 ## Switching modes (summary)
 
 - **`accounts active`** — prints active profile (`store.current`); scripting.
@@ -163,6 +168,42 @@ Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
 | `accounts doctor` | Check registry and dirs (exits 1 on errors). |
 
 See `accounts --help` for `set`, `rename`, `remove`, `tools`, etc.
+
+### Claude Headless And Background Workers
+
+`accounts launch` is the recommended entry point for one-shot and fire-and-forget
+Claude workers. It activates the selected profile's isolated `CLAUDE_CONFIG_DIR`,
+applies the requested permission preset, then starts Claude directly:
+
+```bash
+accounts launch --tool claude --skip-configs --permissions dangerous account002 \
+  --headless "Reply with exactly OK."
+
+accounts launch --tool claude --skip-configs --permissions dangerous account002 \
+  --background --name ui-worker "Work only in the provided task worktree."
+```
+
+The convenience flags are Claude-only aliases for the raw passthrough args:
+`--headless` prepends `-p`, `--background` / `--bg` prepends `--bg`, and
+`--name <name>` forwards a Claude background agent name. Raw passthrough remains
+available when you need exact Claude CLI control:
+
+```bash
+accounts launch --tool claude --skip-configs --permissions dangerous account002 \
+  -- --bg --name ui-worker "Work only in the provided task worktree."
+```
+
+Inspect background sessions with the accounts agent view for the same profile:
+
+```bash
+accounts agents --tool claude --profile account002 --json
+```
+
+`accounts run` accepts the same Claude worker flags when you want the accounts
+supervisor to own the initial tool launch or restart a foreground session. For
+detached Claude `--bg` agents, prefer `accounts launch` plus `accounts agents` for
+status and cleanup; the supervisor manages its direct child process, while Claude
+owns the detached background agent lifecycle.
 
 ## Account Metadata
 

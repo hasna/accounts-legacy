@@ -12,6 +12,7 @@ import {
   DEFAULT_TOOL,
   getTool,
   isBuiltinTool,
+  mergeClaudeWorkerArgs,
   mergeToolArgs,
   normalizePermissionPreset,
 } from "./lib/tools.js";
@@ -794,14 +795,23 @@ addConfigsOptions(program
   .description("launch the tool's binary with the profile's config dir active")
   .option("-t, --tool <tool>", "tool when the profile name exists for multiple tools")
   .option("--permissions <preset>", "tool-specific permission preset, e.g. dangerous")
+  .option("--headless", "Claude one-shot print mode; prepends -p before the prompt unless already supplied")
+  .option("--background", "Claude background agent mode; prepends --bg unless already supplied")
+  .option("--bg", "alias for --background")
+  .option("--name <name>", "Claude background agent name; forwarded with --background/--bg")
   .action(
-    action(async (name: string, args: string[], opts: { tool?: string; permissions?: string } & ConfigsCliOptions) => {
+    action(async (name: string, args: string[], opts: { tool?: string; permissions?: string; headless?: boolean; background?: boolean; bg?: boolean; name?: string } & ConfigsCliOptions) => {
       const store = resolveStore();
       const profile = await store.getProfile(name, opts.tool);
       const tool = getTool(profile.tool);
       runConfigsPrelaunch(profile, tool, configsPrelaunchOptions(opts));
       const env = profileEnv(profile, tool);
-      const launchArgs = mergeToolArgs(tool, args, { permissions: opts.permissions, profile });
+      const workerArgs = mergeClaudeWorkerArgs(tool, args, {
+        headless: opts.headless,
+        background: opts.background || opts.bg,
+        name: opts.name,
+      });
+      const launchArgs = mergeToolArgs(tool, workerArgs, { permissions: opts.permissions, profile });
       await store.useProfile(name, tool.id); // mark active + bump lastUsedAt
       console.log(chalk.dim(`→ ${formatEnvAssignments(env)} ${tool.bin} ${launchArgs.join(" ")}`));
       prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
@@ -823,10 +833,19 @@ addConfigsOptions(program
   .option("-t, --tool <tool>", "tool when target is a profile name")
   .option("--resume", "start with the tool's resume/continue args")
   .option("--permissions <preset>", "tool-specific permission preset, e.g. dangerous")
+  .option("--headless", "Claude one-shot print mode; prepends -p before the prompt unless already supplied")
+  .option("--background", "Claude background agent mode; prepends --bg unless already supplied")
+  .option("--bg", "alias for --background")
+  .option("--name <name>", "Claude background agent name; forwarded with --background/--bg")
   .action(
-    action(async (target: string, args: string[], opts: { profile?: string; tool?: string; resume?: boolean; permissions?: string } & ConfigsCliOptions) => {
+    action(async (target: string, args: string[], opts: { profile?: string; tool?: string; resume?: boolean; permissions?: string; headless?: boolean; background?: boolean; bg?: boolean; name?: string } & ConfigsCliOptions) => {
       const plan = await resolveSupervisorLaunch(target, { profile: opts.profile, tool: opts.tool });
-      const runArgs = mergeToolArgs(plan.tool, [...(opts.resume ? (plan.tool.resumeArgs ?? []) : []), ...args], {
+      const workerArgs = mergeClaudeWorkerArgs(plan.tool, [...(opts.resume ? (plan.tool.resumeArgs ?? []) : []), ...args], {
+        headless: opts.headless,
+        background: opts.background || opts.bg,
+        name: opts.name,
+      });
+      const runArgs = mergeToolArgs(plan.tool, workerArgs, {
         permissions: opts.permissions,
         profile: plan.profile,
       });

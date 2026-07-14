@@ -11,16 +11,31 @@ import {
 } from "./lib/codex-app-menu.js";
 
 let home: string;
+let oldMode: string | undefined;
+let oldApiUrl: string | undefined;
+let oldApiKey: string | undefined;
 
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "accounts-menu-test-"));
+  oldMode = process.env.HASNA_ACCOUNTS_STORAGE_MODE;
+  oldApiUrl = process.env.HASNA_ACCOUNTS_API_URL;
+  oldApiKey = process.env.HASNA_ACCOUNTS_API_KEY;
   process.env.ACCOUNTS_HOME = home;
+  process.env.HASNA_ACCOUNTS_STORAGE_MODE = "local";
+  delete process.env.HASNA_ACCOUNTS_API_URL;
+  delete process.env.HASNA_ACCOUNTS_API_KEY;
   delete process.env.ACCOUNTS_STORE_PATH;
 });
 
 afterEach(() => {
   rmSync(home, { recursive: true, force: true });
   delete process.env.ACCOUNTS_HOME;
+  if (oldMode === undefined) delete process.env.HASNA_ACCOUNTS_STORAGE_MODE;
+  else process.env.HASNA_ACCOUNTS_STORAGE_MODE = oldMode;
+  if (oldApiUrl === undefined) delete process.env.HASNA_ACCOUNTS_API_URL;
+  else process.env.HASNA_ACCOUNTS_API_URL = oldApiUrl;
+  if (oldApiKey === undefined) delete process.env.HASNA_ACCOUNTS_API_KEY;
+  else process.env.HASNA_ACCOUNTS_API_KEY = oldApiKey;
 });
 
 test("codex app menu state lists profiles with active marker", async () => {

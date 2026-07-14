@@ -34,6 +34,12 @@ function runCliWith(args: string[], opts: RunOptions = {}) {
       ...process.env,
       NODE_ENV: "test",
       ACCOUNTS_HOME: home,
+      HASNA_ACCOUNTS_STORAGE_MODE: "local",
+      ACCOUNTS_STORAGE_MODE: "local",
+      HASNA_ACCOUNTS_API_URL: undefined,
+      HASNA_ACCOUNTS_API_KEY: undefined,
+      ACCOUNTS_API_URL: undefined,
+      ACCOUNTS_API_KEY: undefined,
       FAKE_LOGIN_LOG: logPath,
       PATH: opts.path ?? `${binDir}:${process.env.PATH ?? ""}`,
       ...opts.env,
@@ -192,6 +198,70 @@ test("launch syncs Claude profile credentials into keychain before spawning", ()
   expect(keychainLog).toContain("add-generic-password");
   expect(keychainPayload).toContain("account=acct");
   expect(keychainPayload).toContain("acct@example.com-access-token");
+});
+
+test("launch maps Claude worker convenience flags before spawning", () => {
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+
+  const headless = runCli(
+    "launch",
+    "acct",
+    "--tool",
+    "claude",
+    "--skip-configs",
+    "--permissions",
+    "dangerous",
+    "--headless",
+    "Reply OK",
+  );
+  expect(headless.status).toBe(0);
+  expect(readLogEntries()[0]).toMatchObject({
+    tool: "claude",
+    args: "--dangerously-skip-permissions -p Reply OK",
+  });
+
+  const background = runCli(
+    "launch",
+    "acct",
+    "--tool",
+    "claude",
+    "--skip-configs",
+    "--permissions",
+    "dangerous",
+    "--background",
+    "--name",
+    "ui-worker",
+    "Do work",
+  );
+  expect(background.status).toBe(0);
+  expect(readLogEntries()[1]).toMatchObject({
+    tool: "claude",
+    args: "--dangerously-skip-permissions --bg --name ui-worker Do work",
+  });
+});
+
+test("run maps Claude worker convenience flags for supervised launches", () => {
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+
+  const result = runCli(
+    "run",
+    "claude",
+    "--profile",
+    "acct",
+    "--skip-configs",
+    "--permissions",
+    "dangerous",
+    "--headless",
+    "Reply OK",
+  );
+
+  expect(result.status).toBe(0);
+  expect(readLogEntries()[0]).toMatchObject({
+    tool: "claude",
+    args: "--dangerously-skip-permissions -p Reply OK",
+  });
 });
 
 test("launch runs configs apply by default before spawning", () => {

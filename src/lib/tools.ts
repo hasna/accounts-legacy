@@ -182,6 +182,12 @@ export interface ToolArgOptions {
   profile?: Profile;
 }
 
+export interface ClaudeWorkerArgOptions {
+  headless?: boolean;
+  background?: boolean;
+  name?: string;
+}
+
 const PERMISSION_ALIASES = new Map<string, string>([
   ["danger", "dangerous"],
   ["dangerously-skip-permissions", "dangerous"],
@@ -232,6 +238,46 @@ export function mergeToolArgs(tool: ToolDef, args: string[], opts: ToolArgOption
   const launchArgs = launchArgsFor(tool, opts.profile).filter((arg) => !args.includes(arg));
   const permissionArgs = permissionArgsFor(tool, opts.permissions).filter((arg) => !args.includes(arg));
   return [...permissionArgs, ...launchArgs, ...args];
+}
+
+function hasFlag(args: string[], names: string[]): boolean {
+  return args.some((arg) => names.some((name) => arg === name || arg.startsWith(`${name}=`)));
+}
+
+export function mergeClaudeWorkerArgs(tool: ToolDef, args: string[], opts: ClaudeWorkerArgOptions = {}): string[] {
+  const wantsHeadless = opts.headless === true;
+  const wantsBackground = opts.background === true;
+  const wantsName = opts.name !== undefined && opts.name.trim() !== "";
+
+  if (!wantsHeadless && !wantsBackground && !wantsName) return args;
+  if (tool.id !== "claude") {
+    throw new AccountsError("Claude worker flags require the Claude tool. Use --tool claude or pass raw args after --.");
+  }
+  if (wantsHeadless && wantsBackground) {
+    throw new AccountsError("Claude --headless and --background cannot be combined. Use one-shot -p mode or background --bg mode.");
+  }
+  if (wantsName && !wantsBackground && !hasFlag(args, ["--bg", "--background"])) {
+    throw new AccountsError("Claude --name is only supported with --background/--bg or an explicit --bg passthrough arg.");
+  }
+
+  const merged = [...args];
+  if (wantsHeadless && !hasFlag(merged, ["-p", "--print"])) {
+    merged.unshift("-p");
+  }
+  if (wantsBackground && !hasFlag(merged, ["--bg", "--background"])) {
+    merged.unshift("--bg");
+  }
+  if (wantsName && !hasFlag(merged, ["--name"])) {
+    const bgIndex = merged.findIndex((arg) => (
+      arg === "--bg" ||
+      arg === "--background" ||
+      arg.startsWith("--bg=") ||
+      arg.startsWith("--background=")
+    ));
+    const insertAt = bgIndex === -1 ? 0 : bgIndex + 1;
+    merged.splice(insertAt, 0, "--name", opts.name!.trim());
+  }
+  return merged;
 }
 
 const BUILTIN_IDS = new Set(BUILTIN_TOOLS.map((t) => t.id));

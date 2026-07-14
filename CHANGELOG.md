@@ -6,6 +6,25 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-07-14
+
+### Added
+
+- First-class Claude worker flags on `accounts launch` and `accounts run`:
+  `--headless` maps to Claude `-p`, `--background` / `--bg` maps to Claude
+  `--bg`, and `--name <name>` names a background Claude agent. These flags compose
+  with `--permissions dangerous`, leaving the existing `-- ...` passthrough path
+  intact for raw Claude options.
+- Regression coverage for Claude worker argument placement, passthrough
+  de-duplication, and invalid flag combinations so dangerous permissions continue
+  to appear before worker-mode args.
+
+### Changed
+
+- The package repository metadata now points at `hasna/accounts-legacy`, the
+  current source home for the launcher-era `@hasna/accounts` npm package. The
+  clean `hasna/accounts` repository is a separate capacity-service product line.
+
 ## [0.2.6] - 2026-07-09
 
 ### Fixed
