@@ -328,7 +328,7 @@ export function restoreAccountsStorageSnapshot(snapshot: AccountsStorageSnapshot
 }
 
 /** @deprecated The provider-backed snapshot transport was retired. */
-export function accountsStorageSnapshotKey(): string {
+export function accountsStorageSnapshotKey(_env: NodeJS.ProcessEnv = process.env): string {
   return "accounts/accounts.json";
 }
 
@@ -339,17 +339,17 @@ function retiredSyncError(): AccountsError {
 }
 
 /** @deprecated Always rejects; provider-backed sync was retired. */
-export async function storagePush(): Promise<AccountsStorageSyncResult> {
+export async function storagePush(_env: NodeJS.ProcessEnv = process.env): Promise<AccountsStorageSyncResult> {
   throw retiredSyncError();
 }
 
 /** @deprecated Always rejects; provider-backed sync was retired. */
-export async function storagePull(): Promise<AccountsStorageSyncResult> {
+export async function storagePull(_env: NodeJS.ProcessEnv = process.env): Promise<AccountsStorageSyncResult> {
   throw retiredSyncError();
 }
 
 /** @deprecated Always rejects; provider-backed sync was retired. */
-export async function storageSync(): Promise<AccountsStorageSyncResult> {
+export async function storageSync(_env: NodeJS.ProcessEnv = process.env): Promise<AccountsStorageSyncResult> {
   throw retiredSyncError();
 }
 

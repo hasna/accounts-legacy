@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveStore } from "./lib/store.js";
@@ -294,6 +294,29 @@ describe("ApiStore routes registry ops to /v1", () => {
       });
       const store = resolveStore(cloudEnv, { fetchImpl });
       await expect(importProfile({ name: "copied", tool: "acme", dir: source, copy: true }, store)).rejects.toThrow(/500/);
+      expect(existsSync(target)).toBe(false);
+    });
+
+    test("partial copy failure removes the newly created managed target", async () => {
+      const source = join(home, "source-partial");
+      mkdirSync(source, { recursive: true });
+      const target = join(home, "profiles", "acme", "partial");
+      const { fetchImpl } = mockFetch((c) => {
+        if (c.url.endsWith("/tools")) return { status: 200, body: { tools: [{ ...acme, builtin: false }] } };
+        return { status: 500, body: { error: "unexpected network call" } };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      await expect(
+        importProfile(
+          { name: "partial", tool: "acme", dir: source, copy: true },
+          store,
+          (_source, destination) => {
+            mkdirSync(destination, { recursive: true });
+            writeFileSync(join(destination, "partially-copied"), "incomplete");
+            throw new Error("simulated partial copy failure");
+          },
+        ),
+      ).rejects.toThrow("simulated partial copy failure");
       expect(existsSync(target)).toBe(false);
     });
 

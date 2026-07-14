@@ -36,6 +36,9 @@ jobs:
       - name: Type check
         run: bun run typecheck
 
+      - name: Legacy TypeScript compatibility
+        run: bun run test:compat
+
       - name: Run tests
         run: bun test
 

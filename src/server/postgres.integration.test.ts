@@ -6,7 +6,11 @@ import {
   MigrationLedger,
   type PoolQueryClient,
 } from "../generated/storage-kit/index.js";
-import { accountsMigrations, readMigrationStatus } from "./migrations.js";
+import {
+  accountsMigrations,
+  assertMigrationStatusCompatible,
+  readMigrationStatus,
+} from "./migrations.js";
 import { AccountsRepo } from "./repo.js";
 
 const DATABASE_URL = process.env.HASNA_ACCOUNTS_TEST_DATABASE_URL;
@@ -47,7 +51,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
     await adminPool?.end();
   });
 
-  test("migration 0003 upgrades an existing schema and is restart-idempotent", async () => {
+  test("migrations 0003/0004 upgrade existing data and are restart-idempotent", async () => {
     const appMigrations = accountsMigrations().filter((migration) =>
       migration.id.startsWith("accounts_"),
     );
@@ -62,6 +66,15 @@ describePostgres("PostgreSQL migration and repository integration", () => {
         "SELECT to_regclass('custom_tools')::text AS table_name",
       ),
     ).toEqual({ table_name: null });
+
+    await client.execute(
+      "INSERT INTO accounts (tool, name) VALUES ($1, $2)",
+      ["migration-probe", "valid"],
+    );
+    await client.execute(
+      "INSERT INTO current_selections (tool, name) VALUES ($1, $2), ($3, $4)",
+      ["migration-probe", "valid", "migration-orphan", "missing"],
+    );
 
     const upgraded = await new MigrationLedger(client, appMigrations).migrate();
     expect(
@@ -81,15 +94,36 @@ describePostgres("PostgreSQL migration and repository integration", () => {
          ) AS present`,
       ),
     ).toEqual({ present: true });
+    expect(
+      await client.many<{ tool: string; name: string }>(
+        "SELECT tool, name FROM current_selections WHERE tool LIKE 'migration-%' ORDER BY tool",
+      ),
+    ).toEqual([{ tool: "migration-probe", name: "valid" }]);
+    expect(
+      await client.many<{ tool: string; name: string; reason: string }>(
+        "SELECT tool, name, reason FROM current_selection_orphan_archive ORDER BY tool",
+      ),
+    ).toEqual([
+      {
+        tool: "migration-orphan",
+        name: "missing",
+        reason: "missing account during migration 0004",
+      },
+    ]);
 
     await client.close();
     client = openClient();
     const restarted = await new MigrationLedger(client, appMigrations).migrate();
     expect(restarted.plan.every((item) => item.state === "already_applied")).toBe(true);
     expect((await readMigrationStatus(client, appMigrations)).pending).toEqual([]);
+    expect(
+      await client.get<{ count: number }>(
+        "SELECT count(*)::int AS count FROM current_selection_orphan_archive",
+      ),
+    ).toEqual({ count: 1 });
   });
 
-  test("rollback leaves additive 0003 in place and forward-fix remains idempotent", async () => {
+  test("legacy migrator is downgrade-guarded; app rollback keeps the new migrator", async () => {
     await client.execute(
       "INSERT INTO accounts (tool, name) VALUES ($1, $2) ON CONFLICT DO NOTHING",
       ["rollback-probe", "old-server"],
@@ -100,6 +134,23 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       ),
     ).toEqual({ table_name: "custom_tools" });
     const appMigrations = accountsMigrations().filter((migration) => migration.id.startsWith("accounts_"));
+    const customToolsIndex = appMigrations.findIndex(
+      (migration) => migration.id === "accounts_0003_custom_tools",
+    );
+    const legacyMigrations = appMigrations.slice(0, customToolsIndex);
+    const legacyStatus = await readMigrationStatus(client, legacyMigrations);
+    expect(legacyStatus.pending).toEqual([]);
+    expect(legacyStatus.unknown).toEqual([
+      "accounts_0003_custom_tools",
+      "accounts_0004_current_selection_account_fk",
+    ]);
+    expect(() => assertMigrationStatusCompatible(legacyStatus)).toThrow(
+      /not recognized by this build \(downgrade\?\)/,
+    );
+    await expect(
+      new MigrationLedger(client, legacyMigrations).migrate({ dryRun: true }),
+    ).rejects.toThrow(/not recognized by this build \(downgrade\?\)/);
+
     const forward = await new MigrationLedger(client, appMigrations).migrate();
     expect(forward.plan.every((item) => item.state === "already_applied")).toBe(true);
     expect((await readMigrationStatus(client, appMigrations)).pending).toEqual([]);
@@ -157,6 +208,13 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       const firstRepo = new AccountsRepo(client);
       const secondRepo = new AccountsRepo(second);
 
+      await firstRepo.addCustomTool({
+        id: "race",
+        label: "Race",
+        envVar: "RACE_HOME",
+        defaultDir: "/tmp/race",
+        bin: "race",
+      });
       for (let attempt = 0; attempt < 5; attempt += 1) {
         const oldName = `rename-old-${attempt}`;
         const newName = `rename-new-${attempt}`;
@@ -175,6 +233,13 @@ describePostgres("PostgreSQL migration and repository integration", () => {
         expect((await firstRepo.get("race", newName))?.name).toBe(newName);
       }
 
+      await firstRepo.addCustomTool({
+        id: "remove-race",
+        label: "Remove Race",
+        envVar: "REMOVE_RACE_HOME",
+        defaultDir: "/tmp/remove-race",
+        bin: "remove-race",
+      });
       for (let attempt = 0; attempt < 5; attempt += 1) {
         const name = `remove-${attempt}`;
         await firstRepo.create({ tool: "remove-race", name });
@@ -189,6 +254,47 @@ describePostgres("PostgreSQL migration and repository integration", () => {
         }
         expect(await firstRepo.getCurrent("remove-race")).toBeNull();
         expect(await firstRepo.get("remove-race", name)).toBeNull();
+      }
+    } finally {
+      await second.close();
+    }
+  });
+
+  test("custom-tool removal serializes with concurrent account creation", async () => {
+    const second = openClient();
+    try {
+      const firstRepo = new AccountsRepo(client);
+      const secondRepo = new AccountsRepo(second);
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        const tool = `tool-race-${attempt}`;
+        await firstRepo.addCustomTool({
+          id: tool,
+          label: `Tool Race ${attempt}`,
+          envVar: "TOOL_RACE_HOME",
+          defaultDir: `/tmp/${tool}`,
+          bin: tool,
+        });
+
+        const [createResult, removeResult] = await Promise.allSettled([
+          firstRepo.create({ tool, name: "profile" }),
+          secondRepo.removeCustomTool(tool),
+        ]);
+        const account = await firstRepo.get(tool, "profile");
+        const toolExists = (await firstRepo.listCustomTools()).some((item) => item.id === tool);
+
+        if (createResult.status === "fulfilled") {
+          expect(removeResult.status).toBe("rejected");
+          expect(String(removeResult.status === "rejected" ? removeResult.reason : "")).toContain(
+            "still used by profile(s) profile",
+          );
+          expect(account?.name).toBe("profile");
+          expect(toolExists).toBe(true);
+        } else {
+          expect(removeResult).toEqual({ status: "fulfilled", value: true });
+          expect(String(createResult.reason)).toContain(`unknown tool: ${tool}`);
+          expect(account).toBeNull();
+          expect(toolExists).toBe(false);
+        }
       }
     } finally {
       await second.close();

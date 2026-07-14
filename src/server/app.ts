@@ -97,6 +97,10 @@ export function buildServiceContext(options: BuildContextOptions = {}): ServiceC
       // DML-only app role can report readiness.
       const status = await readMigrationStatus(client, migrations);
       if (!status.ledgerPresent) return { ready: false, reason: "schema not migrated (ledger table missing)" };
+      if (status.unknown.length > 0) return { ready: false, reason: `unknown applied migrations: ${status.unknown.join(", ")}` };
+      if (status.checksumMismatches.length > 0) {
+        return { ready: false, reason: `migration checksum mismatch: ${status.checksumMismatches.join(", ")}` };
+      }
       if (status.pending.length > 0) return { ready: false, reason: `pending migrations: ${status.pending.join(", ")}` };
       return { ready: true };
     },

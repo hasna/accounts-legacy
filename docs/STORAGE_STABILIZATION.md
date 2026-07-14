@@ -38,15 +38,22 @@ hydrated from the active Store.
 
 The `accounts storage status|push|pull|sync` command group remains
 discoverable. Status reports local/API compatibility state; provider-backed
-mutations fail explicitly. The retired `remote`, `hybrid`, and `s3` mode
-words are ignored. Other unknown modes fail validation.
+mutations fail explicitly. The three retired mutations continue to accept
+`--json` and the source functions retain their optional environment argument,
+so legacy parsers and TypeScript call sites receive a retirement diagnostic
+instead of a parse or compile failure. The retired `remote`, `hybrid`, and
+`s3` mode words are ignored. Other unknown modes fail validation.
 
 ## Deployment Order
 
-1. Back up the Accounts database using the normal database procedure.
+1. Take and verify a restorable Accounts database backup. This is mandatory:
+   migration `0004` changes live selection rows.
 2. Run `accounts-migrate` with the new source against PostgreSQL. Migration
-   `0003` is additive and creates `custom_tools`. Migration `0004` removes
-   orphan current selections once, then adds a cascading account foreign key.
+   `0003` is additive and creates `custom_tools`. Migration `0004` copies
+   orphan current selections to `current_selection_orphan_archive`, removes
+   those orphans from the live table, preserves valid selections, then adds a
+   cascading account foreign key. Inspect and retain the archive for
+   reconciliation; do not treat it as disposable migration scratch state.
 3. Deploy `accounts-serve` and verify `/health`, `/ready`, `/version`,
    `GET /v1/tools`, and the OpenAPI document.
 4. Roll out new clients only after the server is ready.
@@ -64,13 +71,21 @@ account reads and writes continue to use their original endpoints.
 | Old | New | Compatible. Routes are additive and Tool only requires `id` and `label`; enriched fields are optional. |
 | New | Old | Existing operations work. Minimal legacy built-in Tool responses are accepted. Rename and custom-tool mutations require a server upgrade and fail with an actionable error. |
 | New | New before migrations 0003/0004 | `/ready` is unavailable with a pending-migration reason. Do not send traffic. |
-| New | New after migrations 0003/0004 | Full AccountsStore routing, custom tools, row-locked rename/remove/current updates, and pointer reconciliation are available. |
+| New | New after migrations 0003/0004 | Full AccountsStore routing, custom tools, row/advisory-locked account/tool mutations, rename/remove/current updates, and pointer reconciliation are available. |
 
 ## Rollback And Forward Fix
 
-- Before client rollout, the server may be rolled back. Leave migrations
-  `0003` and `0004` in place; older servers ignore `custom_tools`, and the
-  foreign key preserves existing account/current semantics.
+- Before client rollout, the application server image may be rolled back.
+  Leave migrations `0003` and `0004` in place; older servers ignore
+  `custom_tools`, and the foreign key preserves existing account/current
+  semantics.
+- Never run a pre-`0003` `accounts-migrate` binary after `0003` or `0004`
+  is recorded. The checksum ledger rejects migrations unknown to the supplied
+  manifest as a deterministic downgrade guard. An application rollback must
+  retain the new migrator binary/job; otherwise forward-fix the new image.
+- If migration `0004` requires data recovery, stop writes and restore the
+  mandatory pre-migration backup. The orphan archive is evidence for
+  reconciliation, not a substitute for the backup.
 - After new clients use rename or custom-tool endpoints, prefer a server
   forward-fix. Rolling the server below those endpoints makes the new mutations
   unavailable until it is restored.
@@ -85,7 +100,8 @@ account reads and writes continue to use their original endpoints.
   cold custom-tool lookup/launch, endpoint compatibility, and transaction use.
 - `bun run test:postgres` requires
   `HASNA_ACCOUNTS_TEST_DATABASE_URL`. It uses an isolated schema to verify the
-  `0003` upgrade, restart idempotency, rollback/forward-fix behavior,
-  `0004` constraints, transaction rollback, and concurrent row locking.
+  `0003` upgrade, `0004` orphan archival and valid-row preservation, restart
+  idempotency, old-migrator downgrade rejection, rollback/forward-fix behavior,
+  transaction rollback, and concurrent row/advisory locking.
 - Contract, no-cloud, generated SDK, and vendored storage-kit checks remain
   required before release.

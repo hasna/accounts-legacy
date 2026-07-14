@@ -96,9 +96,14 @@ test("the legacy storage command group is a fail-explicit compatibility shim", (
   const result = runCli({}, "storage", "status");
   expect(result.status).toBe(0);
   expect(result.stdout).toContain("legacy provider-backed sync is retired");
-  const push = runCli({}, "storage", "push");
-  expect(push.status).not.toBe(0);
-  expect(push.stderr).toContain("legacy storage sync was retired");
+  for (const operation of ["push", "pull", "sync"]) {
+    for (const args of [[operation], [operation, "--json"]]) {
+      const retired = runCli({}, "storage", ...args);
+      expect(retired.status).not.toBe(0);
+      expect(retired.stderr).toContain("legacy storage sync was retired");
+      expect(retired.stderr).not.toContain("unknown option");
+    }
+  }
 });
 
 // Regression: a machine still carrying a stale S3-era storage-mode word must not

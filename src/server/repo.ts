@@ -8,6 +8,7 @@
 
 import { AccountsError, type ToolDef, toolDefSchema } from "../types.js";
 import type { PoolQueryClient, TypedQueryClient } from "../generated/storage-kit/index.js";
+import { isBuiltinTool } from "../lib/tools.js";
 import type { CreateAccountInput, UpdateAccountInput } from "./schema.js";
 
 export interface Account {
@@ -128,28 +129,45 @@ export class AccountsRepo implements AccountsStore {
     return row ? rowToAccount(row) : null;
   }
 
-  async create(input: CreateAccountInput): Promise<Account> {
-    const existing = await this.get(input.tool, input.name);
-    if (existing) {
-      throw new AccountsError(`a ${input.tool} profile named "${input.name}" already exists`);
-    }
-    const row = await this.client.one<AccountRow>(
-      `INSERT INTO accounts (tool, name, email, display_name, identity, card_last4, metadata, dir, description)
-       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)
-       RETURNING *`,
-      [
-        input.tool,
-        input.name,
-        input.email ?? null,
-        input.displayName ?? null,
-        input.identity ?? null,
-        input.cardLast4 ?? null,
-        JSON.stringify(input.metadata ?? {}),
-        input.dir ?? null,
-        input.description ?? null,
-      ],
+  private async lockToolRegistry(client: TypedQueryClient, tool: string): Promise<void> {
+    await client.execute(
+      "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+      [`accounts:tool:${tool}`],
     );
-    return rowToAccount(row);
+  }
+
+  async create(input: CreateAccountInput): Promise<Account> {
+    return this.client.transaction(async (client) => {
+      await this.lockToolRegistry(client, input.tool);
+      if (!isBuiltinTool(input.tool)) {
+        const custom = await client.get<{ id: string }>(
+          "SELECT id FROM custom_tools WHERE id = $1",
+          [input.tool],
+        );
+        if (!custom) throw new AccountsError(`unknown tool: ${input.tool}`);
+      }
+      const existing = await this.getWith(client, input.tool, input.name);
+      if (existing) {
+        throw new AccountsError(`a ${input.tool} profile named "${input.name}" already exists`);
+      }
+      const row = await client.one<AccountRow>(
+        `INSERT INTO accounts (tool, name, email, display_name, identity, card_last4, metadata, dir, description)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9)
+         RETURNING *`,
+        [
+          input.tool,
+          input.name,
+          input.email ?? null,
+          input.displayName ?? null,
+          input.identity ?? null,
+          input.cardLast4 ?? null,
+          JSON.stringify(input.metadata ?? {}),
+          input.dir ?? null,
+          input.description ?? null,
+        ],
+      );
+      return rowToAccount(row);
+    });
   }
 
   async update(tool: string, name: string, input: UpdateAccountInput): Promise<Account> {
@@ -269,32 +287,38 @@ export class AccountsRepo implements AccountsStore {
       throw new AccountsError(parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; "));
     }
     const tool = parsed.data;
-    const row = await this.client.one<{ definition: unknown }>(
-      `INSERT INTO custom_tools (id, definition)
-       VALUES ($1, $2::jsonb)
-       ON CONFLICT (id) DO UPDATE SET definition = EXCLUDED.definition
-       RETURNING definition`,
-      [tool.id, JSON.stringify(tool)],
-    );
-    const stored = typeof row.definition === "string" ? safeJsonParse(row.definition) : row.definition;
-    return toolDefSchema.parse(stored);
+    return this.client.transaction(async (client) => {
+      await this.lockToolRegistry(client, tool.id);
+      const row = await client.one<{ definition: unknown }>(
+        `INSERT INTO custom_tools (id, definition)
+         VALUES ($1, $2::jsonb)
+         ON CONFLICT (id) DO UPDATE SET definition = EXCLUDED.definition
+         RETURNING definition`,
+        [tool.id, JSON.stringify(tool)],
+      );
+      const stored = typeof row.definition === "string" ? safeJsonParse(row.definition) : row.definition;
+      return toolDefSchema.parse(stored);
+    });
   }
 
   async removeCustomTool(id: string): Promise<boolean> {
-    const inUse = await this.client.many<{ name: string }>(
-      "SELECT name FROM accounts WHERE tool = $1 ORDER BY name",
-      [id],
-    );
-    if (inUse.length > 0) {
-      throw new AccountsError(
-        `cannot remove "${id}": still used by profile(s) ${inUse.map((r) => r.name).join(", ")}`,
+    return this.client.transaction(async (client) => {
+      await this.lockToolRegistry(client, id);
+      const inUse = await client.many<{ name: string }>(
+        "SELECT name FROM accounts WHERE tool = $1 ORDER BY name",
+        [id],
       );
-    }
-    const result = await this.client.query<{ id: string }>(
-      "DELETE FROM custom_tools WHERE id = $1 RETURNING id",
-      [id],
-    );
-    return result.rowCount > 0;
+      if (inUse.length > 0) {
+        throw new AccountsError(
+          `cannot remove "${id}": still used by profile(s) ${inUse.map((r) => r.name).join(", ")}`,
+        );
+      }
+      const result = await client.query<{ id: string }>(
+        "DELETE FROM custom_tools WHERE id = $1 RETURNING id",
+        [id],
+      );
+      return result.rowCount > 0;
+    });
   }
 }
 

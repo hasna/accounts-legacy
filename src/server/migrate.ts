@@ -7,7 +7,11 @@
 // task and local ops.
 
 import { createCloudPoolFromEnv, MigrationLedger, resolveStorageMode } from "../generated/storage-kit/index.js";
-import { accountsMigrations, readMigrationStatus } from "./migrations.js";
+import {
+  accountsMigrations,
+  assertMigrationStatusCompatible,
+  readMigrationStatus,
+} from "./migrations.js";
 import { APP_SLUG } from "./config.js";
 
 async function main(): Promise<void> {
@@ -25,6 +29,7 @@ async function main(): Promise<void> {
     // green under the least-privilege app role. DDL (the owner role) is only
     // attempted when there is actual pending work.
     const status = await readMigrationStatus(client, migrations);
+    assertMigrationStatusCompatible(status);
     if (status.ledgerPresent && status.pending.length === 0) {
       console.log(JSON.stringify({ evt: "migrate_noop", dryRun, total: migrations.length, pending: [] }, null, 2));
       return;
@@ -32,7 +37,15 @@ async function main(): Promise<void> {
     if (dryRun) {
       console.log(
         JSON.stringify(
-          { evt: "migrate_plan", dryRun, total: migrations.length, ledgerPresent: status.ledgerPresent, pending: status.pending },
+          {
+            evt: "migrate_plan",
+            dryRun,
+            total: migrations.length,
+            ledgerPresent: status.ledgerPresent,
+            pending: status.pending,
+            unknown: status.unknown,
+            checksumMismatches: status.checksumMismatches,
+          },
           null,
           2,
         ),

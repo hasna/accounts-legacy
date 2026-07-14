@@ -315,7 +315,10 @@ Configure API mode with:
 The `@hasna/accounts/storage` entry point and `accounts storage` command
 group retain deprecated source/CLI compatibility shims. Local status and
 snapshot helpers continue to work. `push`, `pull`, and `sync` fail
-explicitly because the retired provider-backed transport is not present.
+explicitly because the retired provider-backed transport is not present. Their
+legacy optional environment arguments remain accepted, and the retired CLI
+commands still parse `--json` before returning the same deterministic
+retirement diagnostic.
 
 ## Supported tools
 

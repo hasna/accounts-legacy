@@ -24,9 +24,14 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   hydrate before synchronous lookup.
 - Account rename/remove reconciles raw machine-local pointers. PostgreSQL
   selection updates are protected by row locks and an additive cascading
-  foreign key migration.
+  foreign key migration. Migration `0004` archives orphan selections before
+  cleanup, and the migrator rejects unknown applied migrations before its
+  privilege-safe no-op path.
+- Custom-tool add/remove and account creation share a transaction-scoped
+  advisory lock, preventing tool deletion from racing a new dependent account.
 - Deprecated storage exports and CLI commands remain as compatibility shims;
-  retired provider-backed sync operations fail explicitly.
+  retired provider-backed sync operations preserve optional environment
+  arguments and `--json` parsing, then fail explicitly.
 
 ## [0.1.32] - 2026-07-06
 

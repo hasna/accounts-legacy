@@ -42,6 +42,7 @@
     "contracts:no-cloud-scan": "contracts no-cloud-scan --json .",
     "dev": "bun run src/cli.ts",
     "sdk:generate": "bun run src/sdk/generate-sdk.ts",
+    "test:compat": "tsc --noEmit -p tsconfig.compat.json",
     "vendor-kit:check": "bunx @hasna/contracts vendor-kit --check .",
     "conformance": "bunx @hasna/contracts repo-conformance .",
     "prepack": "bun run build",

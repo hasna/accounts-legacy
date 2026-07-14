@@ -34,7 +34,14 @@ export interface ImportOptions {
  * `accounts list`/other machines). The on-disk copy/snapshot work is
  * machine-local and stays local.
  */
-export async function importProfile(opts: ImportOptions, store: AccountsStore = resolveStore()): Promise<Profile> {
+export function importProfile(opts: ImportOptions, store?: AccountsStore): Promise<Profile>;
+export async function importProfile(
+  opts: ImportOptions,
+  store: AccountsStore = resolveStore(),
+  copyDirectory: (source: string, target: string) => void = (source, target) => {
+    cpSync(source, target, { recursive: true });
+  },
+): Promise<Profile> {
   const toolId = opts.tool ?? DEFAULT_TOOL;
   const name = opts.name ?? "main";
   const nameCheck = profileNameSchema.safeParse(name);
@@ -51,9 +58,9 @@ export async function importProfile(opts: ImportOptions, store: AccountsStore = 
     if (existsSync(targetDir)) {
       throw new AccountsError(`managed copy target already exists: ${targetDir}`);
     }
-    assertSafeWritePath(join(targetDir, ".accounts-import-check"), { mustStayUnder: profilesDir() });
-    cpSync(sourceDir, targetDir, { recursive: true });
     try {
+      assertSafeWritePath(join(targetDir, ".accounts-import-check"), { mustStayUnder: profilesDir() });
+      copyDirectory(sourceDir, targetDir);
       if (tool.id === "claude") ensureProfileAuthSnapshot(targetDir, tool);
       const addOpts: AddOptions = {
         name,

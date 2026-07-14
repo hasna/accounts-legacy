@@ -1010,7 +1010,8 @@ for (const [name, operation] of [
   storage
     .command(name)
     .description(`deprecated: ${name} is retained only as an explicit migration error`)
-    .action(action(async () => {
+    .option("--json", "retained for compatibility; the retirement diagnostic is unchanged")
+    .action(action(async (_opts: { json?: boolean }) => {
       await operation();
     }));
 }
