@@ -152,8 +152,14 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
           properties: { name: { type: "string" } },
         },
         Tool: {
+          // WIRE-ADDITIVE: the deployed (0.1.x) server returned Tool objects with
+          // only `id`/`label` guaranteed (required) plus `envVar`/`bin`/`builtin`.
+          // The refactored server returns the full ToolDef, but the response
+          // contract must remain a strict SUPERSET of the deployed one so old
+          // /v1 clients keep working — therefore the extra ToolDef fields are
+          // documented as OPTIONAL and `required` stays exactly ["id","label"].
           type: "object",
-          required: ["id", "label", "envVar", "defaultDir", "bin"],
+          required: ["id", "label"],
           properties: {
             id: { type: "string" },
             label: { type: "string" },
