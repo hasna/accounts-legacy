@@ -320,6 +320,12 @@ legacy optional environment arguments remain accepted, and the retired CLI
 commands still parse `--json` before returning the same deterministic
 retirement diagnostic.
 
+For server compatibility, an older client may create an account using a
+previously local custom tool id without first registering a Tool definition.
+The server distinguishes that unseen id from an explicitly removed id using a
+durable PostgreSQL tombstone; only an explicit tools registration reactivates a
+removed id.
+
 ## Supported tools
 
 | Tool | id | Env var | Default dir |

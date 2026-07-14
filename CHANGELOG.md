@@ -29,6 +29,9 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   privilege-safe no-op path.
 - Custom-tool add/remove and account creation share a transaction-scoped
   advisory lock, preventing tool deletion from racing a new dependent account.
+  Additive migration `0005` durably distinguishes unseen legacy custom tool
+  ids (accepted for old-client account creation) from explicitly removed ids
+  (rejected until explicit re-registration), including older direct SQL writers.
 - Deprecated storage exports and CLI commands remain as compatibility shims;
   retired provider-backed sync operations preserve optional environment
   arguments and `--json` parsing, then fail explicitly.

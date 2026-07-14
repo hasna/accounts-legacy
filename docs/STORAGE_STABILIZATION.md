@@ -16,8 +16,8 @@ The source change covers four related surfaces:
    profile registry operations.
 2. Retirement of the legacy provider-backed remote/hybrid subsystem, with
    source-compatible shims but no provider runtime.
-3. PostgreSQL migration `0003_custom_tools.sql` plus additive custom-tool and
-   rename endpoints.
+3. PostgreSQL migrations for custom-tool definitions, selection integrity, and
+   durable removed-tool tombstones, plus additive custom-tool/rename endpoints.
 4. Readiness and server compatibility, including additive Tool responses and
    transactional account/current-selection updates.
 
@@ -52,8 +52,12 @@ instead of a parse or compile failure. The retired `remote`, `hybrid`, and
    `0003` is additive and creates `custom_tools`. Migration `0004` copies
    orphan current selections to `current_selection_orphan_archive`, removes
    those orphans from the live table, preserves valid selections, then adds a
-   cascading account foreign key. Inspect and retain the archive for
-   reconciliation; do not treat it as disposable migration scratch state.
+   cascading account foreign key. Migration `0005` additively creates
+   `custom_tool_tombstones` and database guards that serialize account
+   creation, explicit removal, and explicit re-registration. All three
+   migrations are checksum-ledgered and restart-idempotent. Inspect and retain
+   the orphan archive for reconciliation; do not treat it as disposable
+   migration scratch state.
 3. Deploy `accounts-serve` and verify `/health`, `/ready`, `/version`,
    `GET /v1/tools`, and the OpenAPI document.
 4. Roll out new clients only after the server is ready.
@@ -68,21 +72,22 @@ account reads and writes continue to use their original endpoints.
 | Client | Server | Result |
 | --- | --- | --- |
 | Old | Old | Existing account and selection operations are unchanged. |
-| Old | New | Compatible. Routes are additive and Tool only requires `id` and `label`; enriched fields are optional. |
+| Old | New | Compatible after migration 0005. Account creation with a previously local, unseen custom tool id succeeds without a tools-registration call. A durably removed id is rejected. |
 | New | Old | Existing operations work. Minimal legacy built-in Tool responses are accepted. Rename and custom-tool mutations require a server upgrade and fail with an actionable error. |
-| New | New before migrations 0003/0004 | `/ready` is unavailable with a pending-migration reason. Do not send traffic. |
-| New | New after migrations 0003/0004 | Full AccountsStore routing, custom tools, row/advisory-locked account/tool mutations, rename/remove/current updates, and pointer reconciliation are available. |
+| New | New before migrations 0003/0004/0005 | `/ready` is unavailable with a pending-migration reason. Do not send traffic. |
+| New | New after migrations 0003/0004/0005 | Full AccountsStore routing, durable tool lifecycle state, row/advisory-locked account/tool mutations, rename/remove/current updates, and pointer reconciliation are available. |
 
 ## Rollback And Forward Fix
 
 - Before client rollout, the application server image may be rolled back.
-  Leave migrations `0003` and `0004` in place; older servers ignore
-  `custom_tools`, and the foreign key preserves existing account/current
-  semantics.
-- Never run a pre-`0003` `accounts-migrate` binary after `0003` or `0004`
-  is recorded. The checksum ledger rejects migrations unknown to the supplied
-  manifest as a deterministic downgrade guard. An application rollback must
-  retain the new migrator binary/job; otherwise forward-fix the new image.
+  Leave migrations `0003`, `0004`, and `0005` in place. Database triggers
+  make older account writers observe tombstones and turn older direct
+  `custom_tools` deletes into durable removals. An explicit registration is
+  the only operation that clears a tombstone.
+- Never run a pre-`0003`/`0005` `accounts-migrate` binary after newer
+  migrations are recorded. The checksum ledger rejects migrations unknown to
+  the supplied manifest as a deterministic downgrade guard. An application
+  rollback must retain the new migrator binary/job; otherwise forward-fix.
 - If migration `0004` requires data recovery, stop writes and restore the
   mandatory pre-migration backup. The orphan archive is evidence for
   reconciliation, not a substitute for the backup.
@@ -91,8 +96,9 @@ account reads and writes continue to use their original endpoints.
   unavailable until it is restored.
 - A client rollback does not remove cloud custom tools. Older clients may not
   resolve those tools for launch, but account and tool records remain intact.
-- Do not drop `custom_tools` as an application rollback. Restore service with a
-  corrected server build, then reconcile data through supported endpoints.
+- Do not drop `custom_tools`, `custom_tool_tombstones`, their guard triggers,
+  or the selection foreign key as an application rollback. Restore service with
+  a corrected server build, then reconcile data through supported endpoints.
 
 ## Verification
 
@@ -100,7 +106,9 @@ account reads and writes continue to use their original endpoints.
   cold custom-tool lookup/launch, endpoint compatibility, and transaction use.
 - `bun run test:postgres` requires
   `HASNA_ACCOUNTS_TEST_DATABASE_URL`. It uses an isolated schema to verify the
-  `0003` upgrade, `0004` orphan archival and valid-row preservation, restart
+  `0003` upgrade, `0004` orphan archival and valid-row preservation, `0005`
+  direct-SQL idempotency, unseen legacy ids, durable removal rejection,
+  old-server trigger behavior, both removal/creation orderings, restart
   idempotency, old-migrator downgrade rejection, rollback/forward-fix behavior,
   transaction rollback, and concurrent row/advisory locking.
 - Contract, no-cloud, generated SDK, and vendored storage-kit checks remain

@@ -8,7 +8,6 @@
 
 import { AccountsError, type ToolDef, toolDefSchema } from "../types.js";
 import type { PoolQueryClient, TypedQueryClient } from "../generated/storage-kit/index.js";
-import { isBuiltinTool } from "../lib/tools.js";
 import type { CreateAccountInput, UpdateAccountInput } from "./schema.js";
 
 export interface Account {
@@ -139,12 +138,12 @@ export class AccountsRepo implements AccountsStore {
   async create(input: CreateAccountInput): Promise<Account> {
     return this.client.transaction(async (client) => {
       await this.lockToolRegistry(client, input.tool);
-      if (!isBuiltinTool(input.tool)) {
-        const custom = await client.get<{ id: string }>(
-          "SELECT id FROM custom_tools WHERE id = $1",
-          [input.tool],
-        );
-        if (!custom) throw new AccountsError(`unknown tool: ${input.tool}`);
+      const removed = await client.get<{ id: string }>(
+        "SELECT id FROM custom_tool_tombstones WHERE id = $1",
+        [input.tool],
+      );
+      if (removed) {
+        throw new AccountsError(`custom tool "${input.tool}" was explicitly removed`);
       }
       const existing = await this.getWith(client, input.tool, input.name);
       if (existing) {
@@ -289,6 +288,7 @@ export class AccountsRepo implements AccountsStore {
     const tool = parsed.data;
     return this.client.transaction(async (client) => {
       await this.lockToolRegistry(client, tool.id);
+      await client.execute("DELETE FROM custom_tool_tombstones WHERE id = $1", [tool.id]);
       const row = await client.one<{ definition: unknown }>(
         `INSERT INTO custom_tools (id, definition)
          VALUES ($1, $2::jsonb)
@@ -315,6 +315,10 @@ export class AccountsRepo implements AccountsStore {
       }
       const result = await client.query<{ id: string }>(
         "DELETE FROM custom_tools WHERE id = $1 RETURNING id",
+        [id],
+      );
+      await client.execute(
+        "INSERT INTO custom_tool_tombstones (id) VALUES ($1) ON CONFLICT (id) DO NOTHING",
         [id],
       );
       return result.rowCount > 0;
