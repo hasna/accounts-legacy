@@ -296,10 +296,14 @@ function signalExitCode(signal: NodeJS.Signals | null): number {
 
 function resolveExecutable(bin: string, env: NodeJS.ProcessEnv): string {
   if (process.platform !== "win32" || isAbsolute(bin) || /[\\/]/.test(bin)) return bin;
+  const envValue = (name: string): string | undefined => {
+    const key = Object.keys(env).find((candidate) => candidate.toLowerCase() === name.toLowerCase());
+    return key ? env[key] : undefined;
+  };
   const extensions = extname(bin)
     ? [""]
-    : (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean);
-  for (const entry of (env.PATH ?? "").split(delimiter)) {
+    : (envValue("PATHEXT") ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean);
+  for (const entry of (envValue("PATH") ?? "").split(delimiter)) {
     const directory = entry.replace(/^"(.*)"$/, "$1");
     if (!directory) continue;
     for (const extension of extensions) {

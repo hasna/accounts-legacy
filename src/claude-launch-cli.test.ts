@@ -148,7 +148,7 @@ process.exit(64);
 }
 
 function baseEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
-  return {
+  const env: NodeJS.ProcessEnv = {
     ...process.env,
     NODE_ENV: "test",
     ACCOUNTS_HOME: home,
@@ -159,9 +159,16 @@ function baseEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
     FAKE_SECURITY_LOG: securityLog,
     FAKE_KEYCHAIN_STATE: keychainState,
     ACCOUNTS_TEST_KEYCHAIN_LOCK_PATH: keychainLock,
-    PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}`,
     ...extra,
   };
+  const inheritedPath = Object.entries(process.env)
+    .find(([key]) => key.toLowerCase() === "path")?.[1] ?? "";
+  const requestedPath = extra.PATH ?? `${binDir}${delimiter}${inheritedPath}`;
+  for (const key of Object.keys(env)) {
+    if (key.toLowerCase() === "path") delete env[key];
+  }
+  env[process.platform === "win32" ? "Path" : "PATH"] = requestedPath;
+  return env;
 }
 
 function runCli(args: string[], options: { cwd?: string; env?: Record<string, string> } = {}) {
