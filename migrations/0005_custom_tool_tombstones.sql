@@ -90,3 +90,39 @@ DROP TRIGGER IF EXISTS custom_tool_registration_tombstone ON custom_tools;
 CREATE TRIGGER custom_tool_registration_tombstone
   BEFORE DELETE ON custom_tools
   FOR EACH ROW EXECUTE FUNCTION custom_tool_registration_tombstone();
+
+-- These remain SECURITY INVOKER so the runtime role receives only the direct
+-- table privileges documented for accounts-serve. Pin name resolution to the
+-- migration-owned schema (with pg_catalog first), and do not expose trigger
+-- functions as a callable public API.
+DO $migration$
+DECLARE
+  target_schema TEXT := current_schema();
+BEGIN
+  EXECUTE format(
+    'ALTER FUNCTION %I.accounts_guard_removed_custom_tool() SET search_path = pg_catalog, %I',
+    target_schema,
+    target_schema
+  );
+  EXECUTE format(
+    'ALTER FUNCTION %I.custom_tool_tombstone_guard() SET search_path = pg_catalog, %I',
+    target_schema,
+    target_schema
+  );
+  EXECUTE format(
+    'ALTER FUNCTION %I.custom_tool_registration_reactivate() SET search_path = pg_catalog, %I',
+    target_schema,
+    target_schema
+  );
+  EXECUTE format(
+    'ALTER FUNCTION %I.custom_tool_registration_tombstone() SET search_path = pg_catalog, %I',
+    target_schema,
+    target_schema
+  );
+END
+$migration$;
+
+REVOKE ALL PRIVILEGES ON FUNCTION accounts_guard_removed_custom_tool() FROM PUBLIC;
+REVOKE ALL PRIVILEGES ON FUNCTION custom_tool_tombstone_guard() FROM PUBLIC;
+REVOKE ALL PRIVILEGES ON FUNCTION custom_tool_registration_reactivate() FROM PUBLIC;
+REVOKE ALL PRIVILEGES ON FUNCTION custom_tool_registration_tombstone() FROM PUBLIC;

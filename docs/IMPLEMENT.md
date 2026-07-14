@@ -86,5 +86,9 @@ ACCOUNTS_REQUIRE_POSTGRES=1 HASNA_ACCOUNTS_TEST_DATABASE_URL=<isolated-test-db> 
 ```
 
 Use isolated `ACCOUNTS_HOME` and `ACCOUNTS_TEST_LIVE_DIR` in every test (`accounts.test.ts`, `switcher.test.ts`).
-PostgreSQL tests create and drop a random schema. CI provides a disposable
-PostgreSQL service and treats migration/concurrency coverage as required.
+PostgreSQL tests create and drop random owner/runtime roles plus a random
+schema. Migrations run as the non-superuser schema owner; server and raw legacy
+SQL operations reconnect through the documented DML-only runtime grants. CI
+provides a disposable PostgreSQL service and treats role separation,
+migration/concurrency coverage, and the checksum-pinned full-PR-range gitleaks
+scan as required.

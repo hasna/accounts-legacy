@@ -48,24 +48,77 @@ instead of a parse or compile failure. The retired `remote`, `hybrid`, and
 
 1. Take and verify a restorable Accounts database backup. This is mandatory:
    migration `0004` changes live selection rows.
-2. Run `accounts-migrate` with the new source against PostgreSQL. Migration
+2. Provision separate database identities. Both are dedicated
+   `LOGIN NOINHERIT` roles with no elevated attributes or memberships. The
+   migration owner owns the Accounts schema and its objects and is used only by
+   `accounts-migrate`; the other role is used only by `accounts-serve`.
+3. Run `accounts-migrate` with the owner DSN and
+   `HASNA_ACCOUNTS_RUNTIME_ROLE=<accounts-serve-role>`. Migration
    `0003` is additive and creates `custom_tools`. Migration `0004` copies
    orphan current selections to `current_selection_orphan_archive`, removes
    those orphans from the live table, preserves valid selections, then adds a
    cascading account foreign key. Migration `0005` additively creates
    `custom_tool_tombstones` and database guards that serialize account
    creation, explicit removal, and explicit re-registration. All three
-   migrations are checksum-ledgered and restart-idempotent. Inspect and retain
+   migrations are checksum-ledgered and restart-idempotent. The migrator
+   reapplies and verifies the runtime grant contract after migrations and on a
+   current-schema no-op run. Inspect and retain
    the orphan archive for reconciliation; do not treat it as disposable
    migration scratch state.
-3. Deploy `accounts-serve` and verify `/health`, `/ready`, `/version`,
+4. Deploy `accounts-serve` with the DML-only role DSN and verify `/health`,
+   `/ready`, `/version`,
    `GET /v1/tools`, and the OpenAPI document.
-4. Roll out new clients only after the server is ready.
+5. Roll out new clients only after the server is ready.
 
 Server-before-client is required for `accounts rename`, `accounts tools add`,
 and `accounts tools remove`. A new client connected to an older server returns
 an actionable redeploy error for those route-missing mutations. Existing
 account reads and writes continue to use their original endpoints.
+
+## Database Role Contract
+
+The migration owner and runtime role must be distinct. Both are provisioned
+without elevated attributes or memberships. The owner gets DDL authority by
+owning only the Accounts schema and its objects; it is not used by
+`accounts-serve`:
+
+```sql
+CREATE ROLE accounts_migrator
+  LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE
+  NOREPLICATION NOBYPASSRLS;
+CREATE ROLE accounts_app
+  LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE
+  NOREPLICATION NOBYPASSRLS;
+CREATE SCHEMA accounts AUTHORIZATION accounts_migrator;
+ALTER ROLE accounts_migrator SET search_path = accounts, pg_catalog;
+ALTER ROLE accounts_app SET search_path = accounts, pg_catalog;
+```
+
+Authentication material is provisioned outside the repository. Both roles must
+have no memberships, and the runtime role must not own any Accounts object.
+`accounts` must be a dedicated schema; both migration and server connections
+must resolve it as `current_schema()` through the shown role setting or an
+equivalent connection-level `search_path`.
+`accounts-migrate` fails closed if this contract is not met.
+
+With `HASNA_ACCOUNTS_RUNTIME_ROLE=accounts_app`, the owner-run migrator applies
+only these direct grants after revoking `PUBLIC` access on the managed schema
+and tables:
+
+- `USAGE` on the Accounts schema, without `CREATE`.
+- `SELECT, INSERT, UPDATE, DELETE` on `accounts`,
+  `current_selections`, and `custom_tools`.
+- `SELECT, INSERT, DELETE` on `custom_tool_tombstones`; no `UPDATE`,
+  `TRUNCATE`, `REFERENCES`, or `TRIGGER`.
+- `SELECT` on `schema_migrations` and `api_keys` for readiness and
+  API-key revocation checks.
+- No direct `EXECUTE` on the four migration `0005` trigger functions.
+
+The trigger functions are `SECURITY INVOKER`, owned by the migration owner,
+have `search_path` fixed to `pg_catalog` plus the migration schema, and have
+public execution revoked. Their table access therefore stays within the
+runtime role's audited direct grants. Re-run the owner migrator after every
+schema migration so grants for the current manifest are revalidated.
 
 ## Compatibility Matrix
 
@@ -84,6 +137,10 @@ account reads and writes continue to use their original endpoints.
   make older account writers observe tombstones and turn older direct
   `custom_tools` deletes into durable removals. An explicit registration is
   the only operation that clears a tombstone.
+- An application rollback continues to use the DML-only runtime role. Keep the
+  migration `0005` functions, their locked `search_path`, and the grants
+  applied by the new owner-run migrator. Do not switch the server to the owner
+  DSN as a rollback shortcut.
 - Never run a pre-`0003`/`0005` `accounts-migrate` binary after newer
   migrations are recorded. The checksum ledger rejects migrations unknown to
   the supplied manifest as a deterministic downgrade guard. An application
@@ -110,6 +167,15 @@ account reads and writes continue to use their original endpoints.
   direct-SQL idempotency, unseen legacy ids, durable removal rejection,
   old-server trigger behavior, both removal/creation orderings, restart
   idempotency, old-migrator downgrade rejection, rollback/forward-fix behavior,
-  transaction rollback, and concurrent row/advisory locking.
+  transaction rollback, and concurrent row/advisory locking. The suite creates
+  a non-superuser migration owner and a separate DML-only app role, migrates as
+  the owner, reconnects as the app role, proves normal account/custom-tool
+  operations, and runs both forced raw `INSERT accounts` versus
+  `DELETE custom_tools` orderings without `AccountsRepo` locks.
+- Pull requests install gitleaks `v8.30.1` from its checksum-pinned official
+  Linux x64 archive and scan the complete base-to-head commit range with full
+  redaction. The scan job has read-only contents permission, persists no
+  checkout credential, receives no repository secrets, and ignores
+  PR-controlled gitleaks config, ignore files, and inline allow directives.
 - Contract, no-cloud, generated SDK, and vendored storage-kit checks remain
   required before release.

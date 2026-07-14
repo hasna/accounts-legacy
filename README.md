@@ -326,6 +326,15 @@ The server distinguishes that unseen id from an explicitly removed id using a
 durable PostgreSQL tombstone; only an explicit tools registration reactivates a
 removed id.
 
+Production PostgreSQL uses separate identities: an object-owning migration role
+for `accounts-migrate`, and a DML-only `LOGIN NOINHERIT` role for
+`accounts-serve`. `accounts-migrate` requires
+`HASNA_ACCOUNTS_RUNTIME_ROLE` to name the server role so it validates and
+reapplies the least-privilege grants.
+The server role must never own the schema or run migrations. See
+[Accounts Storage Stabilization](docs/STORAGE_STABILIZATION.md#database-role-contract)
+for the exact grants and rollout order.
+
 ## Supported tools
 
 | Tool | id | Env var | Default dir |

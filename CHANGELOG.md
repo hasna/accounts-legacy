@@ -32,6 +32,13 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   Additive migration `0005` durably distinguishes unseen legacy custom tool
   ids (accepted for old-client account creation) from explicitly removed ids
   (rejected until explicit re-registration), including older direct SQL writers.
+- Migration `0005` trigger functions now remain owner-controlled
+  `SECURITY INVOKER` functions with a fixed schema-safe `search_path` and no
+  public execution. The owner-run migrator validates and applies an explicit
+  DML-only `accounts-serve` role contract; required PostgreSQL tests run normal
+  and raw old-server race operations through that separate role.
+- Pull requests run a checksum-pinned gitleaks binary over the complete
+  base-to-head commit range in a read-only, secret-free, fully redacted job.
 - Deprecated storage exports and CLI commands remain as compatibility shims;
   retired provider-backed sync operations preserve optional environment
   arguments and `--json` parsing, then fail explicitly.

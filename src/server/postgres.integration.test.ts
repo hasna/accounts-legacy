@@ -14,6 +14,7 @@ import {
 } from "./migrations.js";
 import { AccountsRepo } from "./repo.js";
 import { createHandler, type ServiceContext } from "./app.js";
+import { grantAccountsRuntimeRole } from "./runtime-role.js";
 
 const DATABASE_URL = process.env.HASNA_ACCOUNTS_TEST_DATABASE_URL;
 
@@ -29,18 +30,43 @@ const describePostgres = DATABASE_URL ? describe : describe.skip;
 
 describePostgres("PostgreSQL migration and repository integration", () => {
   const signingSecret = "postgres-integration-signing-secret";
-  const schema = "accounts_it_" + randomBytes(6).toString("hex");
+  const suffix = randomBytes(6).toString("hex");
+  const schema = "accounts_it_" + suffix;
+  const migrationOwnerRole = "accounts_owner_" + suffix;
+  const runtimeRole = "accounts_app_" + suffix;
+  const migrationOwnerPassword = randomBytes(24).toString("hex");
+  const runtimePassword = randomBytes(24).toString("hex");
   let adminPool: Pool;
   let client: PoolQueryClient;
+  let appClient: PoolQueryClient;
 
-  function openClient(applicationName = "accounts-postgres-integration"): PoolQueryClient {
+  function roleConnectionString(role: string, password: string): string {
+    const url = new URL(DATABASE_URL!);
+    url.username = role;
+    url.password = password;
+    return url.toString();
+  }
+
+  function openRoleClient(
+    role: string,
+    password: string,
+    applicationName: string,
+  ): PoolQueryClient {
     const pool = new Pool({
-      connectionString: DATABASE_URL,
+      connectionString: roleConnectionString(role, password),
       options: "-c search_path=" + schema,
       application_name: applicationName,
       max: 2,
     });
     return createQueryClient(pool);
+  }
+
+  function openClient(applicationName = "accounts-postgres-integration"): PoolQueryClient {
+    return openRoleClient(migrationOwnerRole, migrationOwnerPassword, applicationName);
+  }
+
+  function openAppClient(applicationName = "accounts-app-integration"): PoolQueryClient {
+    return openRoleClient(runtimeRole, runtimePassword, applicationName);
   }
 
   async function waitForAdvisoryWait(applicationName: string): Promise<void> {
@@ -133,13 +159,22 @@ describePostgres("PostgreSQL migration and repository integration", () => {
 
   beforeAll(async () => {
     adminPool = new Pool({ connectionString: DATABASE_URL, max: 1 });
-    await adminPool.query(`CREATE SCHEMA "${schema}"`);
+    await adminPool.query(
+      `CREATE ROLE "${migrationOwnerRole}" LOGIN PASSWORD '${migrationOwnerPassword}' NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`,
+    );
+    await adminPool.query(
+      `CREATE ROLE "${runtimeRole}" LOGIN PASSWORD '${runtimePassword}' NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS`,
+    );
+    await adminPool.query(`CREATE SCHEMA "${schema}" AUTHORIZATION "${migrationOwnerRole}"`);
     client = openClient();
   });
 
   afterAll(async () => {
+    await appClient?.close();
     await client?.close();
     await adminPool?.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    await adminPool?.query(`DROP ROLE IF EXISTS "${runtimeRole}"`);
+    await adminPool?.query(`DROP ROLE IF EXISTS "${migrationOwnerRole}"`);
     await adminPool?.end();
   });
 
@@ -224,11 +259,145 @@ describePostgres("PostgreSQL migration and repository integration", () => {
     );
     expect(tombstoneMigration).toBeDefined();
     await client.execute(tombstoneMigration!.sql);
+    const fullMigration = await new MigrationLedger(client, accountsMigrations()).migrate();
+    expect(
+      fullMigration.plan
+        .filter((item) => !item.migration.id.startsWith("accounts_"))
+        .every((item) => item.state === "pending"),
+    ).toBe(true);
+    const runtimeGrant = await grantAccountsRuntimeRole(client, runtimeRole);
+    expect(runtimeGrant).toEqual({
+      owner: migrationOwnerRole,
+      role: runtimeRole,
+      schema,
+    });
+    expect(await grantAccountsRuntimeRole(client, runtimeRole)).toEqual(runtimeGrant);
+    appClient = openAppClient();
     expect(
       await client.get<{ table_name: string | null }>(
         "SELECT to_regclass('custom_tool_tombstones')::text AS table_name",
       ),
     ).toEqual({ table_name: "custom_tool_tombstones" });
+  });
+
+  test("migration owner grants a DML-only runtime role that supports normal server flows", async () => {
+    const role = await appClient.one<{
+      current_user: string;
+      schema_usage: boolean;
+      schema_create: boolean;
+      account_dml: boolean;
+      tombstone_select: boolean;
+      tombstone_insert: boolean;
+      tombstone_delete: boolean;
+      tombstone_update: boolean;
+      ledger_select: boolean;
+      api_key_select: boolean;
+    }>(
+      `SELECT current_user,
+              has_schema_privilege(current_user, current_schema(), 'USAGE') AS schema_usage,
+              has_schema_privilege(current_user, current_schema(), 'CREATE') AS schema_create,
+              has_table_privilege(current_user, 'accounts', 'SELECT,INSERT,UPDATE,DELETE') AS account_dml,
+              has_table_privilege(current_user, 'custom_tool_tombstones', 'SELECT') AS tombstone_select,
+              has_table_privilege(current_user, 'custom_tool_tombstones', 'INSERT') AS tombstone_insert,
+              has_table_privilege(current_user, 'custom_tool_tombstones', 'DELETE') AS tombstone_delete,
+              has_table_privilege(current_user, 'custom_tool_tombstones', 'UPDATE') AS tombstone_update,
+              has_table_privilege(current_user, 'schema_migrations', 'SELECT') AS ledger_select,
+              has_table_privilege(current_user, 'api_keys', 'SELECT') AS api_key_select`,
+    );
+    expect(role).toEqual({
+      current_user: runtimeRole,
+      schema_usage: true,
+      schema_create: false,
+      account_dml: true,
+      tombstone_select: true,
+      tombstone_insert: true,
+      tombstone_delete: true,
+      tombstone_update: false,
+      ledger_select: true,
+      api_key_select: true,
+    });
+    expect(
+      await client.one<{
+        schema_usage: boolean;
+        schema_create: boolean;
+        account_select: boolean;
+        tombstone_select: boolean;
+      }>(
+        `SELECT has_schema_privilege('public', $1, 'USAGE') AS schema_usage,
+                has_schema_privilege('public', $1, 'CREATE') AS schema_create,
+                has_table_privilege('public', $2, 'SELECT') AS account_select,
+                has_table_privilege('public', $3, 'SELECT') AS tombstone_select`,
+        [schema, `${schema}.accounts`, `${schema}.custom_tool_tombstones`],
+      ),
+    ).toEqual({
+      schema_usage: false,
+      schema_create: false,
+      account_select: false,
+      tombstone_select: false,
+    });
+    await expect(appClient.execute("CREATE TABLE forbidden_runtime_ddl (id int)")).rejects.toThrow(
+      /permission denied for schema/,
+    );
+
+    const functions = await client.many<{
+      proname: string;
+      owner: string;
+      security_definer: boolean;
+      config: string[];
+      public_execute: boolean;
+      runtime_execute: boolean;
+    }>(
+      `SELECT p.proname,
+              pg_get_userbyid(p.proowner) AS owner,
+              p.prosecdef AS security_definer,
+              p.proconfig AS config,
+              has_function_privilege('public', p.oid, 'EXECUTE') AS public_execute,
+              has_function_privilege($1, p.oid, 'EXECUTE') AS runtime_execute
+         FROM pg_catalog.pg_proc AS p
+         JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace
+        WHERE n.nspname = $2
+          AND p.proname = ANY($3::text[])
+        ORDER BY p.proname`,
+      [
+        runtimeRole,
+        schema,
+        [
+          "accounts_guard_removed_custom_tool",
+          "custom_tool_registration_reactivate",
+          "custom_tool_registration_tombstone",
+          "custom_tool_tombstone_guard",
+        ],
+      ],
+    );
+    expect(functions).toHaveLength(4);
+    for (const fn of functions) {
+      expect(fn.owner).toBe(migrationOwnerRole);
+      expect(fn.security_definer).toBe(false);
+      expect(fn.config).toEqual([`search_path=pg_catalog, ${schema}`]);
+      expect(fn.public_execute).toBe(false);
+      expect(fn.runtime_execute).toBe(false);
+    }
+
+    expect((await readMigrationStatus(appClient)).pending).toEqual([]);
+    const repo = new AccountsRepo(appClient);
+    await repo.addCustomTool({
+      id: "runtime-role-tool",
+      label: "Runtime Role Tool",
+      envVar: "RUNTIME_ROLE_HOME",
+      defaultDir: "/tmp/runtime-role",
+      bin: "runtime-role",
+    });
+    await repo.create({ tool: "runtime-role-tool", name: "profile" });
+    await repo.setCurrent("runtime-role-tool", "profile");
+    expect((await repo.getCurrent("runtime-role-tool"))?.name).toBe("profile");
+    expect(await repo.remove("runtime-role-tool", "profile")).toBe(true);
+    expect(await repo.removeCustomTool("runtime-role-tool")).toBe(true);
+    expect(
+      await appClient.get<{ id: string }>(
+        "SELECT id FROM custom_tool_tombstones WHERE id = $1",
+        ["runtime-role-tool"],
+      ),
+    ).toEqual({ id: "runtime-role-tool" });
   });
 
   test("legacy migrator is downgrade-guarded; app rollback keeps the new migrator", async () => {
@@ -245,7 +414,10 @@ describePostgres("PostgreSQL migration and repository integration", () => {
     const customToolsIndex = appMigrations.findIndex(
       (migration) => migration.id === "accounts_0003_custom_tools",
     );
-    const legacyMigrations = appMigrations.slice(0, customToolsIndex);
+    const authMigrations = accountsMigrations().filter(
+      (migration) => !migration.id.startsWith("accounts_"),
+    );
+    const legacyMigrations = [...appMigrations.slice(0, customToolsIndex), ...authMigrations];
     const legacyStatus = await readMigrationStatus(client, legacyMigrations);
     expect(legacyStatus.pending).toEqual([]);
     expect(legacyStatus.unknown).toEqual([
@@ -260,9 +432,9 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       new MigrationLedger(client, legacyMigrations).migrate({ dryRun: true }),
     ).rejects.toThrow(/not recognized by this build \(downgrade\?\)/);
 
-    const forward = await new MigrationLedger(client, appMigrations).migrate();
+    const forward = await new MigrationLedger(client, accountsMigrations()).migrate();
     expect(forward.plan.every((item) => item.state === "already_applied")).toBe(true);
-    expect((await readMigrationStatus(client, appMigrations)).pending).toEqual([]);
+    expect((await readMigrationStatus(client, accountsMigrations())).pending).toEqual([]);
 
     await client.execute(
       `INSERT INTO custom_tools (id, definition)
@@ -517,6 +689,119 @@ describePostgres("PostgreSQL migration and repository integration", () => {
         createFirstClient.close(),
         removeSecondClient.close(),
         removeFirstClient.close(),
+        createSecondClient.close(),
+      ]);
+    }
+  });
+
+  test("raw old-server account inserts and tool deletes serialize under the app role", async () => {
+    const createFirstClient = openAppClient("raw-create-first");
+    const deleteSecondClient = openAppClient("raw-delete-second");
+    const deleteFirstClient = openAppClient("raw-delete-first");
+    const createSecondClient = openAppClient("raw-create-second");
+    try {
+      await appClient.execute(
+        "INSERT INTO custom_tools (id, definition) VALUES ($1, $2::jsonb)",
+        [
+          "raw-create-first-tool",
+          JSON.stringify({
+            id: "raw-create-first-tool",
+            label: "Raw Create First",
+            envVar: "RAW_CREATE_FIRST_HOME",
+            defaultDir: "/tmp/raw-create-first",
+            bin: "raw-create-first",
+          }),
+        ],
+      );
+      const [created, deletedAfterCreate] = await runOrderedToolRace(
+        "raw-create-first-tool",
+        "raw-create-first",
+        () =>
+          createFirstClient.execute(
+            "INSERT INTO accounts (tool, name) VALUES ($1, $2)",
+            ["raw-create-first-tool", "profile"],
+          ),
+        "raw-delete-second",
+        () =>
+          deleteSecondClient.execute("DELETE FROM custom_tools WHERE id = $1", [
+            "raw-create-first-tool",
+          ]),
+      );
+      expect(created.status).toBe("fulfilled");
+      expect(deletedAfterCreate.status).toBe("rejected");
+      expect(
+        String(deletedAfterCreate.status === "rejected" ? deletedAfterCreate.reason : ""),
+      ).toContain('cannot remove "raw-create-first-tool": accounts still use this tool');
+      expect(
+        await appClient.get("SELECT tool FROM accounts WHERE tool = $1 AND name = $2", [
+          "raw-create-first-tool",
+          "profile",
+        ]),
+      ).toEqual({ tool: "raw-create-first-tool" });
+      expect(
+        await appClient.get("SELECT id FROM custom_tools WHERE id = $1", [
+          "raw-create-first-tool",
+        ]),
+      ).toEqual({ id: "raw-create-first-tool" });
+      expect(
+        await appClient.get("SELECT id FROM custom_tool_tombstones WHERE id = $1", [
+          "raw-create-first-tool",
+        ]),
+      ).toBeNull();
+
+      await appClient.execute(
+        "INSERT INTO custom_tools (id, definition) VALUES ($1, $2::jsonb)",
+        [
+          "raw-delete-first-tool",
+          JSON.stringify({
+            id: "raw-delete-first-tool",
+            label: "Raw Delete First",
+            envVar: "RAW_DELETE_FIRST_HOME",
+            defaultDir: "/tmp/raw-delete-first",
+            bin: "raw-delete-first",
+          }),
+        ],
+      );
+      const [deleted, createdAfterDelete] = await runOrderedToolRace(
+        "raw-delete-first-tool",
+        "raw-delete-first",
+        () =>
+          deleteFirstClient.execute("DELETE FROM custom_tools WHERE id = $1", [
+            "raw-delete-first-tool",
+          ]),
+        "raw-create-second",
+        () =>
+          createSecondClient.execute(
+            "INSERT INTO accounts (tool, name) VALUES ($1, $2)",
+            ["raw-delete-first-tool", "profile"],
+          ),
+      );
+      expect(deleted.status).toBe("fulfilled");
+      expect(createdAfterDelete.status).toBe("rejected");
+      expect(
+        String(createdAfterDelete.status === "rejected" ? createdAfterDelete.reason : ""),
+      ).toContain('custom tool "raw-delete-first-tool" was explicitly removed');
+      expect(
+        await appClient.get("SELECT tool FROM accounts WHERE tool = $1 AND name = $2", [
+          "raw-delete-first-tool",
+          "profile",
+        ]),
+      ).toBeNull();
+      expect(
+        await appClient.get("SELECT id FROM custom_tools WHERE id = $1", [
+          "raw-delete-first-tool",
+        ]),
+      ).toBeNull();
+      expect(
+        await appClient.get("SELECT id FROM custom_tool_tombstones WHERE id = $1", [
+          "raw-delete-first-tool",
+        ]),
+      ).toEqual({ id: "raw-delete-first-tool" });
+    } finally {
+      await Promise.all([
+        createFirstClient.close(),
+        deleteSecondClient.close(),
+        deleteFirstClient.close(),
         createSecondClient.close(),
       ]);
     }
