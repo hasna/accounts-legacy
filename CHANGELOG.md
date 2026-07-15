@@ -20,7 +20,8 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   configuration is incomplete. Cold custom-tool login/import/launch paths
   hydrate before synchronous lookup.
 - Pull requests run a checksum-pinned gitleaks binary over the complete
-  base-to-head commit range in a read-only, secret-free, fully redacted job.
+  base-to-head commit range with read-only repository permissions and fully
+  redacted output.
 - Deprecated storage exports and CLI commands remain as compatibility shims;
   retired provider-backed sync operations preserve optional environment
   arguments and `--json` parsing, then fail explicitly.
