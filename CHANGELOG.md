@@ -51,7 +51,7 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   credential after Claude confirms dispatch or exits, including launch errors
   and forwarded termination signals. Lock files contain no credential values.
 - Resolve Claude from Windows `PATH`/`PATHEXT`, invoke only resolved `.cmd` and
-  `.bat` shims through `cmd.exe` with control-character rejection and escaped
+  `.bat` shims through `cmd.exe` with line-break rejection and escaped
   arguments, and keep native executables on the direct-spawn path.
 - Keep Claude stdout unmodified, send Accounts diagnostics to stderr, preserve
   Claude exit status, and map forwarded termination signals to nonzero exits.
