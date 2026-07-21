@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolveStore } from "./lib/store.js";
+import { PassThrough } from "node:stream";
+import { resolveStore, type AccountsStore } from "./lib/store.js";
 import { resolveSupervisorLaunch } from "./lib/supervisor.js";
 import { clearCustomToolsCache, getTool } from "./lib/tools.js";
 import { loginToolChoices, prepareLogin } from "./lib/login.js";
@@ -28,6 +29,42 @@ function mockFetch(routes: (call: Call) => { status: number; body: unknown }) {
     });
   }) as unknown as typeof fetch;
   return { calls, fetchImpl };
+}
+
+function deferredRejection() {
+  let reject!: (reason: Error) => void;
+  const promise = new Promise<void>((_resolve, rejectPromise) => {
+    reject = rejectPromise;
+  });
+  // The pre-fix implementation drops the returned promise. Keep the red test
+  // deterministic instead of letting that known bug become an unhandled rejection.
+  void promise.catch(() => {});
+  return { promise, reject };
+}
+
+function trackProfilePersistence(store: AccountsStore, operations: string[]): AccountsStore {
+  return new Proxy(store, {
+    get(target, property, receiver) {
+      if (property === "findProfile") {
+        return (...args: Parameters<AccountsStore["findProfile"]>) => {
+          operations.push("find");
+          return target.findProfile(...args);
+        };
+      }
+      if (property === "addProfile") {
+        return (...args: Parameters<AccountsStore["addProfile"]>) => {
+          operations.push("add");
+          return target.addProfile(...args);
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+function nextEventLoopTurn(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 describe("resolveStore transport selection", () => {
@@ -261,6 +298,110 @@ describe("ApiStore routes registry ops to /v1", () => {
 
       expect(calls.map((c) => c.method + " " + new URL(c.url).pathname)).toEqual(["GET /v1/tools"]);
       expect(existsSync(join(home, "profiles", "acme", "new-invalid"))).toBe(false);
+    });
+
+    test("delayed login validation rejects before local find, add, profile directory, or tool lock", async () => {
+      const tool = { ...acme, id: "async-local", bin: process.execPath };
+      const baseStore = resolveStore({
+        ACCOUNTS_HOME: home,
+        HASNA_ACCOUNTS_STORAGE_MODE: "local",
+      } as NodeJS.ProcessEnv);
+      await baseStore.addTool(tool);
+      const operations: string[] = [];
+      const store = trackProfilePersistence(baseStore, operations);
+      const validation = deferredRejection();
+      let markValidationStarted!: () => void;
+      const validationStarted = new Promise<void>((resolve) => {
+        markValidationStarted = resolve;
+      });
+
+      const preparation = prepareLogin("new-async-local", {
+        toolId: tool.id,
+        env: process.env,
+        store,
+        validateTool: () => {
+          markValidationStarted();
+          return validation.promise;
+        },
+      });
+      await validationStarted;
+      await nextEventLoopTurn();
+      const profileDir = join(home, "profiles", tool.id, "new-async-local");
+      const stateBeforeRejection = {
+        operations: [...operations],
+        profileDirectoryExists: existsSync(profileDir),
+        profileExists: loadMachineStore().profiles.some((profile) => profile.name === "new-async-local"),
+        toolLock: loadMachineStore().toolLocks?.["new-async-local"],
+      };
+
+      validation.reject(new Error("delayed permission rejection"));
+      expect(stateBeforeRejection.operations).toEqual([]);
+      expect(stateBeforeRejection.profileDirectoryExists).toBe(false);
+      expect(stateBeforeRejection.toolLock).toBeUndefined();
+      expect(stateBeforeRejection.profileExists).toBe(false);
+      await expect(preparation).rejects.toThrow("delayed permission rejection");
+    });
+
+    test("delayed validation on unavailable keep rejects before API profile persistence", async () => {
+      const unavailableTool = { ...acme, bin: join(home, "missing-acme") };
+      const { calls, fetchImpl } = mockFetch((c) => {
+        if (c.url.endsWith("/tools")) {
+          return { status: 200, body: { tools: [{ ...unavailableTool, builtin: false }] } };
+        }
+        if (c.method === "GET" && c.url.includes("/accounts")) {
+          return c.url.includes("/accounts?")
+            ? { status: 200, body: { accounts: [] } }
+            : { status: 404, body: { error: "not found" } };
+        }
+        if (c.method === "POST" && c.url.endsWith("/accounts")) {
+          return {
+            status: 201,
+            body: {
+              tool: "acme",
+              name: "new-async-api",
+              dir: join(home, "profiles", "acme", "new-async-api"),
+              createdAt: "2020-01-01T00:00:00Z",
+            },
+          };
+        }
+        return { status: 500, body: { error: "unexpected request" } };
+      });
+      const operations: string[] = [];
+      const store = trackProfilePersistence(resolveStore(cloudEnv, { fetchImpl }), operations);
+      const validation = deferredRejection();
+      let markValidationStarted!: () => void;
+      const validationStarted = new Promise<void>((resolve) => {
+        markValidationStarted = resolve;
+      });
+      const input = new PassThrough();
+      const output = new PassThrough();
+      input.end("2\n");
+
+      const preparation = prepareLogin("new-async-api", {
+        toolId: "acme",
+        env: process.env,
+        forceInteractive: true,
+        input: input as unknown as NodeJS.ReadStream,
+        output: output as unknown as NodeJS.WriteStream,
+        store,
+        validateTool: () => {
+          markValidationStarted();
+          return validation.promise;
+        },
+      });
+      await validationStarted;
+      await nextEventLoopTurn();
+      const stateBeforeRejection = {
+        operations: [...operations],
+        hasApiPost: calls.some((call) => call.method === "POST"),
+        profileDirectoryExists: existsSync(join(home, "profiles", "acme", "new-async-api")),
+      };
+
+      validation.reject(new Error("delayed keep rejection"));
+      expect(stateBeforeRejection.operations).toEqual([]);
+      expect(stateBeforeRejection.hasApiPost).toBe(false);
+      expect(stateBeforeRejection.profileDirectoryExists).toBe(false);
+      await expect(preparation).rejects.toThrow("delayed keep rejection");
     });
 
     test("cold import resolves a cloud custom tool", async () => {

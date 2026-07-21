@@ -18,6 +18,10 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   commands that accept native arguments (not `login`).
 - Login and permissions CLI subprocess tests explicitly use local Accounts
   storage instead of inheriting a station-level cloud/API mode.
+- Login preparation awaits synchronous or asynchronous selected-tool validation
+  before profile lookup, creation, tool locking, or API persistence.
+- The default Bun test preload neutralizes inherited station Accounts cloud/API
+  configuration while explicit cloud fixtures remain supported.
 - Compatible transitive overrides keep the MCP SDK graph on patched
   `body-parser` and Hono releases; the lockfile now passes `bun audit` without
   changing the package version.
