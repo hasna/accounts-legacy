@@ -45,6 +45,8 @@ export interface PrepareLoginOptions {
   output?: NodeJS.WriteStream;
   env?: NodeJS.ProcessEnv;
   forceInteractive?: boolean;
+  /** Validate the final selected tool before creating a profile or tool lock. */
+  validateTool?: (tool: ToolDef) => void;
   /** Registry store to route reads/writes through (defaults to `resolveStore()`). */
   store?: AccountsStore;
 }
@@ -344,6 +346,7 @@ export async function prepareLogin(name: string, opts: PrepareLoginOptions = {})
     while (true) {
       const availability = detectToolAvailability(tool, opts.env);
       if (availability.available) {
+        opts.validateTool?.(tool);
         const profile = await existingOrCreateProfile(name, tool, store);
         return {
           status: "ready",
@@ -359,6 +362,7 @@ export async function prepareLogin(name: string, opts: PrepareLoginOptions = {})
         continue;
       }
       if (action === "keep") {
+        opts.validateTool?.(tool);
         const profile = await existingOrCreateProfile(name, tool, store);
         return {
           status: "stopped",

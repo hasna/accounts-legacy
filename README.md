@@ -262,7 +262,9 @@ YOLO mode flags. Unsupported tools fail with a list of configured presets.
 Historical Claude invocations may also pass `--dangerously-skip-permissions`
 directly to `accounts login` or `accounts launch`; this Claude-only compatibility
 form is equivalent to `--permissions dangerous`. Do not combine permission
-forms. Raw tool arguments remain available after `--`.
+forms. Commands with native argument lists, including `launch`, `run`, and
+switching commands, continue to accept raw tool arguments after `--`; `login`
+does not accept raw native-argument passthrough.
 
 ## Shell hook (optional)
 

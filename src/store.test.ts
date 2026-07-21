@@ -238,6 +238,31 @@ describe("ApiStore routes registry ops to /v1", () => {
       expect(calls[0]!.url).toBe(`${BASE}/v1/tools`);
     });
 
+    test("login validation rejects a cloud custom tool before profile creation", async () => {
+      const executableTool = { ...acme, bin: process.execPath };
+      const { calls, fetchImpl } = mockFetch((c) => {
+        if (c.url.endsWith("/tools")) {
+          return { status: 200, body: { tools: [{ ...executableTool, builtin: false }] } };
+        }
+        return { status: 500, body: { error: "unexpected mutation" } };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+
+      await expect(
+        prepareLogin("new-invalid", {
+          toolId: "acme",
+          env: process.env,
+          store,
+          validateTool: () => {
+            throw new Error("permission rejected");
+          },
+        }),
+      ).rejects.toThrow("permission rejected");
+
+      expect(calls.map((c) => c.method + " " + new URL(c.url).pathname)).toEqual(["GET /v1/tools"]);
+      expect(existsSync(join(home, "profiles", "acme", "new-invalid"))).toBe(false);
+    });
+
     test("cold import resolves a cloud custom tool", async () => {
       const source = join(home, "source");
       mkdirSync(source, { recursive: true });

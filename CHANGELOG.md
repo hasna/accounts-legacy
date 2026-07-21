@@ -14,9 +14,13 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 - Historical Claude `login` and `launch` invocations accept the direct
   `--dangerously-skip-permissions` compatibility flag without requiring `--`.
   Other tools and conflicting permission inputs fail before configs or tool
-  launch, while standalone raw `-- ...` passthrough remains unchanged.
+  launch, while standalone raw `-- ...` passthrough remains unchanged on
+  commands that accept native arguments (not `login`).
 - Login and permissions CLI subprocess tests explicitly use local Accounts
   storage instead of inheriting a station-level cloud/API mode.
+- Compatible transitive overrides keep the MCP SDK graph on patched
+  `body-parser` and Hono releases; the lockfile now passes `bun audit` without
+  changing the package version.
 
 ## [0.2.8] - 2026-07-15
 

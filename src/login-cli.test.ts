@@ -170,6 +170,14 @@ function readStore() {
   };
 }
 
+function expectNoProfileState(name: string, tool: string) {
+  expect(existsSync(join(home, "profiles", tool, name))).toBe(false);
+  if (!existsSync(join(home, "accounts.json"))) return;
+  const store = readStore();
+  expect(store.profiles?.some((profile) => profile.name === name && profile.tool === tool)).toBe(false);
+  expect(store.toolLocks?.[name]).toBeUndefined();
+}
+
 test("login forwards documented and native-compatible Claude dangerous permissions", () => {
   writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude", 23);
   expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
@@ -207,6 +215,56 @@ test("login rejects unsupported and duplicate permission inputs before launching
   expect(duplicate.status).toBe(1);
   expect(duplicate.stderr).toContain("cannot be combined");
   expect(readLogEntries()).toEqual([]);
+});
+
+test("duplicate permissions for a nonexistent login do not create profile state", () => {
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
+
+  const result = runCli(
+    "login",
+    "new-duplicate",
+    "--tool",
+    "claude",
+    "--permissions",
+    "dangerous",
+    "--dangerously-skip-permissions",
+  );
+
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain("cannot be combined");
+  expectNoProfileState("new-duplicate", "claude");
+  expect(readLogEntries()).toEqual([]);
+});
+
+test("unsupported permissions for an interactively selected new login do not create profile state", () => {
+  writeFakeTool("opencode", "OPENCODE_CONFIG_DIR", "opencode");
+
+  const result = runCliWith(["login", "new-unsupported", "--permissions", "dangerous"], {
+    input: "opencode\n",
+    env: { ACCOUNTS_FORCE_INTERACTIVE: "1" },
+    path: binDir,
+  });
+
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain('tool "opencode" does not support permissions "dangerous"');
+  expectNoProfileState("new-unsupported", "opencode");
+  expect(readLogEntries()).toEqual([]);
+});
+
+test("valid permissions survive interactive tool selection for a new login", () => {
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude", 23);
+
+  const result = runCliWith(["login", "new-valid", "--permissions", "dangerous"], {
+    input: "claude\n",
+    env: { ACCOUNTS_FORCE_INTERACTIVE: "1" },
+    path: binDir,
+  });
+
+  expect(result.status).toBe(23);
+  expect(readLogEntries().map((entry) => entry.args)).toEqual(["--dangerously-skip-permissions"]);
+  const store = readStore();
+  expect(store.profiles?.some((profile) => profile.name === "new-valid" && profile.tool === "claude")).toBe(true);
+  expect(store.toolLocks?.["new-valid"]).toBe("claude");
 });
 
 test("launch syncs Claude profile credentials into keychain before spawning", () => {

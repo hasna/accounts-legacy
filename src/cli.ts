@@ -305,15 +305,24 @@ interface PermissionCliOptions {
 
 const CLAUDE_DANGEROUS_PERMISSION_ARG = "--dangerously-skip-permissions";
 
-function resolveCliPermissionPreset(
-  tool: ToolDef,
-  opts: PermissionCliOptions,
-  passthroughArgs: string[] = [],
-): string | undefined {
-  const hasNativePassthrough = tool.id === "claude" && passthroughArgs.includes(CLAUDE_DANGEROUS_PERMISSION_ARG);
+function validateCliPermissionSyntax(opts: PermissionCliOptions): void {
   if (opts.dangerouslySkipPermissions && opts.permissions) {
     throw new AccountsError(`${CLAUDE_DANGEROUS_PERMISSION_ARG} cannot be combined with --permissions`);
   }
+}
+
+interface ResolvedCliPermissions {
+  preset?: string;
+  args: string[];
+}
+
+function resolveCliPermissions(
+  tool: ToolDef,
+  opts: PermissionCliOptions,
+  passthroughArgs: string[] = [],
+): ResolvedCliPermissions {
+  validateCliPermissionSyntax(opts);
+  const hasNativePassthrough = tool.id === "claude" && passthroughArgs.includes(CLAUDE_DANGEROUS_PERMISSION_ARG);
   if (opts.dangerouslySkipPermissions && hasNativePassthrough) {
     throw new AccountsError(`${CLAUDE_DANGEROUS_PERMISSION_ARG} cannot be supplied both directly and after --`);
   }
@@ -325,8 +334,7 @@ function resolveCliPermissionPreset(
   }
 
   const preset = opts.dangerouslySkipPermissions ? "dangerous" : opts.permissions;
-  permissionArgsFor(tool, preset);
-  return preset;
+  return { preset, args: permissionArgsFor(tool, preset) };
 }
 
 interface ConfigsCliOptions {
@@ -612,17 +620,27 @@ program
   .option("--dangerously-skip-permissions", "compatibility alias for Claude --permissions dangerous")
   .action(
     action(async (name: string, opts: { tool?: string } & PermissionCliOptions) => {
+      validateCliPermissionSyntax(opts);
       const store = resolveStore();
-      const prepared = await prepareLogin(name, { toolId: opts.tool, input: process.stdin, output: process.stderr, env: process.env, store });
+      let permissionArgs: string[] = [];
+      const prepared = await prepareLogin(name, {
+        toolId: opts.tool,
+        input: process.stdin,
+        output: process.stderr,
+        env: process.env,
+        validateTool: (tool) => {
+          permissionArgs = resolveCliPermissions(tool, opts).args;
+        },
+        store,
+      });
       if (prepared.status === "stopped") {
         console.error(chalk.yellow(prepared.message));
         console.error(chalk.dim(`Selected tool kept: ${prepared.tool.id}`));
         process.exit(1);
       }
       const { profile, tool, args: baseLoginArgs } = prepared;
-      const permissions = resolveCliPermissionPreset(tool, opts);
       const loginArgs = [
-        ...permissionArgsFor(tool, permissions).filter((arg) => !baseLoginArgs.includes(arg)),
+        ...permissionArgs.filter((arg) => !baseLoginArgs.includes(arg)),
         ...baseLoginArgs,
       ];
       const env = profileEnv(profile, tool);
@@ -857,7 +875,7 @@ addConfigsOptions(program
       const store = resolveStore();
       const profile = await store.getProfile(name, opts.tool);
       const tool = getTool(profile.tool);
-      const permissions = resolveCliPermissionPreset(tool, opts, args);
+      const { preset: permissions } = resolveCliPermissions(tool, opts, args);
       const plan = planClaudeLaunch(tool, args, opts);
       runConfigsPrelaunch(profile, tool, configsPrelaunchOptions(opts));
       const env = profileEnv(profile, tool);
