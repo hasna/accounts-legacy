@@ -26,6 +26,7 @@ export const APP_MIGRATION_FILES = [
   "0005_custom_tool_tombstones.sql",
   "0006_current_selection_revisions.sql",
   "0007_login_operation_rollback_state.sql",
+  "0008_account_incarnations.sql",
 ] as const;
 
 function moduleDir(): string {

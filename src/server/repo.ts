@@ -8,7 +8,12 @@
 
 import { AccountsError, type ToolDef, toolDefSchema } from "../types.js";
 import type { PoolQueryClient, TypedQueryClient } from "../generated/storage-kit/index.js";
-import type { CreateAccountInput, RestoreAccountInput, UpdateAccountInput } from "./schema.js";
+import type {
+  CreateAccountInput,
+  LoginUpdateAccountInput,
+  RestoreAccountInput,
+  UpdateAccountInput,
+} from "./schema.js";
 
 export interface Account {
   tool: string;
@@ -21,6 +26,7 @@ export interface Account {
   dir?: string;
   description?: string;
   createdAt: string;
+  incarnationId: string;
   lastUsedAt?: string;
 }
 
@@ -43,13 +49,19 @@ export interface AccountsStore {
   get(tool: string, name: string): Promise<Account | null>;
   create(input: CreateAccountInput): Promise<Account>;
   update(tool: string, name: string, input: UpdateAccountInput): Promise<Account>;
+  updateForLogin(tool: string, name: string, input: LoginUpdateAccountInput): Promise<Account>;
   restoreProfile(tool: string, name: string, input: RestoreAccountInput): Promise<Account>;
   rename(tool: string, oldName: string, newName: string): Promise<Account>;
   remove(tool: string, name: string): Promise<boolean>;
   listCurrent(): Promise<CurrentSelection[]>;
   getCurrent(tool: string): Promise<CurrentSelection | null>;
   setCurrent(tool: string, name: string): Promise<CurrentSelection>;
-  setCurrentForLogin(tool: string, name: string, operationId: string): Promise<LoginCurrentSelection>;
+  setCurrentForLogin(
+    tool: string,
+    name: string,
+    operationId: string,
+    expectedIncarnationId?: string,
+  ): Promise<LoginCurrentSelection>;
   restoreCurrent(
     tool: string,
     expectedName: string,
@@ -80,6 +92,7 @@ interface AccountRow {
   dir: string | null;
   description: string | null;
   created_at: string | Date;
+  incarnation_id: string;
   last_used_at: string | Date | null;
 }
 
@@ -109,6 +122,7 @@ function rowToAccount(row: AccountRow): Account {
     name: row.name,
     metadata: parseMetadata(row.metadata),
     createdAt: iso(row.created_at) ?? new Date(0).toISOString(),
+    incarnationId: row.incarnation_id,
   };
   if (row.email !== null) account.email = row.email;
   if (row.display_name !== null) account.displayName = row.display_name;
@@ -252,6 +266,26 @@ export class AccountsRepo implements AccountsStore {
     return rowToAccount(row);
   }
 
+  async updateForLogin(tool: string, name: string, input: LoginUpdateAccountInput): Promise<Account> {
+    const row = await this.client.get<AccountRow>(
+      `UPDATE accounts
+          SET email = $1
+        WHERE tool = $2 AND name = $3 AND incarnation_id = $4::uuid
+          AND email IS NOT DISTINCT FROM $5
+        RETURNING *`,
+      [input.email, tool, name, input.expectedIncarnationId, input.expectedEmail],
+    );
+    if (row) return rowToAccount(row);
+    const current = await this.get(tool, name);
+    if (!current) throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
+    if (current.incarnationId !== input.expectedIncarnationId) {
+      throw new AccountsError("profile changed while login finalization was in progress");
+    }
+    // A same-incarnation concurrent email edit won the compare-and-set. Return
+    // it unchanged so the client records no rollback ownership.
+    return current;
+  }
+
   async rename(tool: string, oldName: string, newName: string): Promise<Account> {
     return this.client.transaction(async (client) => {
       const existing = await this.getWith(client, tool, oldName, { forUpdate: true });
@@ -285,13 +319,18 @@ export class AccountsRepo implements AccountsStore {
       params.push(input.lastUsedAt.expected, input.lastUsedAt.restore);
       index += 2;
     }
-    params.push(tool, name);
+    params.push(tool, name, input.expectedIncarnationId);
     const row = await this.client.get<AccountRow>(
-      `UPDATE accounts SET ${sets.join(", ")} WHERE tool = $${index} AND name = $${index + 1} RETURNING *`,
+      `UPDATE accounts SET ${sets.join(", ")} ` +
+      `WHERE tool = $${index} AND name = $${index + 1} AND incarnation_id = $${index + 2}::uuid RETURNING *`,
       params,
     );
-    if (!row) throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
-    return rowToAccount(row);
+    if (row) return rowToAccount(row);
+    // A replacement incarnation is a successful no-op: rollback did not own
+    // it and must not turn the original login failure into a second error.
+    const current = await this.getWith(this.client, tool, name);
+    if (!current) throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
+    return current;
   }
 
   async remove(tool: string, name: string): Promise<boolean> {
@@ -364,6 +403,7 @@ export class AccountsRepo implements AccountsStore {
     tool: string,
     name: string,
     operationId: string,
+    expectedIncarnationId?: string,
   ): Promise<LoginCurrentSelection> {
     return this.client.transaction(async (client) => {
       // Serialize duplicate operation IDs independently of the mutable current
@@ -378,10 +418,11 @@ export class AccountsRepo implements AccountsStore {
         updated_at: string | Date | null;
         revision: string | number | null;
         previous_name: string | null;
+        previous_incarnation_id: string | null;
         previous_target_last_used_at: string | Date | null;
       }>(
         `SELECT operation_id, tool, name, state, updated_at, revision,
-                previous_name, previous_target_last_used_at
+                previous_name, previous_incarnation_id, previous_target_last_used_at
            FROM current_login_operations
           WHERE operation_id = $1`,
         [operationId],
@@ -395,6 +436,12 @@ export class AccountsRepo implements AccountsStore {
         }
         if (completed.updated_at === null || completed.revision === null) {
           throw new AccountsError("completed login operation is missing its activation result");
+        }
+        if (expectedIncarnationId) {
+          const account = await this.getWith(client, tool, name, { forUpdate: true });
+          if (!account || account.incarnationId !== expectedIncarnationId) {
+            throw new AccountsError("profile changed while login activation was in progress");
+          }
         }
         return {
           tool: completed.tool,
@@ -410,8 +457,15 @@ export class AccountsRepo implements AccountsStore {
       }
       const account = await this.getWith(client, tool, name, { forUpdate: true });
       if (!account) throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
-      const displaced = await client.get<{ name: string }>(
-        "SELECT name FROM current_selections WHERE tool = $1 FOR UPDATE",
+      if (expectedIncarnationId && account.incarnationId !== expectedIncarnationId) {
+        throw new AccountsError("profile changed while login activation was in progress");
+      }
+      const displaced = await client.get<{ name: string; incarnation_id: string }>(
+        `SELECT current.name, account.incarnation_id
+           FROM current_selections AS current
+           JOIN accounts AS account ON account.tool = current.tool AND account.name = current.name
+          WHERE current.tool = $1
+          FOR UPDATE OF current`,
         [tool],
       );
       const row = await client.one<{
@@ -440,8 +494,9 @@ export class AccountsRepo implements AccountsStore {
       );
       await client.execute(
         `INSERT INTO current_login_operations
-           (operation_id, tool, name, state, updated_at, revision, previous_name, previous_target_last_used_at)
-         VALUES ($1::uuid, $2, $3, 'completed', $4::timestamptz, $5::bigint, $6, $7::timestamptz)`,
+           (operation_id, tool, name, state, updated_at, revision, previous_name,
+            previous_incarnation_id, previous_target_last_used_at)
+         VALUES ($1::uuid, $2, $3, 'completed', $4::timestamptz, $5::bigint, $6, $7::uuid, $8::timestamptz)`,
         [
           operationId,
           row.tool,
@@ -449,6 +504,7 @@ export class AccountsRepo implements AccountsStore {
           iso(row.updated_at),
           String(row.revision),
           displaced?.name ?? null,
+          displaced?.incarnation_id ?? null,
           account.lastUsedAt ?? null,
         ],
       );
@@ -558,9 +614,11 @@ export class AccountsRepo implements AccountsStore {
         state: "completed" | "cancelled";
         updated_at: string | Date | null;
         previous_name: string | null;
+        previous_incarnation_id: string | null;
         previous_target_last_used_at: string | Date | null;
       }>(
-        `SELECT tool, name, state, updated_at, previous_name, previous_target_last_used_at
+        `SELECT tool, name, state, updated_at, previous_name, previous_incarnation_id,
+                previous_target_last_used_at
            FROM current_login_operations
           WHERE operation_id = $1::uuid`,
         [operationId],
@@ -591,7 +649,13 @@ export class AccountsRepo implements AccountsStore {
       const requiredNames = previousName ? [expectedName, previousName] : [expectedName];
       const lockedNames = await this.lockAccounts(client, tool, requiredNames);
       if (!lockedNames.has(expectedName)) return false;
-      const restoreName = previousName && lockedNames.has(previousName) ? previousName : undefined;
+      const restoreAccount = previousName && lockedNames.has(previousName)
+        ? await this.getWith(client, tool, previousName)
+        : null;
+      const restoreName = previousName &&
+        restoreAccount?.incarnationId === operation.previous_incarnation_id
+        ? previousName
+        : undefined;
       const owned = await client.get<{ updated_at: string | Date }>(
         `SELECT updated_at
            FROM current_selections

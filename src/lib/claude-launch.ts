@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
   existsSync,
@@ -13,10 +13,10 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { delimiter, extname, isAbsolute, join } from "node:path";
+import { delimiter, extname, isAbsolute, join, resolve } from "node:path";
 import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
-import { claudeKeychainCredentialFromProfile } from "./claude-auth.js";
+import { claudeKeychainCredentialFromProfile, prepareClaudeProfileKeychain } from "./claude-auth.js";
 import {
   captureClaudeKeychain,
   keychainSupported,
@@ -228,7 +228,7 @@ function keychainLockPath(): string {
     return process.env.ACCOUNTS_TEST_KEYCHAIN_LOCK_PATH;
   }
   const uid = typeof process.getuid === "function" ? process.getuid() : "user";
-  return join(tmpdir(), `accounts-claude-keychain-${uid}.lock`);
+  return join(process.platform === "win32" ? tmpdir() : "/tmp", `accounts-claude-keychain-${uid}.lock`);
 }
 
 function processAlive(pid: number): boolean {
@@ -245,12 +245,60 @@ function sleep(ms: number): Promise<void> {
 }
 
 export async function acquireClaudeKeychainLock(signal?: AbortSignal): Promise<() => void> {
-  const path = keychainLockPath();
+  return acquireClaudeProcessLock(
+    keychainLockPath(),
+    "Claude keychain",
+    "ACCOUNTS_TEST_KEYCHAIN_LOCK_TIMEOUT_MS",
+    signal,
+  );
+}
+
+/** Perform one standalone profile-to-keychain write under the shared lease. */
+export async function prepareClaudeProfileKeychainLocked(
+  profileDir: string,
+  tool: ToolDef,
+  profileName?: string,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (tool.id !== "claude" || !keychainSupported()) return false;
+  const release = await acquireClaudeKeychainLock(signal);
+  try {
+    return prepareClaudeProfileKeychain(profileDir, tool, profileName);
+  } finally {
+    release();
+  }
+}
+
+function profileLoginLockPath(profileDir: string): string {
+  const uid = typeof process.getuid === "function" ? process.getuid() : "user";
+  const identity = createHash("sha256").update(resolve(profileDir)).digest("hex").slice(0, 32);
+  return join(process.platform === "win32" ? tmpdir() : "/tmp", `accounts-claude-login-${uid}-${identity}.lock`);
+}
+
+/** Serialize interactive login children for one profile without blocking apply. */
+export async function acquireClaudeProfileLoginLock(
+  profileDir: string,
+  signal?: AbortSignal,
+): Promise<() => void> {
+  return acquireClaudeProcessLock(
+    profileLoginLockPath(profileDir),
+    "Claude profile login",
+    "ACCOUNTS_TEST_PROFILE_LOGIN_LOCK_TIMEOUT_MS",
+    signal,
+  );
+}
+
+async function acquireClaudeProcessLock(
+  path: string,
+  label: string,
+  timeoutSetting: string,
+  signal?: AbortSignal,
+): Promise<() => void> {
   const token = `${process.pid}:${randomUUID()}`;
-  const deadline = Date.now() + numericTestSetting("ACCOUNTS_TEST_KEYCHAIN_LOCK_TIMEOUT_MS", 600_000);
+  const deadline = Date.now() + numericTestSetting(timeoutSetting, 600_000);
 
   while (true) {
-    if (signal?.aborted) throw new AccountsError("interrupted while waiting for the Claude keychain lock");
+    if (signal?.aborted) throw new AccountsError(`interrupted while waiting for the ${label} lock`);
     const candidate = `${path}.candidate-${process.pid}-${randomUUID()}`;
     let candidateFd: number | undefined;
     let published = false;
@@ -280,7 +328,7 @@ export async function acquireClaudeKeychainLock(signal?: AbortSignal): Promise<(
       }
     } catch (error) {
       const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
-      if (code !== "EEXIST") throw new AccountsError(`failed to acquire Claude keychain lock: ${redactText(String(error))}`);
+      if (code !== "EEXIST") throw new AccountsError(`failed to acquire ${label} lock: ${redactText(String(error))}`);
     } finally {
       if (candidateFd !== undefined) closeSync(candidateFd);
       rmSync(candidate, { force: true });
@@ -289,24 +337,24 @@ export async function acquireClaudeKeychainLock(signal?: AbortSignal): Promise<(
     try {
       const stat = lstatSync(path);
       if (!stat.isFile() || stat.isSymbolicLink()) {
-        throw new AccountsError(`invalid Claude keychain lock at ${path}; refusing unsafe reclaim`);
+        throw new AccountsError(`invalid ${label} lock at ${path}; refusing unsafe reclaim`);
       }
       const ownerText = readFileSync(path, "utf8").trim();
       const match = ownerText.match(/^([1-9]\d*):([^:\r\n]+)$/);
       const owner = match ? Number(match[1]) : Number.NaN;
       if (!Number.isSafeInteger(owner)) {
-        throw new AccountsError(`invalid Claude keychain lock at ${path}; refusing unsafe reclaim`);
+        throw new AccountsError(`invalid ${label} lock at ${path}; refusing unsafe reclaim`);
       }
       if (!processAlive(owner)) {
-        throw new AccountsError(`stale Claude keychain lock at ${path}; refusing automatic reclaim without proven ownership`);
+        throw new AccountsError(`stale ${label} lock at ${path}; refusing automatic reclaim without proven ownership`);
       }
     } catch (error) {
       if (error instanceof AccountsError) throw error;
       const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
       if (code === "ENOENT") continue;
-      throw new AccountsError(`failed to inspect Claude keychain lock: ${redactText(String(error))}`);
+      throw new AccountsError(`failed to inspect ${label} lock: ${redactText(String(error))}`);
     }
-    if (Date.now() >= deadline) throw new AccountsError("timed out waiting for the Claude keychain lock");
+    if (Date.now() >= deadline) throw new AccountsError(`timed out waiting for the ${label} lock`);
     await sleep(25);
   }
 }

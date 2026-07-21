@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, linkSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -90,6 +90,24 @@ test("an unverifiable same-PID lock fails closed instead of stealing across modu
   expect(existsSync(lock)).toBe(true);
 });
 
+test("empty and malformed registry locks remain fail-closed regardless of age", () => {
+  const lock = join(accountsHome(), ".store.lock");
+  for (const contents of [
+    "",
+    "malformed-owner\n",
+    "v2:999999999\n",
+    "999999999:anything\n",
+    "1e9\n",
+  ]) {
+    writeFileSync(lock, contents, { mode: 0o600 });
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(lock, old, old);
+    expect(() => withStoreLock(() => "unsafe", 50)).toThrow(/timed out waiting/);
+    expect(existsSync(lock)).toBe(true);
+    rmSync(lock, { force: true });
+  }
+});
+
 test("registry lock timeout is checked before every acquisition attempt", () => {
   expect(() => withStoreLock(() => "unsafe", 0)).toThrow(/timed out waiting/);
   expect(existsSync(join(accountsHome(), ".store.lock"))).toBe(false);
@@ -151,7 +169,11 @@ test("registry acquisition reclaims a live reused PID with a different portable 
   const child = spawn(process.execPath, ["-e", "await Bun.sleep(10_000)"], { stdio: "ignore" });
   if (!child.pid) throw new Error("test child did not expose a pid");
   const lock = join(accountsHome(), ".store.lock");
-  writeFileSync(lock, `v2:${child.pid}:darwin-old-process-start:old-token\n`, { mode: 0o600 });
+  writeFileSync(
+    lock,
+    `v2:${child.pid}:darwin-old-process-start:00000000-0000-4000-8000-000000000000\n`,
+    { mode: 0o600 },
+  );
   process.env.ACCOUNTS_TEST_PROCESS_START_ID = `${child.pid}:darwin-new-process-start`;
   try {
     expect(withStoreLock(() => "acquired", 100)).toBe("acquired");
@@ -275,6 +297,9 @@ test("raw machine pointers survive cloud-only profiles and reconcile rename/remo
     version: 1,
     current: { acme: "old" },
     applied: { acme: "old" },
+    profileAuthRevisions: { "acme/old": "old-auth-generation" },
+    profileAuthCommitRevisions: { "acme/old": "old-auth-commit" },
+    profileAuthIncarnations: { "acme/old": "old-auth-incarnation" },
     toolLocks: { old: "acme" },
     profiles: [],
     tools: [],
@@ -286,11 +311,20 @@ test("raw machine pointers survive cloud-only profiles and reconcile rename/remo
   reconcileMachineProfileRename("acme", "old", "new");
   expect(loadMachineStore().current).toEqual({ acme: "new" });
   expect(loadMachineStore().applied).toEqual({ acme: "new" });
+  expect(loadMachineStore().profileAuthRevisions["acme/old"]).toBeUndefined();
+  expect(loadMachineStore().profileAuthRevisions["acme/new"]).toBe("old-auth-generation");
+  expect(loadMachineStore().profileAuthCommitRevisions["acme/old"]).toBeUndefined();
+  expect(loadMachineStore().profileAuthCommitRevisions["acme/new"]).toBe("old-auth-commit");
+  expect(loadMachineStore().profileAuthIncarnations["acme/old"]).toBeUndefined();
+  expect(loadMachineStore().profileAuthIncarnations["acme/new"]).toBe("old-auth-incarnation");
   expect(loadMachineStore().toolLocks).toEqual({ new: "acme" });
 
   reconcileMachineProfileRemove("acme", "new");
   expect(loadMachineStore().current).toEqual({});
   expect(loadMachineStore().applied).toEqual({});
+  expect(loadMachineStore().profileAuthRevisions).toEqual({});
+  expect(loadMachineStore().profileAuthCommitRevisions).toEqual({});
+  expect(loadMachineStore().profileAuthIncarnations).toEqual({});
   expect(loadMachineStore().toolLocks).toEqual({});
 });
 

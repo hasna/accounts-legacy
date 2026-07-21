@@ -178,7 +178,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
     await adminPool?.end();
   });
 
-  test("migrations 0003/0004/0005/0006/0007 upgrade existing data and are restart-idempotent", async () => {
+  test("migrations 0003 through 0008 upgrade existing data and are restart-idempotent", async () => {
     const appMigrations = accountsMigrations().filter((migration) =>
       migration.id.startsWith("accounts_"),
     );
@@ -258,12 +258,24 @@ describePostgres("PostgreSQL migration and repository integration", () => {
     ]);
 
     const pendingRollbackState = await readMigrationStatus(client, appMigrations);
-    expect(pendingRollbackState.pending).toEqual(["accounts_0007_login_operation_rollback_state"]);
+    expect(pendingRollbackState.pending).toEqual([
+      "accounts_0007_login_operation_rollback_state",
+      "accounts_0008_account_incarnations",
+    ]);
     expect(pendingRollbackState.checksumMismatches).toEqual([]);
     const upgraded = await new MigrationLedger(client, appMigrations).migrate();
     expect(
       upgraded.plan.find((item) => item.migration.id === "accounts_0007_login_operation_rollback_state")?.state,
     ).toBe("pending");
+    expect(
+      upgraded.plan.find((item) => item.migration.id === "accounts_0008_account_incarnations")?.state,
+    ).toBe("pending");
+    expect(
+      await client.get<{ present: boolean }>(
+        "SELECT incarnation_id IS NOT NULL AS present FROM accounts WHERE tool = $1 AND name = $2",
+        ["migration-probe", "valid"],
+      ),
+    ).toEqual({ present: true });
 
     await client.close();
     client = openClient();
@@ -511,6 +523,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       "accounts_0005_custom_tool_tombstones",
       "accounts_0006_current_selection_revisions",
       "accounts_0007_login_operation_rollback_state",
+      "accounts_0008_account_incarnations",
     ]);
     expect(() => assertMigrationStatusCompatible(legacyStatus)).toThrow(
       /not recognized by this build \(downgrade\?\)/,
@@ -589,6 +602,30 @@ describePostgres("PostgreSQL migration and repository integration", () => {
     }
   });
 
+  test("profile-field rollback cannot mutate a removed and recreated account", async () => {
+    const repo = new AccountsRepo(appClient);
+    const original = await repo.create({
+      tool: "claude",
+      name: "profile-field-aba",
+      email: "fixture@example.test",
+    });
+    await repo.remove(original.tool, original.name);
+    const replacement = await repo.create({
+      tool: original.tool,
+      name: original.name,
+      email: "fixture@example.test",
+    });
+
+    const restored = await repo.restoreProfile(original.tool, original.name, {
+      expectedIncarnationId: original.incarnationId,
+      email: { expected: "fixture@example.test", restore: null },
+    });
+
+    expect(restored.incarnationId).toBe(replacement.incarnationId);
+    expect(restored.incarnationId).not.toBe(original.incarnationId);
+    expect((await repo.get(original.tool, original.name))?.email).toBe("fixture@example.test");
+  });
+
   test("foreign key rejects orphan current selections", async () => {
     await expect(
       client.execute(
@@ -639,6 +676,42 @@ describePostgres("PostgreSQL migration and repository integration", () => {
     expect(await repo.restoreCurrentOperation(tool, target, operationId, prior, null)).toBe(true);
     expect((await repo.getCurrent(tool))?.name).toBe(concurrent);
     expect((await repo.get(tool, target))?.lastUsedAt).toBe(targetBeforeActivation);
+  });
+
+  test("login operation rollback never activates a recreated displaced account", async () => {
+    const repo = new AccountsRepo(appClient);
+    const tool = "claude";
+    const prior = "operation-incarnation-prior";
+    const target = "operation-incarnation-target";
+    const operationId = "55555555-5555-4555-8555-555555555555";
+    const originalPrior = await repo.create({ tool, name: prior });
+    const targetAccount = await repo.create({ tool, name: target });
+    await repo.setCurrent(tool, prior);
+    await repo.setCurrentForLogin(tool, target, operationId, targetAccount.incarnationId);
+    expect(await repo.remove(tool, prior)).toBe(true);
+    const replacement = await repo.create({ tool, name: prior });
+    expect(replacement.incarnationId).not.toBe(originalPrior.incarnationId);
+
+    expect(await repo.restoreCurrentOperation(tool, target, operationId, prior, null)).toBe(true);
+    expect(await repo.getCurrent(tool)).toBeNull();
+    expect((await repo.get(tool, prior))?.incarnationId).toBe(replacement.incarnationId);
+  });
+
+  test("completed login operation replay rejects a recreated target incarnation", async () => {
+    const repo = new AccountsRepo(appClient);
+    const tool = "claude";
+    const target = "operation-replay-target";
+    const operationId = "66666666-6666-4666-8666-666666666666";
+    const original = await repo.create({ tool, name: target });
+    await repo.setCurrentForLogin(tool, target, operationId, original.incarnationId);
+    expect(await repo.remove(tool, target)).toBe(true);
+    const replacement = await repo.create({ tool, name: target });
+    expect(replacement.incarnationId).not.toBe(original.incarnationId);
+
+    await expect(
+      repo.setCurrentForLogin(tool, target, operationId, original.incarnationId),
+    ).rejects.toThrow(/profile changed while login activation was in progress/);
+    expect(await repo.getCurrent(tool)).toBeNull();
   });
 
   test("current activation timestamps round-trip for conditional last-used rollback", async () => {

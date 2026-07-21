@@ -105,6 +105,8 @@ export const profileSchema = z.object({
   dir: z.string(),
   description: z.string().optional(),
   createdAt: z.string(),
+  /** Stable account incarnation; absent only from legacy local profile records. */
+  incarnationId: z.string().uuid().optional(),
   lastUsedAt: z.string().optional(),
 });
 
@@ -123,8 +125,16 @@ export const storeSchema = z.object({
   applied: z.record(z.string(), z.string()).default({}),
   /** Mutation generation for each machine-local applied selection. */
   appliedRevisions: z.record(z.string(), z.string()).default({}),
+  /** Stable machine-local identity generation for each profile auth root. */
+  profileAuthRevisions: z.record(z.string(), z.string()).default({}),
+  /** Published immutable committed-auth revision for each profile auth root. */
+  profileAuthCommitRevisions: z.record(z.string(), z.string()).default({}),
+  /** Stable incarnation digest used to carry auth ownership across renames. */
+  profileAuthIncarnations: z.record(z.string(), z.string()).default({}),
   /** Map of profile/account name -> preferred tool id for bare commands. */
   toolLocks: z.record(slugSchema, slugSchema).default({}),
+  /** Mutation generation for each machine-local profile-name tool lock. */
+  toolLockRevisions: z.record(slugSchema, z.string()).default({}),
   profiles: z.array(profileSchema).default([]),
   /** User-registered tools (apps) added at runtime, on top of built-ins. */
   tools: z.array(toolDefSchema).default([]),
@@ -138,9 +148,16 @@ export type NormalizedStore = z.output<typeof storeSchema>;
  * optional for source compatibility with callers constructing legacy Store
  * literals; storeSchema fills them before any runtime use.
  */
-export type Store = Omit<NormalizedStore, "currentRevisions" | "appliedRevisions"> & {
+export type Store = Omit<
+  NormalizedStore,
+  "currentRevisions" | "appliedRevisions" | "profileAuthRevisions" | "profileAuthCommitRevisions" | "profileAuthIncarnations" | "toolLockRevisions"
+> & {
   currentRevisions?: NormalizedStore["currentRevisions"];
   appliedRevisions?: NormalizedStore["appliedRevisions"];
+  profileAuthRevisions?: NormalizedStore["profileAuthRevisions"];
+  profileAuthCommitRevisions?: NormalizedStore["profileAuthCommitRevisions"];
+  profileAuthIncarnations?: NormalizedStore["profileAuthIncarnations"];
+  toolLockRevisions?: NormalizedStore["toolLockRevisions"];
 };
 
 export class AccountsError extends Error {

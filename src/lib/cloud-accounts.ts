@@ -41,6 +41,7 @@ export interface CloudAccount {
   dir?: string;
   description?: string;
   createdAt: string;
+  incarnationId?: string;
   lastUsedAt?: string;
 }
 
@@ -94,14 +95,31 @@ export interface AccountsCloudApi {
   get(name: string, tool?: string): Promise<Profile | undefined>;
   create(input: CloudCreateInput): Promise<Profile>;
   update(name: string, tool: string, input: CloudUpdateInput): Promise<Profile>;
-  restoreProfile?(name: string, tool: string, fields: ProfileRollbackFields): Promise<Profile>;
+  restoreProfile?(
+    name: string,
+    tool: string,
+    fields: ProfileRollbackFields,
+    expectedIncarnationId: string,
+  ): Promise<Profile>;
+  redetectEmailForLogin?(
+    name: string,
+    tool: string,
+    email: string,
+    expectedIncarnationId: string,
+    expectedEmail?: string,
+  ): Promise<Profile>;
   rename(oldName: string, newName: string, tool: string): Promise<Profile>;
   remove(name: string, tool?: string): Promise<Profile>;
   listCurrent(): Promise<CloudCurrentSelection[]>;
   listCurrentForLoginRollback?(): Promise<Array<CloudCurrentSelection & { revision: string }>>;
   getCurrent(tool: string): Promise<CloudCurrentSelection | null>;
   setCurrent(tool: string, name: string): Promise<CloudCurrentSelection>;
-  setCurrentForLogin?(tool: string, name: string, operationId: string): Promise<CloudCurrentSelection & { revision: string }>;
+  setCurrentForLogin?(
+    tool: string,
+    name: string,
+    operationId: string,
+    expectedIncarnationId: string,
+  ): Promise<CloudCurrentSelection & { revision: string }>;
   restoreCurrent(tool: string, expectedName: string, name?: string): Promise<boolean>;
   restoreCurrentGeneration?(tool: string, expectedName: string, expectedRevision: string, name?: string): Promise<boolean>;
   restoreCurrentOperation?(
@@ -132,6 +150,7 @@ function toProfile(account: CloudAccount): Profile {
     dir: account.dir ?? "",
     ...(account.description ? { description: account.description } : {}),
     createdAt: account.createdAt,
+    ...(account.incarnationId ? { incarnationId: account.incarnationId } : {}),
     ...(account.lastUsedAt ? { lastUsedAt: account.lastUsedAt } : {}),
   };
 }
@@ -148,6 +167,11 @@ const LOGIN_ROLLOUT_RETRY = {
   baseDelayMs: 25,
   maxDelayMs: 250,
   retryStatuses: [404, 408, 425, 429, 500, 502, 503, 504],
+};
+const LOGIN_TRANSACTION_TIMEOUT_MS = 5_000;
+const LOGIN_TRANSACTION_REQUEST = {
+  timeoutMs: LOGIN_TRANSACTION_TIMEOUT_MS,
+  retry: LOGIN_ROLLOUT_RETRY,
 };
 
 function requireCurrentRevision(value: unknown): CloudCurrentSelection {
@@ -299,16 +323,41 @@ function makeApi(client: HasnaStorageClient): AccountsCloudApi {
       return toProfile(updated);
     },
 
-    async restoreProfile(name: string, tool: string, fields: ProfileRollbackFields): Promise<Profile> {
+    async restoreProfile(
+      name: string,
+      tool: string,
+      fields: ProfileRollbackFields,
+      expectedIncarnationId: string,
+    ): Promise<Profile> {
       try {
         const restored = await t.post<CloudAccount>(
-          `/accounts/${encodeURIComponent(tool)}/${encodeURIComponent(name)}/restore`,
-          fields,
-          { idempotencyKey: randomUUID(), retry: LOGIN_ROLLOUT_RETRY },
+          `/accounts/${encodeURIComponent(tool)}/${encodeURIComponent(name)}/login/restore`,
+          { expectedIncarnationId, ...fields },
+          { idempotencyKey: randomUUID(), ...LOGIN_TRANSACTION_REQUEST },
         );
         return toProfile(restored);
       } catch (err) {
         if (isEndpointMissing(err)) throw endpointMissingError("accounts login profile rollback");
+        throw err;
+      }
+    },
+
+    async redetectEmailForLogin(
+      name: string,
+      tool: string,
+      email: string,
+      expectedIncarnationId: string,
+      expectedEmail?: string,
+    ): Promise<Profile> {
+      try {
+        const updated = await t.patch<CloudAccount>(
+          `/accounts/${encodeURIComponent(tool)}/${encodeURIComponent(name)}/login/update`,
+          { expectedIncarnationId, expectedEmail: expectedEmail ?? null, email },
+          { idempotencyKey: randomUUID(), ...LOGIN_TRANSACTION_REQUEST },
+        );
+        return toProfile(updated);
+      } catch (err) {
+        if (isEndpointMissing(err)) throw endpointMissingError("accounts login profile update");
         throw err;
       }
     },
@@ -374,12 +423,13 @@ function makeApi(client: HasnaStorageClient): AccountsCloudApi {
       tool: string,
       name: string,
       operationId: string,
+      expectedIncarnationId: string,
     ): Promise<CloudCurrentSelection & { revision: string }> {
       try {
         const current = await t.put<CloudCurrentSelection>(
-          `/current/${encodeURIComponent(tool)}/login`,
-          { name, operationId },
-          { retry: LOGIN_ROLLOUT_RETRY },
+          `/current/${encodeURIComponent(tool)}/login/activate`,
+          { name, operationId, expectedIncarnationId },
+          LOGIN_TRANSACTION_REQUEST,
         );
         if (current.operationId !== operationId) {
           throw transactionalLoginServerError("accounts-serve did not echo the transactional login operation id");
@@ -440,7 +490,7 @@ function makeApi(client: HasnaStorageClient): AccountsCloudApi {
             ...(name ? { name } : {}),
             ...(restoreLastUsedAt !== undefined ? { restoreLastUsedAt } : {}),
           },
-          { idempotencyKey: operationId, retry: LOGIN_ROLLOUT_RETRY },
+          { idempotencyKey: operationId, ...LOGIN_TRANSACTION_REQUEST },
         );
         if (result.restored) return true;
         const current = await api.getCurrent(tool);

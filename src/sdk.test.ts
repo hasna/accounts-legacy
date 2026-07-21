@@ -27,7 +27,7 @@ describe("accounts SDK", () => {
   test("OpenAPI document covers health/ready/version + versioned CRUD", () => {
     const doc = buildOpenApiDoc("1.2.3");
     expect(doc.info.version).toBe("1.2.3");
-    for (const p of ["/health", "/ready", "/version", "/v1/accounts", "/v1/accounts/{tool}/{name}", "/v1/current", "/v1/current/{tool}", "/v1/current/{tool}/login", "/v1/tools"]) {
+    for (const p of ["/health", "/ready", "/version", "/v1/accounts", "/v1/accounts/{tool}/{name}", "/v1/current", "/v1/current/{tool}", "/v1/current/{tool}/login/activate", "/v1/tools"]) {
       expect(doc.paths[p]).toBeDefined();
     }
     expect((doc.paths["/v1/accounts"] as any).post.operationId).toBe("createAccount");

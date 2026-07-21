@@ -75,7 +75,7 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
         },
         Account: {
           type: "object",
-          required: ["tool", "name", "metadata", "createdAt"],
+          required: ["tool", "name", "metadata", "createdAt", "incarnationId"],
           properties: {
             tool: { type: "string" },
             name: { type: "string" },
@@ -87,6 +87,7 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
             dir: { type: "string" },
             description: { type: "string" },
             createdAt: { type: "string" },
+            incarnationId: { type: "string", format: "uuid" },
             lastUsedAt: { type: "string" },
           },
         },
@@ -135,10 +136,22 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
         },
         RestoreAccountInput: {
           type: "object",
+          required: ["expectedIncarnationId"],
           properties: {
+            expectedIncarnationId: { type: "string", format: "uuid" },
             email: ref("RestoreFieldInput"),
             lastUsedAt: ref("RestoreFieldInput"),
           },
+        },
+        LoginUpdateAccountInput: {
+          type: "object",
+          required: ["expectedIncarnationId", "expectedEmail", "email"],
+          properties: {
+            expectedIncarnationId: { type: "string", format: "uuid" },
+            expectedEmail: { type: ["string", "null"], format: "email" },
+            email: { type: "string", format: "email" },
+          },
+          additionalProperties: false,
         },
         CurrentSelection: {
           type: "object",
@@ -168,11 +181,13 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
         },
         SetLoginCurrentInput: {
           type: "object",
-          required: ["name", "operationId"],
+          required: ["name", "operationId", "expectedIncarnationId"],
           properties: {
             name: { type: "string" },
             operationId: { type: "string", format: "uuid" },
+            expectedIncarnationId: { type: "string", format: "uuid" },
           },
+          additionalProperties: false,
         },
         RestoreCurrentInput: {
           type: "object",
@@ -392,7 +407,7 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
           },
         },
       },
-      "/v1/accounts/{tool}/{name}/restore": {
+      "/v1/accounts/{tool}/{name}/login/restore": {
         post: {
           operationId: "restoreAccount",
           summary: "Conditionally restore fields changed by failed login finalization",
@@ -405,6 +420,24 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
           responses: {
             "200": jsonResponse("Conditionally restored account", ref("Account")),
             "404": jsonResponse("Not found", ref("ErrorResponse")),
+            ...errorResponses,
+          },
+        },
+      },
+      "/v1/accounts/{tool}/{name}/login/update": {
+        patch: {
+          operationId: "updateAccountForLogin",
+          summary: "Update login-finalization fields for one exact account incarnation",
+          security: [{ apiKey: [] }],
+          parameters: [
+            { name: "tool", in: "path", required: true, schema: { type: "string" } },
+            { name: "name", in: "path", required: true, schema: { type: "string" } },
+          ],
+          requestBody: jsonBody(ref("LoginUpdateAccountInput")),
+          responses: {
+            "200": jsonResponse("Updated exact account incarnation", ref("Account")),
+            "404": jsonResponse("Not found", ref("ErrorResponse")),
+            "409": jsonResponse("Account incarnation changed", ref("ErrorResponse")),
             ...errorResponses,
           },
         },
@@ -473,7 +506,7 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
           },
         },
       },
-      "/v1/current/{tool}/login": {
+      "/v1/current/{tool}/login/activate": {
         put: {
           operationId: "setLoginCurrent",
           summary: "Set current through the transactional login-only endpoint",

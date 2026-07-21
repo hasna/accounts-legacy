@@ -1,10 +1,22 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { addProfile, useProfile, renameProfile, removeProfile, currentProfile, getProfile, updateProfile } from "./lib/profiles.js";
+import {
+  addProfile,
+  useProfile,
+  renameProfile,
+  removeProfile,
+  currentProfile,
+  claimProfileToolLock,
+  getProfile,
+  getProfileToolLockRevision,
+  lockProfileTool,
+  updateProfile,
+} from "./lib/profiles.js";
 import { applyProfile, appliedProfile } from "./lib/apply.js";
 import { importProfile } from "./lib/import-profile.js";
 import {
@@ -13,6 +25,7 @@ import {
   rollbackLoginFinalization,
 } from "./lib/login.js";
 import {
+  assertClaudeProfileCommittedAuthSnapshot,
   claudeKeychainCredentialFromProfile,
   ensureProfileAuthSnapshot,
   hasAuthSnapshot,
@@ -23,7 +36,13 @@ import { installHook, hookPath, hookScript, isSafeProfileName } from "./lib/hook
 import { resolvePickMode } from "./lib/pick.js";
 import { switchProfile } from "./lib/switch.js";
 import { profileEnv } from "./lib/env.js";
-import { loadMachineStore, loadStore, saveStore } from "./storage.js";
+import {
+  captureMachineProfileAuthSlotExpectation,
+  loadMachineStore,
+  loadStore,
+  reconcileMachineProfileCreate,
+  saveStore,
+} from "./storage.js";
 import { getTool } from "./lib/tools.js";
 import { resolveStore, type AccountsStore } from "./lib/store.js";
 import { AccountsError } from "./types.js";
@@ -118,6 +137,17 @@ test("apply snapshots live oauth to previous profile when switching", async () =
   ensureProfileAuthSnapshot(personalDir, tool);
   await applyProfile("work");
   await applyProfile("personal");
+  const machine = loadMachineStore();
+  const workIdentity = machine.profileAuthRevisions["claude/work"];
+  const workCommit = machine.profileAuthCommitRevisions["claude/work"];
+  const personalIdentity = machine.profileAuthRevisions["claude/personal"];
+  const personalCommit = machine.profileAuthCommitRevisions["claude/personal"];
+  expect(workIdentity).toBeTruthy();
+  expect(workCommit).toBeTruthy();
+  expect(personalIdentity).toBeTruthy();
+  expect(personalCommit).toBeTruthy();
+  assertClaudeProfileCommittedAuthSnapshot(workIdentity!, workCommit!);
+  assertClaudeProfileCommittedAuthSnapshot(personalIdentity!, personalCommit!);
   const snap = JSON.parse(readFileSync(profileOAuthSnapshot(workDir), "utf8")) as {
     oauthAccount: { emailAddress: string };
   };
@@ -389,6 +419,33 @@ test("interrupted API finalization clears a newly-created current selection", as
   expect(appliedProfile("claude")).toBeUndefined();
 });
 
+test("API login preflight rejects a profile missing server-owned incarnation", async () => {
+  const target = addProfile({ name: "target-missing-incarnation" });
+  const localStore = resolveStore({
+    ACCOUNTS_HOME: home,
+    HASNA_ACCOUNTS_STORAGE_MODE: "local",
+  } as NodeJS.ProcessEnv);
+  const staleApiStore = new Proxy(localStore, {
+    get(store, property, receiver) {
+      if (property === "transport") return "api";
+      if (property === "requiresProfileIncarnationRollback") return true;
+      if (property === "getProfile") {
+        return async (...args: Parameters<AccountsStore["getProfile"]>) => {
+          const profile = await store.getProfile(...args);
+          const { incarnationId: _incarnationId, ...legacyProfile } = profile;
+          return legacyProfile;
+        };
+      }
+      const value = Reflect.get(store, property, receiver);
+      return typeof value === "function" ? value.bind(store) : value;
+    },
+  }) as AccountsStore;
+
+  await expect(
+    captureLoginFinalizationState(target.name, getTool("claude"), staleApiStore),
+  ).rejects.toThrow("did not return an account incarnation");
+});
+
 test("rollback does not overwrite a newer concurrent Claude apply", async () => {
   const prior = addProfile({ name: "prior-concurrent" });
   const target = addProfile({ name: "target-concurrent" });
@@ -431,6 +488,119 @@ test("rollback does not overwrite a newer concurrent Claude apply", async () => 
   expect(
     JSON.parse(readFileSync(profileOAuthSnapshot(target.dir), "utf8")).oauthAccount.emailAddress,
   ).toBe("rotated-target-concurrent@example.com");
+});
+
+test("rollback rejects a stale parked identity when the current profile owns a new direct identity", async () => {
+  const target = addProfile({ name: "identity-recreated" });
+  writeOAuth(target.dir, "before-recreate@example.com");
+  const state = await captureLoginFinalizationState(target.name, getTool("claude"));
+  const machine = loadMachineStore();
+  const directKey = `claude/${target.name}`;
+  const parkedKey = `@incarnation/${"a".repeat(64)}`;
+  const oldIdentity = machine.profileAuthRevisions[directKey];
+  const oldCommit = machine.profileAuthCommitRevisions[directKey];
+  const incarnation = machine.profileAuthIncarnations[directKey];
+  if (!oldIdentity || !oldCommit || !incarnation) throw new Error("missing captured auth ownership");
+  machine.profileAuthRevisions[parkedKey] = oldIdentity;
+  machine.profileAuthCommitRevisions[parkedKey] = oldCommit;
+  machine.profileAuthIncarnations[parkedKey] = incarnation;
+  machine.profileAuthRevisions[directKey] = randomUUID();
+  delete machine.profileAuthCommitRevisions[directKey];
+  machine.profileAuthIncarnations[directKey] = incarnation;
+  saveStore(machine);
+  writeOAuth(target.dir, "recreated@example.com");
+
+  await expect(rollbackLoginFinalization(state)).rejects.toThrow(
+    /missing Claude profile auth identity/,
+  );
+
+  expect(JSON.parse(readFileSync(join(target.dir, ".claude.json"), "utf8")).oauthAccount.emailAddress)
+    .toBe("recreated@example.com");
+  expect(JSON.parse(readFileSync(join(target.dir, ".credentials.json"), "utf8")).claudeAiOauth.refreshToken)
+    .toBe("recreated@example.com-refresh-token");
+});
+
+test("apply-started rollback preserves an API-recreated auth generation", async () => {
+  const prior = addProfile({ name: "prior-api-recreate" });
+  const target = addProfile({ name: "target-api-recreate" });
+  writeOAuth(prior.dir, "prior-api-recreate@example.com");
+  writeOAuth(target.dir, "target-api-recreate@example.com");
+  await applyProfile(prior.name, prior.tool);
+  const state = await captureLoginFinalizationState(target.name, getTool("claude"));
+  await finalizeLogin(target.name, target.tool, undefined, state);
+  const expectation = captureMachineProfileAuthSlotExpectation(target.tool, target.name);
+  reconcileMachineProfileCreate(target, expectation);
+  writeOAuth(target.dir, "replacement-api-recreate@example.com");
+  const replacementMachine = loadMachineStore();
+  const authKey = `claude/${target.name}`;
+  const replacementIdentity = replacementMachine.profileAuthRevisions[authKey];
+  const replacementCommit = replacementMachine.profileAuthCommitRevisions[authKey];
+  const replacementIncarnation = replacementMachine.profileAuthIncarnations[authKey];
+  const appliedRevision = replacementMachine.appliedRevisions.claude;
+
+  await rollbackLoginFinalization(state);
+
+  const after = loadMachineStore();
+  expect(after.applied.claude).toBe(target.name);
+  expect(after.appliedRevisions.claude).toBe(appliedRevision);
+  expect(after.profileAuthRevisions[authKey]).toBe(replacementIdentity);
+  expect(after.profileAuthCommitRevisions[authKey]).toBe(replacementCommit);
+  expect(after.profileAuthIncarnations[authKey]).toBe(replacementIncarnation);
+  expect(JSON.parse(readFileSync(join(target.dir, ".claude.json"), "utf8")).oauthAccount.emailAddress)
+    .toBe("replacement-api-recreate@example.com");
+  expect(JSON.parse(readFileSync(join(target.dir, ".credentials.json"), "utf8")).claudeAiOauth.refreshToken)
+    .toBe("replacement-api-recreate@example.com-refresh-token");
+});
+
+test("operation rollback preserves a newer tool-lock-only generation", async () => {
+  const prior = addProfile({ name: "prior-tool-lock-cas" });
+  const target = addProfile({ name: "target-tool-lock-cas" });
+  useProfile(prior.name, prior.tool);
+  const store = resolveStore({
+    ACCOUNTS_HOME: home,
+    HASNA_ACCOUNTS_STORAGE_MODE: "local",
+  } as NodeJS.ProcessEnv);
+  const operationId = randomUUID();
+  await store.useProfileForLogin!(target.name, target.tool, operationId);
+  const newerToolLockRevision = lockProfileTool(target.name, target.tool);
+
+  expect(await store.restoreCurrentOperation!(target.tool, target.name, operationId, prior.name)).toBe(true);
+
+  expect(currentProfile(target.tool)?.name).toBe(prior.name);
+  expect(getProfileToolLockRevision(target.name)).toBe(newerToolLockRevision);
+});
+
+test("login tool-lock claim atomically captures the displaced generation", () => {
+  addProfile({ name: "atomic-tool-lock", tool: "codex" });
+  addProfile({ name: "atomic-tool-lock", tool: "claude" });
+  const displacedRevision = lockProfileTool("atomic-tool-lock", "codex");
+
+  const claim = claimProfileToolLock("atomic-tool-lock", "claude");
+
+  expect(claim.previousTool).toBe("codex");
+  expect(claim.previousRevision).toBe(displacedRevision);
+  expect(getProfileToolLockRevision("atomic-tool-lock")).toBe(claim.revision);
+});
+
+test("operation rollback never activates a recreated displaced profile", async () => {
+  const prior = addProfile({ name: "prior-incarnation" });
+  const target = addProfile({ name: "target-incarnation" });
+  useProfile(prior.name, prior.tool);
+  const store = resolveStore({
+    ACCOUNTS_HOME: home,
+    HASNA_ACCOUNTS_STORAGE_MODE: "local",
+  } as NodeJS.ProcessEnv);
+  const operationId = randomUUID();
+  await store.useProfileForLogin!(target.name, target.tool, operationId);
+  removeProfile(prior.name, { tool: prior.tool });
+  await Bun.sleep(2);
+  const replacement = addProfile({ name: prior.name, tool: prior.tool, dir: prior.dir });
+  expect(replacement.createdAt).not.toBe(prior.createdAt);
+
+  expect(await store.restoreCurrentOperation!(target.tool, target.name, operationId, prior.name)).toBe(true);
+
+  expect(currentProfile(target.tool)).toBeUndefined();
+  expect(getProfile(prior.name, prior.tool).createdAt).toBe(replacement.createdAt);
 });
 
 test("failed login rollback restores the apply displaced at finalization, not the pre-child apply", async () => {
@@ -570,6 +740,25 @@ test("rollback preserves an email edit made after login redetection", async () =
   await finalizeLogin(target.name, target.tool, racingStore, state);
   await rollbackLoginFinalization(state, racingStore);
 
+  expect(getProfile(target.name, target.tool).email).toBe(concurrentEmail);
+});
+
+test("login redetection never overwrites an email edit committed while the child ran", async () => {
+  const prior = addProfile({ name: "prior-email-before-redetect" });
+  const target = addProfile({
+    name: "target-email-before-redetect",
+    email: "captured-email@example.com",
+  });
+  writeOAuth(prior.dir, "prior-email-before-redetect@example.com");
+  writeOAuth(target.dir, "detected-email-before-redetect@example.com");
+  await applyProfile(prior.name, prior.tool);
+  const state = await captureLoginFinalizationState(target.name, getTool("claude"));
+  const concurrentEmail = "concurrent-email-before-redetect@example.com";
+  updateProfile(target.name, { tool: target.tool, email: concurrentEmail });
+
+  await finalizeLogin(target.name, target.tool, undefined, state);
+  expect(getProfile(target.name, target.tool).email).toBe(concurrentEmail);
+  await rollbackLoginFinalization(state);
   expect(getProfile(target.name, target.tool).email).toBe(concurrentEmail);
 });
 

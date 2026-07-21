@@ -10,7 +10,7 @@
 
 import { homedir, hostname } from "node:os";
 import { spawnSync } from "node:child_process";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   chmodSync,
   closeSync,
@@ -69,7 +69,11 @@ const EMPTY_STORE: NormalizedStore = {
   currentRevisions: {},
   applied: {},
   appliedRevisions: {},
+  profileAuthRevisions: {},
+  profileAuthCommitRevisions: {},
+  profileAuthIncarnations: {},
   toolLocks: {},
+  toolLockRevisions: {},
   profiles: [],
   tools: [],
 };
@@ -154,15 +158,15 @@ const processIncarnation = portableProcessStartId(process.pid) ?? `fallback-${ra
 
 function registryLockOwner(text: string): { pid?: number; incarnation?: string } {
   const owner = text.trim();
-  const parts = owner.split(":");
-  if (parts[0] === "v2") {
-    const pid = Number(parts[1]);
-    return {
-      ...(Number.isSafeInteger(pid) && pid > 0 ? { pid } : {}),
-      ...(parts[2] ? { incarnation: parts[2] } : {}),
-    };
+  const v2 = /^v2:([1-9]\d*):((?:linux|darwin)-[A-Za-z0-9-]+|fallback-[0-9a-f-]+):([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$/i.exec(owner);
+  if (v2) {
+    const pid = Number(v2[1]);
+    return Number.isSafeInteger(pid) && pid > 0
+      ? { pid, incarnation: v2[2] }
+      : {};
   }
-  const pid = Number(parts[0]);
+  if (!/^[1-9]\d*$/.test(owner)) return {};
+  const pid = Number(owner);
   return Number.isSafeInteger(pid) && pid > 0 ? { pid } : {};
 }
 
@@ -211,10 +215,10 @@ function observeRegistryLock(path: string): RegistryLockObservation | undefined 
       }
     }
   } else {
-    // A process can die between exclusive creation and writing its identity.
-    // Do not steal a freshly created empty lock, but reclaim it after that tiny
-    // initialization window.
-    stale = Date.now() - stat.mtimeMs >= 1_000;
+    // Empty or malformed ownership is unverifiable. Never reclaim it by age:
+    // a live process may still be initializing the lease, and ownership cannot
+    // be proven after a crash. Manual removal is the safe recovery path.
+    stale = false;
   }
   return { text, dev: stat.dev, ino: stat.ino, stale };
 }
@@ -438,46 +442,293 @@ export function loadCurrentMap(): Record<string, string> {
   return current;
 }
 
-export function reconcileMachineProfileRename(toolId: string, oldName: string, newName: string): void {
+/** Stable machine-store key for the identity of one tool/profile auth root. */
+export function profileAuthRevisionKey(toolId: string, profileName: string): string {
+  return `${toolId}/${profileName}`;
+}
+
+/** Collision-free holding key when a stale name key belongs to another incarnation. */
+export function parkedProfileAuthRevisionKey(incarnation: string): string {
+  if (!/^[0-9a-f]{64}$/i.test(incarnation)) throw new AccountsError("invalid profile auth incarnation");
+  return `@incarnation/${incarnation}`;
+}
+
+/** Name-independent profile incarnation used to recover ownership across a concurrent rename. */
+export function profileAuthIncarnation(
+  profile: Pick<NormalizableProfile, "tool" | "createdAt" | "dir" | "incarnationId">,
+): string {
+  return createHash("sha256")
+    .update(
+      profile.incarnationId
+        ? JSON.stringify(["incarnation", profile.incarnationId])
+        : JSON.stringify(["legacy", profile.tool, profile.createdAt, resolve(profile.dir)]),
+    )
+    .digest("hex");
+}
+
+type NormalizableProfile = NormalizedStore["profiles"][number];
+
+/** Resolve the current machine key for this exact profile incarnation. */
+export function findProfileAuthRevisionKey(
+  store: Pick<NormalizedStore, "profileAuthRevisions" | "profileAuthIncarnations">,
+  profile: Pick<NormalizableProfile, "tool" | "name" | "createdAt" | "dir">,
+): string | undefined {
+  const directKey = profileAuthRevisionKey(profile.tool, profile.name);
+  const incarnation = profileAuthIncarnation(profile);
+  if (store.profileAuthIncarnations[directKey] === incarnation) return directKey;
+  // Upgrade compatibility: identity existed before incarnation tracking.
+  if (store.profileAuthRevisions[directKey] && !store.profileAuthIncarnations[directKey]) return directKey;
+  const matches = Object.entries(store.profileAuthIncarnations)
+    .filter(([, candidate]) => candidate === incarnation)
+    .map(([key]) => key);
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
+export interface MachineProfileReconcileExpectation {
+  currentRevision?: string;
+  appliedRevision?: string;
+  toolLock?: string;
+  toolLockRevision?: string;
+  authKey?: string;
+  authIdentity?: string;
+  authCommitRevision?: string;
+  authIncarnation?: string;
+}
+
+export interface MachineProfileAuthSlotExpectation {
+  authKey: string;
+  authIdentity: string | null;
+  authCommitRevision: string | null;
+  authIncarnation: string | null;
+}
+
+/** Capture one name-bound auth slot before an API create round trip. */
+export function captureMachineProfileAuthSlotExpectation(
+  toolId: string,
+  name: string,
+): MachineProfileAuthSlotExpectation {
+  return withStoreLock(() => {
+    const store = parseStoreFile();
+    const authKey = profileAuthRevisionKey(toolId, name);
+    return {
+      authKey,
+      authIdentity: store.profileAuthRevisions[authKey] ?? null,
+      authCommitRevision: store.profileAuthCommitRevisions[authKey] ?? null,
+      authIncarnation: store.profileAuthIncarnations[authKey] ?? null,
+    };
+  });
+}
+
+/**
+ * A successful API create establishes a new profile even when an old server
+ * record was removed without its delayed local reconciliation. Rotate only the
+ * exact stale slot observed before the request; a concurrent apply wins the CAS.
+ */
+export function reconcileMachineProfileCreate(
+  profile: Pick<NormalizableProfile, "tool" | "name" | "createdAt" | "dir">,
+  expected: MachineProfileAuthSlotExpectation,
+): void {
+  withStoreLock(() => {
+    const store = parseStoreFile();
+    const authKey = profileAuthRevisionKey(profile.tool, profile.name);
+    if (
+      authKey !== expected.authKey ||
+      (store.profileAuthRevisions[authKey] ?? null) !== expected.authIdentity ||
+      (store.profileAuthCommitRevisions[authKey] ?? null) !== expected.authCommitRevision ||
+      (store.profileAuthIncarnations[authKey] ?? null) !== expected.authIncarnation
+    ) {
+      return;
+    }
+    store.profileAuthRevisions[authKey] = randomUUID();
+    delete store.profileAuthCommitRevisions[authKey];
+    store.profileAuthIncarnations[authKey] = profileAuthIncarnation(profile);
+    saveStoreLocked(store);
+  });
+}
+
+/** Capture machine-local ownership before an API rename/remove round trip. */
+export function captureMachineProfileReconcileExpectation(
+  profile: Pick<NormalizableProfile, "tool" | "name" | "createdAt" | "dir">,
+): MachineProfileReconcileExpectation {
+  return withStoreLock(() => {
+    const store = parseStoreFile();
+    const authKey = findProfileAuthRevisionKey(store, profile);
+    return {
+      ...(store.current[profile.tool] === profile.name && store.currentRevisions[profile.tool]
+        ? { currentRevision: store.currentRevisions[profile.tool] }
+        : {}),
+      ...(store.applied[profile.tool] === profile.name && store.appliedRevisions[profile.tool]
+        ? { appliedRevision: store.appliedRevisions[profile.tool] }
+        : {}),
+      ...(store.toolLocks[profile.name] ? { toolLock: store.toolLocks[profile.name] } : {}),
+      ...(store.toolLockRevisions[profile.name]
+        ? { toolLockRevision: store.toolLockRevisions[profile.name] }
+        : {}),
+      ...(authKey ? { authKey } : {}),
+      ...(authKey && store.profileAuthRevisions[authKey]
+        ? { authIdentity: store.profileAuthRevisions[authKey] }
+        : {}),
+      ...(authKey && store.profileAuthCommitRevisions[authKey]
+        ? { authCommitRevision: store.profileAuthCommitRevisions[authKey] }
+        : {}),
+      ...(authKey && store.profileAuthIncarnations[authKey]
+        ? { authIncarnation: store.profileAuthIncarnations[authKey] }
+        : {}),
+    };
+  });
+}
+
+function ownsExpectedAuth(
+  store: NormalizedStore,
+  expected: MachineProfileReconcileExpectation,
+): expected is MachineProfileReconcileExpectation & {
+  authKey: string;
+  authIdentity: string;
+  authIncarnation: string;
+} {
+  return Boolean(
+    expected.authKey &&
+    expected.authIdentity &&
+    expected.authIncarnation &&
+    store.profileAuthRevisions[expected.authKey] === expected.authIdentity &&
+    (store.profileAuthCommitRevisions[expected.authKey] ?? null) === (expected.authCommitRevision ?? null) &&
+    store.profileAuthIncarnations[expected.authKey] === expected.authIncarnation,
+  );
+}
+
+export function reconcileMachineProfileRename(
+  toolId: string,
+  oldName: string,
+  newName: string,
+  expected?: MachineProfileReconcileExpectation,
+): void {
   withStoreLock(() => {
     const store = parseStoreFile();
     let changed = false;
-    if (store.current[toolId] === oldName) {
+    const ownsCurrent = expected
+      ? Boolean(expected.currentRevision && store.current[toolId] === oldName && store.currentRevisions[toolId] === expected.currentRevision)
+      : store.current[toolId] === oldName;
+    const ownsApplied = expected
+      ? Boolean(expected.appliedRevision && store.applied[toolId] === oldName && store.appliedRevisions[toolId] === expected.appliedRevision)
+      : store.applied[toolId] === oldName;
+    const ownsAuth = expected ? ownsExpectedAuth(store, expected) : true;
+    if (ownsCurrent) {
       store.current[toolId] = newName;
       store.currentRevisions[toolId] = randomUUID();
       changed = true;
     }
-    if (store.applied[toolId] === oldName) {
+    if (ownsApplied) {
       store.applied[toolId] = newName;
       store.appliedRevisions[toolId] = randomUUID();
       changed = true;
     }
-    if (store.toolLocks[oldName] === toolId) {
+    const targetToolLockIsFree = !store.toolLocks[newName] && !store.toolLockRevisions[newName];
+    if (
+      store.toolLocks[oldName] === toolId &&
+      targetToolLockIsFree &&
+      (!expected || (
+        (ownsCurrent || ownsApplied || ownsAuth) &&
+        expected.toolLock === toolId &&
+        Boolean(expected.toolLockRevision) &&
+        store.toolLockRevisions[oldName] === expected.toolLockRevision
+      ))
+    ) {
       delete store.toolLocks[oldName];
+      delete store.toolLockRevisions[oldName];
       store.toolLocks[newName] = toolId;
+      store.toolLockRevisions[newName] = randomUUID();
+      changed = true;
+    }
+    const oldAuthKey = expected?.authKey ?? profileAuthRevisionKey(toolId, oldName);
+    const newAuthKey = profileAuthRevisionKey(toolId, newName);
+    const targetIsFree = !store.profileAuthRevisions[newAuthKey] &&
+      !store.profileAuthCommitRevisions[newAuthKey] &&
+      !store.profileAuthIncarnations[newAuthKey];
+    const authIdentity = ownsAuth && targetIsFree ? store.profileAuthRevisions[oldAuthKey] : undefined;
+    if (authIdentity) {
+      delete store.profileAuthRevisions[oldAuthKey];
+      store.profileAuthRevisions[newAuthKey] = authIdentity;
+      changed = true;
+    }
+    const authCommitRevision = ownsAuth && targetIsFree ? store.profileAuthCommitRevisions[oldAuthKey] : undefined;
+    if (authCommitRevision) {
+      delete store.profileAuthCommitRevisions[oldAuthKey];
+      store.profileAuthCommitRevisions[newAuthKey] = authCommitRevision;
+      changed = true;
+    }
+    const authIncarnation = ownsAuth && targetIsFree ? store.profileAuthIncarnations[oldAuthKey] : undefined;
+    if (authIncarnation) {
+      delete store.profileAuthIncarnations[oldAuthKey];
+      store.profileAuthIncarnations[newAuthKey] = authIncarnation;
       changed = true;
     }
     if (changed) saveStoreLocked(store);
   });
 }
 
-export function reconcileMachineProfileRemove(toolId: string, name: string): void {
+export function reconcileMachineProfileRemove(
+  toolId: string,
+  name: string,
+  incarnation?: string,
+  expected?: MachineProfileReconcileExpectation,
+): void {
   withStoreLock(() => {
     const store = parseStoreFile();
     let changed = false;
-    if (store.current[toolId] === name) {
+    const ownsCurrent = expected
+      ? Boolean(expected.currentRevision && store.current[toolId] === name && store.currentRevisions[toolId] === expected.currentRevision)
+      : store.current[toolId] === name;
+    const ownsApplied = expected
+      ? Boolean(expected.appliedRevision && store.applied[toolId] === name && store.appliedRevisions[toolId] === expected.appliedRevision)
+      : store.applied[toolId] === name;
+    const ownsAuth = expected ? ownsExpectedAuth(store, expected) : true;
+    if (ownsCurrent) {
       delete store.current[toolId];
       delete store.currentRevisions[toolId];
       changed = true;
     }
-    if (store.applied[toolId] === name) {
+    if (ownsApplied) {
       delete store.applied[toolId];
       delete store.appliedRevisions[toolId];
       changed = true;
     }
-    if (store.toolLocks[name] === toolId) {
+    if (
+      store.toolLocks[name] === toolId &&
+      (!expected || (
+        (ownsCurrent || ownsApplied || ownsAuth) &&
+        expected.toolLock === toolId &&
+        Boolean(expected.toolLockRevision) &&
+        store.toolLockRevisions[name] === expected.toolLockRevision
+      ))
+    ) {
       delete store.toolLocks[name];
+      delete store.toolLockRevisions[name];
       changed = true;
+    }
+    const authKey = profileAuthRevisionKey(toolId, name);
+    const authKeys = ownsAuth
+      ? expected
+        ? new Set([expected.authKey!])
+        : new Set([
+            authKey,
+            ...Object.entries(store.profileAuthIncarnations)
+              .filter(([, candidate]) => Boolean(incarnation && candidate === incarnation))
+              .map(([key]) => key),
+          ])
+      : new Set<string>();
+    for (const key of authKeys) {
+      if (store.profileAuthRevisions[key]) {
+        delete store.profileAuthRevisions[key];
+        changed = true;
+      }
+      if (store.profileAuthCommitRevisions[key]) {
+        delete store.profileAuthCommitRevisions[key];
+        changed = true;
+      }
+      if (store.profileAuthIncarnations[key]) {
+        delete store.profileAuthIncarnations[key];
+        changed = true;
+      }
     }
     if (changed) saveStoreLocked(store);
   });
@@ -519,8 +770,16 @@ export function loadStore(): NormalizedStore {
   }
   for (const name of Object.keys(store.toolLocks)) {
     const toolId = store.toolLocks[name];
-    if (!profileNameSchema.safeParse(name).success || !toolId) delete store.toolLocks[name];
-    else if (!store.profiles.some((p) => p.name === name && p.tool === toolId)) delete store.toolLocks[name];
+    if (!profileNameSchema.safeParse(name).success || !toolId) {
+      delete store.toolLocks[name];
+      delete store.toolLockRevisions[name];
+    } else if (!store.profiles.some((p) => p.name === name && p.tool === toolId)) {
+      delete store.toolLocks[name];
+      delete store.toolLockRevisions[name];
+    }
+  }
+  for (const name of Object.keys(store.toolLockRevisions)) {
+    if (!store.toolLocks[name]) delete store.toolLockRevisions[name];
   }
   return store;
 }

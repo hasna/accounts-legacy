@@ -539,18 +539,33 @@ test("remove clears applied pointer", () => {
   useProfile("work");
   const store = loadStore();
   store.applied = { claude: "work" };
+  store.profileAuthRevisions = { "claude/work": "auth-generation" };
+  store.profileAuthCommitRevisions = { "claude/work": "auth-commit" };
+  store.profileAuthIncarnations = { "claude/work": "auth-incarnation" };
   saveStore(store);
   removeProfile("work");
   expect(loadStore().applied.claude).toBeUndefined();
+  expect(loadStore().profileAuthRevisions).toEqual({});
+  expect(loadStore().profileAuthCommitRevisions).toEqual({});
+  expect(loadStore().profileAuthIncarnations).toEqual({});
 });
 
 test("rename updates applied pointer", () => {
   addProfile({ name: "work" });
   const store = loadStore();
   store.applied = { claude: "work" };
+  store.profileAuthRevisions = { "claude/work": "auth-generation" };
+  store.profileAuthCommitRevisions = { "claude/work": "auth-commit" };
+  store.profileAuthIncarnations = { "claude/work": "auth-incarnation" };
   saveStore(store);
   renameProfile("work", "job");
   expect(loadStore().applied.claude).toBe("job");
+  expect(loadStore().profileAuthRevisions["claude/work"]).toBeUndefined();
+  expect(loadStore().profileAuthRevisions["claude/job"]).toBe("auth-generation");
+  expect(loadStore().profileAuthCommitRevisions["claude/work"]).toBeUndefined();
+  expect(loadStore().profileAuthCommitRevisions["claude/job"]).toBe("auth-commit");
+  expect(loadStore().profileAuthIncarnations["claude/work"]).toBeUndefined();
+  expect(loadStore().profileAuthIncarnations["claude/job"]).toBe("auth-incarnation");
 });
 
 test("loadStore prunes stale current and applied pointers", () => {

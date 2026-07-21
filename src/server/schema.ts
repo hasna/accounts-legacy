@@ -73,6 +73,7 @@ export type UpdateAccountInput = z.infer<typeof updateAccountSchema>;
 
 export const restoreAccountSchema = z
   .object({
+    expectedIncarnationId: z.string().uuid(),
     email: z.object({
       expected: z.string().email().nullable(),
       restore: z.string().email().nullable(),
@@ -85,11 +86,19 @@ export const restoreAccountSchema = z
   .refine((value) => value.email !== undefined || value.lastUsedAt !== undefined, "restore requires at least one field");
 export type RestoreAccountInput = z.infer<typeof restoreAccountSchema>;
 
+export const loginUpdateAccountSchema = z.object({
+  expectedIncarnationId: z.string().uuid(),
+  expectedEmail: z.string().email().nullable(),
+  email: z.string().email(),
+}).strict();
+export type LoginUpdateAccountInput = z.infer<typeof loginUpdateAccountSchema>;
+
 export const setCurrentSchema = z.object({ name: profileNameSchema });
 export const setLoginCurrentSchema = z.object({
   name: profileNameSchema,
   operationId: z.string().uuid(),
-});
+  expectedIncarnationId: z.string().uuid(),
+}).strict();
 
 const postgresRevisionSchema = z
   .string()

@@ -1,7 +1,18 @@
 import type { Profile, ToolDef } from "../types.js";
 import { randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 import { AccountsError } from "../types.js";
-import { loadAppliedMap, loadMachineStore, loadStore, saveStore, withStoreLock } from "../storage.js";
+import {
+  loadAppliedMap,
+  findProfileAuthRevisionKey,
+  loadMachineStore,
+  loadStore,
+  parkedProfileAuthRevisionKey,
+  profileAuthIncarnation,
+  profileAuthRevisionKey,
+  saveStore,
+  withStoreLock,
+} from "../storage.js";
 import { getTool } from "./tools.js";
 import { resolveStore, type AccountsStore } from "./store.js";
 import {
@@ -11,14 +22,16 @@ import {
   ensureProfileAuthSnapshot,
   liveCredentialShouldUpdateProfile,
   liveOAuthEmail,
+  pruneClaudeProfileCommittedAuthSnapshotSets,
   restoreClaudeAuthFromProfile,
   restoreClaudeLiveAuthSnapshot,
   restoreClaudeProfileAuthSnapshot,
   snapshotLiveAuthToProfile,
+  writeClaudeProfileCommittedAuthSnapshot,
   type ClaudeLiveAuthSnapshot,
   type ClaudeProfileAuthSnapshot,
 } from "./claude-auth.js";
-import { withApplyLock, withApplyLockWait } from "./apply-lock.js";
+import { withApplyLockAsync } from "./apply-lock.js";
 import { acquireClaudeKeychainLock } from "./claude-launch.js";
 import {
   captureClaudeKeychain,
@@ -27,10 +40,34 @@ import {
   type KeychainCredential,
 } from "./keychain.js";
 
-interface ApplyRollbackState {
+export interface ApplyRollbackState {
   liveClaude: ClaudeLiveAuthSnapshot;
   applied?: { name: string; revision?: string };
   profileAuthSnapshots: ClaudeProfileAuthSnapshot[];
+  profileAuthRefs: Array<{
+    key: string;
+    identity?: string;
+    commitRevision?: string;
+    incarnation?: string;
+  }>;
+  profileAuthWrites: Array<{
+    key: string;
+    identity: string | null;
+    commitRevision: string | null;
+    incarnation: string | null;
+  }>;
+}
+
+/** True only while every auth slot written by this apply is still unchanged. */
+export function ownsApplyAuthWrites(
+  local: ReturnType<typeof loadMachineStore>,
+  rollback: ApplyRollbackState,
+): boolean {
+  return rollback.profileAuthWrites.every((write) =>
+    (local.profileAuthRevisions[write.key] ?? null) === write.identity &&
+    (local.profileAuthCommitRevisions[write.key] ?? null) === write.commitRevision &&
+    (local.profileAuthIncarnations[write.key] ?? null) === write.incarnation
+  );
 }
 
 export interface ApplyTransactionTracker {
@@ -82,6 +119,7 @@ export async function applyProfile(
   toolId?: string,
   store: AccountsStore = resolveStore(),
   tracker?: ApplyTransactionTracker,
+  expectedProfile?: Profile,
 ): Promise<{ profile: Profile; previous?: string; appliedRevision: string; currentRevision?: string }> {
   if (!store.useProfileForLogin || !store.restoreCurrentOperation) {
     throw new AccountsError(
@@ -89,7 +127,18 @@ export async function applyProfile(
       "upgrade the custom store before running accounts apply",
     );
   }
+  const useProfileForLogin = store.useProfileForLogin.bind(store);
   const profile = await store.getProfile(name, toolId);
+  if (
+    expectedProfile &&
+    (profile.tool !== expectedProfile.tool ||
+      profile.name !== expectedProfile.name ||
+      (expectedProfile.incarnationId
+        ? profile.incarnationId !== expectedProfile.incarnationId
+        : profileAuthIncarnation(profile) !== profileAuthIncarnation(expectedProfile)))
+  ) {
+    throw new AccountsError("profile changed while its Claude auth was being applied");
+  }
   const tool = getTool(profile.tool);
 
   if (tool.id !== "claude") {
@@ -107,39 +156,64 @@ export async function applyProfile(
     releaseKeychainLease = await acquireClaudeKeychainLock();
   }
   let keychainBefore: KeychainCredential | undefined;
-  let result: ReturnType<typeof applyProfileAuth> | undefined;
   try {
     keychainBefore = keychainSupported() ? captureClaudeKeychain() : undefined;
-    try {
-      result = withApplyLock(() => {
+    return await withApplyLockAsync(async () => {
+      let result: ReturnType<typeof applyProfileAuth>;
+      try {
         if (tracker) tracker.applyStarted = true;
-        return applyProfileAuth(profile, tool, toolProfiles, tracker);
-      });
-    } catch (error) {
-      restoreKeychainAfterFailure(keychainBefore, error);
-    }
-    if (tracker) tracker.appliedRevision = result.appliedRevision;
-    const operationId = randomUUID();
-    if (tracker) tracker.currentOperationId = operationId;
-    let active;
-    try {
-      active = await store.useProfileForLogin(profile.name, tool.id, operationId);
-    } catch (error) {
-      if (tracker) throw error;
-      await rollbackAppliedState(
-        result.rollback,
-        profile.name,
-        result.appliedRevision,
-        keychainBefore,
-        () => store.restoreCurrentOperation!(tool.id, profile.name, operationId),
-        error,
-      );
-    }
-    if (!active) throw new AccountsError("apply activation ended without a committed result");
-    if (tracker) tracker.currentRevision = active.currentRevision;
-    if (tracker) tracker.currentPreviousName = active.previousCurrentName;
-    if (tracker) tracker.currentPreviousProfileLastUsedAt = active.previousProfileLastUsedAt;
-    return { ...result, profile: active.profile, currentRevision: active.currentRevision };
+        result = applyProfileAuth(profile, tool, toolProfiles, tracker);
+      } catch (error) {
+        restoreKeychainAfterFailure(keychainBefore, error);
+      }
+      if (tracker) tracker.appliedRevision = result.appliedRevision;
+      const operationId = randomUUID();
+      if (tracker) tracker.currentOperationId = operationId;
+      let active;
+      try {
+        active = await useProfileForLogin(profile.name, tool.id, operationId, expectedProfile ?? profile);
+      } catch (error) {
+        if (tracker) throw error;
+        await rollbackAppliedState(
+          result.rollback,
+          profile.name,
+          result.appliedRevision,
+          keychainBefore,
+          () => store.restoreCurrentOperation!(tool.id, profile.name, operationId),
+          error,
+        );
+      }
+      if (!active) throw new AccountsError("apply activation ended without a committed result");
+      if (
+        active.profile.createdAt !== profile.createdAt ||
+        resolve(active.profile.dir) !== resolve(profile.dir) ||
+        (profile.incarnationId && active.profile.incarnationId !== profile.incarnationId)
+      ) {
+        const error = new AccountsError("profile changed while its Claude auth was being applied; apply rolled back");
+        if (tracker) throw error;
+        await rollbackAppliedState(
+          result.rollback,
+          profile.name,
+          result.appliedRevision,
+          keychainBefore,
+          () => store.restoreCurrentOperation!(tool.id, profile.name, operationId),
+          error,
+        );
+      }
+      if (tracker) tracker.currentRevision = active.currentRevision;
+      if (tracker) tracker.currentPreviousName = active.previousCurrentName;
+      if (tracker) tracker.currentPreviousProfileLastUsedAt = active.previousProfileLastUsedAt;
+      if (!tracker) {
+        pruneClaudeProfileCommittedAuthSnapshotSets(
+          result.rollback.profileAuthWrites.flatMap((write) =>
+            write.identity && write.commitRevision
+              ? [{ identity: write.identity, keepRevision: write.commitRevision }]
+              : []
+          ),
+        );
+      }
+      return { ...result, profile: active.profile, currentRevision: active.currentRevision };
+    });
   } finally {
     releaseKeychainLease?.();
   }
@@ -171,13 +245,18 @@ async function rollbackAppliedState(
     rollbackFailed = true;
   }
   try {
-    await withApplyLockWait(() => withStoreLock(() => {
+    withStoreLock(() => {
       const local = loadMachineStore();
-      if (local.applied.claude !== expectedName || local.appliedRevisions.claude !== expectedRevision) return;
+      if (
+        local.applied.claude !== expectedName ||
+        local.appliedRevisions.claude !== expectedRevision ||
+        !ownsApplyAuthWrites(local, rollback)
+      ) return;
       for (const snapshot of [...rollback.profileAuthSnapshots].reverse()) {
         restoreClaudeProfileAuthSnapshot(snapshot);
       }
       restoreClaudeLiveAuthSnapshot(rollback.liveClaude);
+      restoreProfileAuthRefs(local, rollback.profileAuthRefs);
       if (rollback.applied) {
         local.applied.claude = rollback.applied.name;
         local.appliedRevisions.claude = randomUUID();
@@ -186,7 +265,7 @@ async function rollbackAppliedState(
         delete local.appliedRevisions.claude;
       }
       saveStore(local);
-    }));
+    });
   } catch {
     rollbackFailed = true;
   }
@@ -200,6 +279,80 @@ async function rollbackAppliedState(
     throw new AccountsError(`${message}; failed to roll back the interrupted apply transaction`);
   }
   throw original;
+}
+
+function restoreProfileAuthRefs(
+  local: ReturnType<typeof loadMachineStore>,
+  refs: ApplyRollbackState["profileAuthRefs"],
+): void {
+  for (const ref of refs) {
+    if (ref.identity) local.profileAuthRevisions[ref.key] = ref.identity;
+    else delete local.profileAuthRevisions[ref.key];
+    if (ref.commitRevision) local.profileAuthCommitRevisions[ref.key] = ref.commitRevision;
+    else delete local.profileAuthCommitRevisions[ref.key];
+    if (ref.incarnation) local.profileAuthIncarnations[ref.key] = ref.incarnation;
+    else delete local.profileAuthIncarnations[ref.key];
+  }
+}
+
+function captureProfileAuthRef(
+  local: ReturnType<typeof loadMachineStore>,
+  refs: ApplyRollbackState["profileAuthRefs"],
+  key: string,
+): void {
+  if (refs.some((ref) => ref.key === key)) return;
+  const identity = local.profileAuthRevisions[key];
+  const commitRevision = local.profileAuthCommitRevisions[key];
+  const incarnation = local.profileAuthIncarnations[key];
+  refs.push({
+    key,
+    ...(identity ? { identity } : {}),
+    ...(commitRevision ? { commitRevision } : {}),
+    ...(incarnation ? { incarnation } : {}),
+  });
+}
+
+function adoptProfileAuthIncarnation(
+  local: ReturnType<typeof loadMachineStore>,
+  refs: ApplyRollbackState["profileAuthRefs"],
+  profile: Profile,
+): string {
+  const targetKey = profileAuthRevisionKey(profile.tool, profile.name);
+  const sourceKey = findProfileAuthRevisionKey(local, profile);
+  captureProfileAuthRef(local, refs, targetKey);
+  const incarnation = profileAuthIncarnation(profile);
+  const displacedIncarnation = local.profileAuthIncarnations[targetKey];
+  if (displacedIncarnation && displacedIncarnation !== incarnation) {
+    const parkedKey = parkedProfileAuthRevisionKey(displacedIncarnation);
+    captureProfileAuthRef(local, refs, parkedKey);
+    if (
+      local.profileAuthRevisions[parkedKey] ||
+      local.profileAuthCommitRevisions[parkedKey] ||
+      local.profileAuthIncarnations[parkedKey]
+    ) {
+      throw new AccountsError("duplicate parked profile auth ownership");
+    }
+    const displacedIdentity = local.profileAuthRevisions[targetKey];
+    const displacedCommit = local.profileAuthCommitRevisions[targetKey];
+    delete local.profileAuthRevisions[targetKey];
+    delete local.profileAuthCommitRevisions[targetKey];
+    delete local.profileAuthIncarnations[targetKey];
+    if (displacedIdentity) local.profileAuthRevisions[parkedKey] = displacedIdentity;
+    if (displacedCommit) local.profileAuthCommitRevisions[parkedKey] = displacedCommit;
+    local.profileAuthIncarnations[parkedKey] = displacedIncarnation;
+  }
+  if (sourceKey && sourceKey !== targetKey) {
+    captureProfileAuthRef(local, refs, sourceKey);
+    const identity = local.profileAuthRevisions[sourceKey];
+    const commitRevision = local.profileAuthCommitRevisions[sourceKey];
+    delete local.profileAuthRevisions[sourceKey];
+    delete local.profileAuthCommitRevisions[sourceKey];
+    delete local.profileAuthIncarnations[sourceKey];
+    if (identity) local.profileAuthRevisions[targetKey] = identity;
+    if (commitRevision) local.profileAuthCommitRevisions[targetKey] = commitRevision;
+  }
+  local.profileAuthIncarnations[targetKey] = incarnation;
+  return targetKey;
 }
 
 /** Synchronous, machine-local disk work for apply (runs under the apply lock). */
@@ -219,7 +372,11 @@ function applyProfileAuth(
         ? { applied: { name: previous, ...(local.appliedRevisions[tool.id] ? { revision: local.appliedRevisions[tool.id] } : {}) } }
         : {}),
       profileAuthSnapshots: [captureClaudeProfileAuthSnapshot(profile.dir)],
+      profileAuthRefs: [],
+      profileAuthWrites: [],
     };
+    const targetAuthKey = adoptProfileAuthIncarnation(local, rollback.profileAuthRefs, profile);
+    const touchedProfiles = new Map<string, Profile>([[targetAuthKey, profile]]);
     if (tracker) tracker.applyRollback = rollback;
 
     // Preserve whatever auth is currently live by snapshotting it into the
@@ -242,6 +399,8 @@ function applyProfileAuth(
       if (!rollback.profileAuthSnapshots.some((snapshot) => snapshot.base === owner.dir)) {
         rollback.profileAuthSnapshots.push(captureClaudeProfileAuthSnapshot(owner.dir));
       }
+      const ownerAuthKey = adoptProfileAuthIncarnation(local, rollback.profileAuthRefs, owner);
+      touchedProfiles.set(ownerAuthKey, owner);
       try {
         snapshotLiveAuthToProfile(owner.dir, tool);
       } catch (error) {
@@ -257,12 +416,35 @@ function applyProfileAuth(
       local.applied[tool.id] = profile.name;
       const appliedRevision = randomUUID();
       local.appliedRevisions[tool.id] = appliedRevision;
+      for (const [authKey, touchedProfile] of touchedProfiles) {
+        const authIdentity = local.profileAuthRevisions[authKey] ?? randomUUID();
+        const authCommitRevision = randomUUID();
+        writeClaudeProfileCommittedAuthSnapshot(
+          touchedProfile.dir,
+          authIdentity,
+          authCommitRevision,
+        );
+        local.profileAuthRevisions[authKey] = authIdentity;
+        local.profileAuthCommitRevisions[authKey] = authCommitRevision;
+        local.profileAuthIncarnations[authKey] = profileAuthIncarnation(touchedProfile);
+      }
+      const writtenAuthKeys = new Set([
+        ...rollback.profileAuthRefs.map((ref) => ref.key),
+        ...touchedProfiles.keys(),
+      ]);
+      rollback.profileAuthWrites = [...writtenAuthKeys].map((key) => ({
+        key,
+        identity: local.profileAuthRevisions[key] ?? null,
+        commitRevision: local.profileAuthCommitRevisions[key] ?? null,
+        incarnation: local.profileAuthIncarnations[key] ?? null,
+      }));
       saveStore(local);
 
       return { profile, appliedRevision, rollback, ...(previous && previous !== profile.name ? { previous } : {}) };
     } catch (error) {
       for (const snapshot of [...rollback.profileAuthSnapshots].reverse()) restoreClaudeProfileAuthSnapshot(snapshot);
       restoreClaudeLiveAuthSnapshot(rollback.liveClaude);
+      restoreProfileAuthRefs(local, rollback.profileAuthRefs);
       throw error;
     }
   });

@@ -196,17 +196,18 @@ describe("resolveAccountsCloud", () => {
 
   test("transactional login activation uses a route old replicas cannot mutate", async () => {
     const operationId = "11111111-1111-4111-8111-111111111111";
+    const incarnationId = "22222222-2222-4222-8222-222222222222";
     const { calls, fetchImpl } = mockFetch(() => ({
       status: 200,
       body: { tool: "claude", name: "work", updatedAt: "2020-01-01T00:00:00Z", revision: "9", operationId },
     }));
     const r = resolveAccountsCloud(cloudEnv, { fetchImpl });
     if (r.transport !== "cloud-http") throw new Error("expected cloud");
-    expect((await r.api.setCurrentForLogin!("claude", "work", operationId)).revision).toBe("9");
+    expect((await r.api.setCurrentForLogin!("claude", "work", operationId, incarnationId)).revision).toBe("9");
     expect(calls[0]).toMatchObject({
       method: "PUT",
-      url: `${BASE}/v1/current/claude/login`,
-      body: { name: "work", operationId },
+      url: `${BASE}/v1/current/claude/login/activate`,
+      body: { name: "work", operationId, expectedIncarnationId: incarnationId },
     });
   });
 
@@ -215,12 +216,17 @@ describe("resolveAccountsCloud", () => {
     const r = resolveAccountsCloud(cloudEnv, { fetchImpl, sleepImpl: async () => {} });
     if (r.transport !== "cloud-http") throw new Error("expected cloud");
     await expect(
-      r.api.setCurrentForLogin!("claude", "work", "11111111-1111-4111-8111-111111111111"),
+      r.api.setCurrentForLogin!(
+        "claude",
+        "work",
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+      ),
     ).rejects.toThrow(
       /transactional login activation.*Redeploy accounts-serve/s,
     );
     expect(calls).toHaveLength(9);
-    expect(calls[0]!.url).toBe(`${BASE}/v1/current/claude/login`);
+    expect(calls[0]!.url).toBe(`${BASE}/v1/current/claude/login/activate`);
   });
 
   test("transactional login activation retries a lost response with the same operation id", async () => {
@@ -244,11 +250,12 @@ describe("resolveAccountsCloud", () => {
     }) as typeof fetch;
     const r = resolveAccountsCloud(cloudEnv, { fetchImpl, sleepImpl: async () => {} });
     if (r.transport !== "cloud-http") throw new Error("expected cloud");
-    expect((await r.api.setCurrentForLogin!("claude", "work", operationId)).revision).toBe("11");
+    const incarnationId = "33333333-3333-4333-8333-333333333333";
+    expect((await r.api.setCurrentForLogin!("claude", "work", operationId, incarnationId)).revision).toBe("11");
     expect(calls).toHaveLength(2);
     expect(calls.map((call) => call.body)).toEqual([
-      { name: "work", operationId },
-      { name: "work", operationId },
+      { name: "work", operationId, expectedIncarnationId: incarnationId },
+      { name: "work", operationId, expectedIncarnationId: incarnationId },
     ]);
   });
 
@@ -282,7 +289,7 @@ describe("resolveAccountsCloud", () => {
 
     await r.api.restoreProfile!("work", "claude", {
       email: { expected: "failed@example.com", restore: null },
-    });
+    }, "11111111-1111-4111-8111-111111111111");
 
     expect(calls).toHaveLength(3);
     expect(calls.map((call) => call.headers["idempotency-key"])).toEqual([
@@ -291,6 +298,9 @@ describe("resolveAccountsCloud", () => {
       calls[0]!.headers["idempotency-key"],
     ]);
     expect(calls[0]!.headers["idempotency-key"]).toBeTruthy();
+    expect(calls[0]!.body).toMatchObject({
+      expectedIncarnationId: "11111111-1111-4111-8111-111111111111",
+    });
   });
 
   test("restoreCurrentGeneration conditionally restores or clears the failed selection", async () => {

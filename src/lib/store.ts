@@ -28,7 +28,12 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
 import {
+  captureMachineProfileAuthSlotExpectation,
+  captureMachineProfileReconcileExpectation,
+  findProfileAuthRevisionKey,
   profilesDir,
+  profileAuthIncarnation,
+  reconcileMachineProfileCreate,
   reconcileMachineProfileRemove,
   reconcileMachineProfileRename,
 } from "../storage.js";
@@ -77,6 +82,11 @@ export interface ProfileRollbackFields {
   lastUsedAt?: { expected: string | null; restore: string | null };
 }
 
+export interface ProfileRollbackOwnership {
+  authIdentity?: string;
+  authCommitRevision?: string;
+}
+
 export interface UseProfileResult {
   profile: Profile;
   toolId: string;
@@ -96,6 +106,8 @@ export interface RemoveResult {
 /** The single registry surface. LocalStore and ApiStore both implement it. */
 export interface AccountsStore {
   readonly transport: "local" | "api";
+  /** Real API stores require a server-issued profile incarnation before login can launch. */
+  readonly requiresProfileIncarnationRollback?: boolean;
   listProfiles(tool?: string): Promise<Profile[]>;
   getProfile(name: string, tool?: string): Promise<Profile>;
   findProfile(name: string, tool?: string): Promise<Profile | undefined>;
@@ -103,12 +115,29 @@ export interface AccountsStore {
   updateProfile(name: string, opts: UpdateOptions): Promise<Profile>;
   renameProfile(oldName: string, newName: string, tool?: string): Promise<Profile>;
   removeProfile(name: string, opts?: RemoveOptions): Promise<RemoveResult>;
-  redetectEmail(name: string, tool?: string): Promise<Profile>;
+  /** Remove a newly created local profile only while the caller still owns its exact auth identity. */
+  removeProfileIncarnation?(
+    profile: Profile,
+    expectedAuthIdentity: string,
+    expectedAuthCommitRevision: string,
+    expectedToolLockRevision?: string,
+    opts?: RemoveOptions,
+  ): Promise<RemoveResult | undefined>;
+  redetectEmail(name: string, tool?: string, expectedProfile?: Profile): Promise<Profile>;
   /** Restore fields that login finalization may have changed. */
-  restoreProfileState?(profile: Profile, fields: ProfileRollbackFields): Promise<Profile>;
+  restoreProfileState?(
+    profile: Profile,
+    fields: ProfileRollbackFields,
+    ownership?: ProfileRollbackOwnership,
+  ): Promise<Profile>;
   useProfile(name: string, tool?: string): Promise<UseProfileResult>;
   /** Activate through a generation-capable endpoint that old API replicas cannot mutate. */
-  useProfileForLogin?(name: string, tool: string | undefined, operationId: string): Promise<UseProfileResult>;
+  useProfileForLogin?(
+    name: string,
+    tool: string | undefined,
+    operationId: string,
+    expectedProfile?: Profile,
+  ): Promise<UseProfileResult>;
   /** Legacy name-only conditional restore/clear retained for public API compatibility. */
   restoreCurrent(tool: string, expectedName: string, name?: string): Promise<boolean>;
   /** Conditionally restore/clear current only when it still has the failed login write generation. */
@@ -141,8 +170,28 @@ class LocalStore implements AccountsStore {
     tool: string;
     name: string;
     previousCurrentName?: string;
+    previousCurrentIncarnation?: string;
     previousProfileLastUsedAt?: string;
+    previousToolLock?: string;
+    previousToolLockRevision?: string;
+    writtenToolLockRevision: string;
   }>();
+
+  constructor() {
+    // Upgrade legacy local records before any transaction captures ownership.
+    // Persisting under the registry lease makes the UUID stable across every
+    // process and prevents timestamp/path ABA collisions during rollback.
+    withStoreLock(() => {
+      const machine = loadMachineStore();
+      let changed = false;
+      for (const profile of machine.profiles) {
+        if (profile.incarnationId) continue;
+        profile.incarnationId = randomUUID();
+        changed = true;
+      }
+      if (changed) saveStore(machine);
+    });
+  }
 
   async listProfiles(tool?: string): Promise<Profile[]> {
     return localList(tool);
@@ -165,10 +214,66 @@ class LocalStore implements AccountsStore {
   async removeProfile(name: string, opts: RemoveOptions = {}): Promise<RemoveResult> {
     return localRemove(name, opts);
   }
-  async redetectEmail(name: string, tool?: string): Promise<Profile> {
-    return localRedetect(name, tool);
+  async removeProfileIncarnation(
+    profile: Profile,
+    expectedAuthIdentity: string,
+    expectedAuthCommitRevision: string,
+    expectedToolLockRevision?: string,
+    opts: RemoveOptions = {},
+  ): Promise<RemoveResult | undefined> {
+    return withStoreLock(() => {
+      if (profile.tool !== "claude" || !expectedAuthIdentity || !expectedAuthCommitRevision) return undefined;
+      const machine = loadMachineStore();
+      const current = machine.profiles.find(
+        (candidate) =>
+          candidate.name === profile.name &&
+          candidate.tool === profile.tool &&
+          candidate.createdAt === profile.createdAt &&
+          resolve(candidate.dir) === resolve(profile.dir),
+      );
+      if (!current) return undefined;
+      const authKey = findProfileAuthRevisionKey(machine, current);
+      if (
+        !authKey ||
+        machine.profileAuthRevisions[authKey] !== expectedAuthIdentity ||
+        machine.profileAuthCommitRevisions[authKey] !== expectedAuthCommitRevision ||
+        !expectedToolLockRevision ||
+        machine.toolLockRevisions[current.name] !== expectedToolLockRevision ||
+        JSON.stringify(current) !== JSON.stringify(profile)
+      ) {
+        return undefined;
+      }
+      // The outer registry lease spans the identity check, registry removal,
+      // and optional managed-directory purge. A cooperating remove/recreate or
+      // apply cannot interleave between the check and deletion.
+      return localRemove(current.name, { ...opts, tool: current.tool });
+    });
   }
-  async restoreProfileState(profile: Profile, fields: ProfileRollbackFields): Promise<Profile> {
+  async redetectEmail(name: string, tool?: string, expectedProfile?: Profile): Promise<Profile> {
+    if (!expectedProfile) return localRedetect(name, tool);
+    return withStoreLock(() => {
+      const machine = loadMachineStore();
+      const current = machine.profiles.find((profile) => profile.name === name && (!tool || profile.tool === tool));
+      if (
+        !current ||
+        current.tool !== expectedProfile.tool ||
+        profileAuthIncarnation(current) !== profileAuthIncarnation(expectedProfile)
+      ) {
+        throw new AccountsError("profile changed while login finalization was in progress");
+      }
+      const email = detectEmail(current.dir, getTool(current.tool));
+      if (email && (current.email ?? null) === (expectedProfile.email ?? null)) {
+        current.email = email;
+        saveStore(machine);
+      }
+      return structuredClone(current);
+    });
+  }
+  async restoreProfileState(
+    profile: Profile,
+    fields: ProfileRollbackFields,
+    ownership?: ProfileRollbackOwnership,
+  ): Promise<Profile> {
     return withStoreLock(() => {
       const machine = loadMachineStore();
       const index = machine.profiles.findIndex(
@@ -176,6 +281,26 @@ class LocalStore implements AccountsStore {
       );
       if (index < 0) throw new AccountsError(`no profile named "${profile.name}" for tool "${profile.tool}"`);
       const current = machine.profiles[index]!;
+      if (profile.tool === "claude") {
+        const authKey = findProfileAuthRevisionKey(machine, current);
+        if (
+          !authKey ||
+          !ownership?.authIdentity ||
+          !ownership.authCommitRevision ||
+          machine.profileAuthRevisions[authKey] !== ownership.authIdentity ||
+          machine.profileAuthCommitRevisions[authKey] !== ownership.authCommitRevision
+        ) {
+          return structuredClone(current);
+        }
+      } else if (
+        !profile.incarnationId ||
+        !current.incarnationId ||
+        current.incarnationId !== profile.incarnationId
+      ) {
+        // Truly legacy records that have not crossed the LocalStore upgrade
+        // boundary fail closed instead of trusting timestamp/path equality.
+        return structuredClone(current);
+      }
       if (fields.email && (current.email ?? null) === fields.email.expected) {
         if (fields.email.restore === null) delete current.email;
         else current.email = fields.email.restore;
@@ -191,7 +316,12 @@ class LocalStore implements AccountsStore {
   async useProfile(name: string, tool?: string): Promise<UseProfileResult> {
     return localUse(name, tool);
   }
-  async useProfileForLogin(name: string, tool: string | undefined, operationId: string): Promise<UseProfileResult> {
+  async useProfileForLogin(
+    name: string,
+    tool: string | undefined,
+    operationId: string,
+    expectedProfile?: Profile,
+  ): Promise<UseProfileResult> {
     return withStoreLock(() => {
       const machine = loadMachineStore();
       const matches = machine.profiles.filter(
@@ -207,18 +337,34 @@ class LocalStore implements AccountsStore {
         );
       }
       const profile = matches[0]!;
+      if (expectedProfile && profileAuthIncarnation(profile) !== profileAuthIncarnation(expectedProfile)) {
+        throw new AccountsError("profile changed while login activation was in progress");
+      }
       const previousCurrentName = machine.current[profile.tool];
+      const previousCurrentProfile = previousCurrentName
+        ? machine.profiles.find((candidate) => candidate.name === previousCurrentName && candidate.tool === profile.tool)
+        : undefined;
       const previousProfileLastUsedAt = profile.lastUsedAt;
+      const previousToolLock = machine.toolLocks[profile.name];
+      const previousToolLockRevision = machine.toolLockRevisions[profile.name];
       machine.current[profile.tool] = profile.name;
       machine.currentRevisions[profile.tool] = operationId;
+      const writtenToolLockRevision = randomUUID();
       machine.toolLocks[profile.name] = profile.tool;
+      machine.toolLockRevisions[profile.name] = writtenToolLockRevision;
       profile.lastUsedAt = new Date().toISOString();
       saveStore(machine);
       this.loginOperations.set(operationId, {
         tool: profile.tool,
         name: profile.name,
         ...(previousCurrentName ? { previousCurrentName } : {}),
+        ...(previousCurrentProfile
+          ? { previousCurrentIncarnation: profileAuthIncarnation(previousCurrentProfile) }
+          : {}),
         ...(previousProfileLastUsedAt ? { previousProfileLastUsedAt } : {}),
+        ...(previousToolLock ? { previousToolLock } : {}),
+        ...(previousToolLockRevision ? { previousToolLockRevision } : {}),
+        writtenToolLockRevision,
       });
       return {
         profile: structuredClone(profile),
@@ -284,7 +430,17 @@ class LocalStore implements AccountsStore {
       if (operation && (operation.tool !== tool || operation.name !== expectedName)) {
         throw new AccountsError("login operation id is already bound to another profile");
       }
-      const restoreName = operation ? operation.previousCurrentName : name;
+      const requestedRestoreName = operation ? operation.previousCurrentName : name;
+      const restoreName = requestedRestoreName && operation?.previousCurrentIncarnation
+        ? machine.profiles.some(
+            (profile) =>
+              profile.name === requestedRestoreName &&
+              profile.tool === tool &&
+              profileAuthIncarnation(profile) === operation.previousCurrentIncarnation,
+          )
+          ? requestedRestoreName
+          : undefined
+        : requestedRestoreName;
       const restoreProfileLastUsedAt = operation
         ? operation.previousProfileLastUsedAt ?? null
         : restoreLastUsedAt;
@@ -294,6 +450,19 @@ class LocalStore implements AccountsStore {
       if (restoreProfileLastUsedAt !== undefined && failedProfile) {
         if (restoreProfileLastUsedAt === null) delete failedProfile.lastUsedAt;
         else failedProfile.lastUsedAt = restoreProfileLastUsedAt;
+      }
+      if (operation && machine.toolLockRevisions[expectedName] === operation.writtenToolLockRevision) {
+        if (operation.previousToolLock) {
+          machine.toolLocks[expectedName] = operation.previousToolLock;
+          if (operation.previousToolLockRevision) {
+            machine.toolLockRevisions[expectedName] = operation.previousToolLockRevision;
+          } else {
+            machine.toolLockRevisions[expectedName] = randomUUID();
+          }
+        } else {
+          delete machine.toolLocks[expectedName];
+          delete machine.toolLockRevisions[expectedName];
+        }
       }
       if (restoreName) {
         if (!machine.profiles.some((profile) => profile.name === restoreName && profile.tool === tool)) {
@@ -346,6 +515,7 @@ class LocalStore implements AccountsStore {
  */
 class ApiStore implements AccountsStore {
   readonly transport = "api" as const;
+  readonly requiresProfileIncarnationRollback = true;
 
   constructor(private readonly api: AccountsCloudApi) {}
 
@@ -369,13 +539,16 @@ class ApiStore implements AccountsStore {
   async addProfile(opts: AddOptions): Promise<Profile> {
     assertProfileName(opts.name);
     const toolId = opts.tool ?? DEFAULT_TOOL;
+    const authExpectation = toolId === "claude"
+      ? captureMachineProfileAuthSlotExpectation(toolId, opts.name)
+      : undefined;
     const tool = await this.resolveTool(toolId);
     const managed = opts.dir === undefined;
     const dir = managed ? join(profilesDir(), toolId, opts.name) : validatedDirectoryPath(opts.dir!);
     const created = prepareProfileDirectory(dir, managed);
     const email = opts.email ?? detectEmail(dir, tool) ?? undefined;
     try {
-      return await this.api.create({
+      const profile = await this.api.create({
         name: opts.name,
         tool: toolId,
         email,
@@ -386,6 +559,8 @@ class ApiStore implements AccountsStore {
         dir,
         description: opts.description,
       });
+      if (authExpectation) reconcileMachineProfileCreate(profile, authExpectation);
+      return profile;
     } catch (error) {
       if (created) rmSync(dir, { recursive: true, force: true });
       throw error;
@@ -415,36 +590,71 @@ class ApiStore implements AccountsStore {
   async renameProfile(oldName: string, newName: string, tool?: string): Promise<Profile> {
     assertProfileName(newName);
     const existing = await this.resolve(oldName, tool);
+    const expectation = captureMachineProfileReconcileExpectation(existing);
     const renamed = await this.api.rename(oldName, newName, existing.tool);
-    reconcileMachineProfileRename(existing.tool, oldName, newName);
+    reconcileMachineProfileRename(existing.tool, oldName, newName, expectation);
     return renamed;
   }
 
   async removeProfile(name: string, opts: RemoveOptions = {}): Promise<RemoveResult> {
-    const profile = await this.api.remove(name, opts.tool);
-    reconcileMachineProfileRemove(profile.tool, profile.name);
+    const existing = await this.resolve(name, opts.tool);
+    const expectation = captureMachineProfileReconcileExpectation(existing);
+    const profile = await this.api.remove(existing.name, existing.tool);
+    reconcileMachineProfileRemove(
+      profile.tool,
+      profile.name,
+      profileAuthIncarnation(profile),
+      expectation,
+    );
     const purgeNote = opts.purge
       ? "--purge is a local-only operation; the config dir (if any) was not touched in self_hosted mode"
       : undefined;
     return { profile, purged: false, ...(purgeNote ? { purgeNote } : {}) };
   }
 
-  async redetectEmail(name: string, tool?: string): Promise<Profile> {
+  async redetectEmail(name: string, tool?: string, expectedProfile?: Profile): Promise<Profile> {
     const profile = await this.resolve(name, tool);
+    if (expectedProfile?.incarnationId && profile.incarnationId !== expectedProfile.incarnationId) {
+      throw new AccountsError("profile changed while login finalization was in progress");
+    }
     if (!profile.dir || !existsSync(profile.dir)) return profile;
     const email = detectEmail(profile.dir, getTool(profile.tool));
     if (!email || email === profile.email) return profile;
+    if (expectedProfile) {
+      if (!expectedProfile.incarnationId || !this.api.redetectEmailForLogin) {
+        throw new AccountsError(
+          "the configured Accounts API store does not support incarnation-aware login profile updates",
+        );
+      }
+      return this.api.redetectEmailForLogin(
+        name,
+        profile.tool,
+        email,
+        expectedProfile.incarnationId,
+        expectedProfile.email,
+      );
+    }
     return this.api.update(name, profile.tool, { email });
   }
 
-  async restoreProfileState(profile: Profile, fields: ProfileRollbackFields): Promise<Profile> {
+  async restoreProfileState(
+    profile: Profile,
+    fields: ProfileRollbackFields,
+    _ownership?: ProfileRollbackOwnership,
+  ): Promise<Profile> {
     if (!this.api.restoreProfile) {
       throw new AccountsError(
         "the configured Accounts API store does not support transactional profile rollback; " +
         "upgrade the custom store before running accounts login",
       );
     }
-    return this.api.restoreProfile(profile.name, profile.tool, fields);
+    if (!profile.incarnationId) {
+      throw new AccountsError(
+        "accounts-serve did not return an account incarnation for transactional profile rollback; " +
+        "redeploy accounts-serve 0.2.9 or newer before running accounts login",
+      );
+    }
+    return this.api.restoreProfile(profile.name, profile.tool, fields, profile.incarnationId);
   }
 
   async useProfile(name: string, tool?: string): Promise<UseProfileResult> {
@@ -461,7 +671,12 @@ class ApiStore implements AccountsStore {
     };
   }
 
-  async useProfileForLogin(name: string, tool: string | undefined, operationId: string): Promise<UseProfileResult> {
+  async useProfileForLogin(
+    name: string,
+    tool: string | undefined,
+    operationId: string,
+    expectedProfile?: Profile,
+  ): Promise<UseProfileResult> {
     if (!this.api.setCurrentForLogin) {
       throw new AccountsError(
         "the configured Accounts API store does not support transactional login activation; " +
@@ -469,7 +684,16 @@ class ApiStore implements AccountsStore {
       );
     }
     const profile = await this.resolve(name, tool);
-    const current = await this.api.setCurrentForLogin(profile.tool, profile.name, operationId);
+    const expectedIncarnationId = expectedProfile?.incarnationId ?? profile.incarnationId;
+    if (!expectedIncarnationId || profile.incarnationId !== expectedIncarnationId) {
+      throw new AccountsError("profile changed while login activation was in progress");
+    }
+    const current = await this.api.setCurrentForLogin(
+      profile.tool,
+      profile.name,
+      operationId,
+      expectedIncarnationId,
+    );
     return {
       profile: { ...profile, lastUsedAt: current.updatedAt },
       toolId: profile.tool,

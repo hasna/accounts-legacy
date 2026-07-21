@@ -18,6 +18,7 @@ import { AccountsRepo, type AccountsStore } from "./repo.js";
 import { accountsMigrations, readMigrationStatus } from "./migrations.js";
 import {
   createAccountSchema,
+  loginUpdateAccountSchema,
   restoreAccountSchema,
   setLoginCurrentSchema,
   updateAccountSchema,
@@ -219,7 +220,10 @@ export function createHandler(ctx: ServiceContext): (req: Request) => Promise<Re
         return json(renamed, 200);
       }
 
-      const profileRestoreMatch = pathname.match(/^\/v1\/accounts\/([^/]+)\/([^/]+)\/restore$/);
+      // New-only route: earlier 0.2.9 candidates exposed /restore with a
+      // non-strict body that could strip incarnation ownership. Keeping the
+      // /login/restore discriminator makes mixed-version replicas fail closed.
+      const profileRestoreMatch = pathname.match(/^\/v1\/accounts\/([^/]+)\/([^/]+)\/login\/restore$/);
       if (profileRestoreMatch && method === "POST") {
         const denied = await authorize(req, url, SCOPES.write);
         if (denied) return denied;
@@ -231,6 +235,20 @@ export function createHandler(ctx: ServiceContext): (req: Request) => Promise<Re
         const name = decodeURIComponent(profileRestoreMatch[2]!);
         const restored = await ctx.repo.restoreProfile(tool, name, input.data);
         return json(restored, 200);
+      }
+
+      const profileLoginUpdateMatch = pathname.match(/^\/v1\/accounts\/([^/]+)\/([^/]+)\/login\/update$/);
+      if (profileLoginUpdateMatch && method === "PATCH") {
+        const denied = await authorize(req, url, SCOPES.write);
+        if (denied) return denied;
+        const parsedBody = await parseJson(req);
+        if (!parsedBody.ok) return parsedBody.res;
+        const input = loginUpdateAccountSchema.safeParse(parsedBody.value);
+        if (!input.success) return json(errorBody(zodMessage(input.error)), 400);
+        const tool = decodeURIComponent(profileLoginUpdateMatch[1]!);
+        const name = decodeURIComponent(profileLoginUpdateMatch[2]!);
+        const updated = await ctx.repo.updateForLogin(tool, name, input.data);
+        return json(updated, 200);
       }
 
       const accountMatch = pathname.match(/^\/v1\/accounts\/([^/]+)\/([^/]+)$/);
@@ -321,7 +339,7 @@ export function createHandler(ctx: ServiceContext): (req: Request) => Promise<Re
         return json({ restored }, 200);
       }
 
-      const currentLoginMatch = pathname.match(/^\/v1\/current\/([^/]+)\/login$/);
+      const currentLoginMatch = pathname.match(/^\/v1\/current\/([^/]+)\/login\/activate$/);
       if (currentLoginMatch && method === "PUT") {
         const denied = await authorize(req, url, SCOPES.write);
         if (denied) return denied;
@@ -330,7 +348,12 @@ export function createHandler(ctx: ServiceContext): (req: Request) => Promise<Re
         const input = setLoginCurrentSchema.safeParse(parsedBody.value);
         if (!input.success) return json(errorBody(zodMessage(input.error)), 400);
         const tool = decodeURIComponent(currentLoginMatch[1]!);
-        const current = await ctx.repo.setCurrentForLogin(tool, input.data.name, input.data.operationId);
+        const current = await ctx.repo.setCurrentForLogin(
+          tool,
+          input.data.name,
+          input.data.operationId,
+          input.data.expectedIncarnationId,
+        );
         return json(current, 200);
       }
 

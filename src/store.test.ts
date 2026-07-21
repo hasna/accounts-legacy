@@ -8,7 +8,12 @@ import { resolveSupervisorLaunch } from "./lib/supervisor.js";
 import { clearCustomToolsCache, getTool } from "./lib/tools.js";
 import { loginToolChoices, prepareLogin, rollbackLoginPreparation } from "./lib/login.js";
 import { importProfile } from "./lib/import-profile.js";
-import { loadMachineStore, saveStore } from "./storage.js";
+import {
+  loadMachineStore,
+  profileAuthIncarnation,
+  profileAuthRevisionKey,
+  saveStore,
+} from "./storage.js";
 
 const BASE = "https://accounts.hasna.xyz";
 const KEY = "hasna_accounts_testkey_0000";
@@ -16,13 +21,15 @@ const cloudEnv = { HASNA_ACCOUNTS_API_URL: BASE, HASNA_ACCOUNTS_API_KEY: KEY } a
 
 type Call = { method: string; url: string; body: unknown };
 
-function mockFetch(routes: (call: Call) => { status: number; body: unknown }) {
+function mockFetch(
+  routes: (call: Call) => { status: number; body: unknown } | Promise<{ status: number; body: unknown }>,
+) {
   const calls: Call[] = [];
   const fetchImpl = (async (input: unknown, init?: RequestInit) => {
     const url = String(input);
     const body = init?.body ? JSON.parse(init.body as string) : null;
     calls.push({ method: init?.method ?? "GET", url, body });
-    const { status, body: resBody } = routes(calls[calls.length - 1]!);
+    const { status, body: resBody } = await routes(calls[calls.length - 1]!);
     return new Response(status === 204 ? null : JSON.stringify(resBody), {
       status,
       headers: { "content-type": "application/json" },
@@ -99,7 +106,15 @@ describe("ApiStore routes registry ops to /v1", () => {
     const operationId = "11111111-1111-4111-8111-111111111111";
     const { calls, fetchImpl } = mockFetch((c) => {
       if (c.method === "GET") {
-        return { status: 200, body: { tool: "claude", name: "work", createdAt: "2020-01-01T00:00:00Z" } };
+        return {
+          status: 200,
+          body: {
+            tool: "claude",
+            name: "work",
+            createdAt: "2020-01-01T00:00:00Z",
+            incarnationId: "11111111-1111-4111-8111-111111111111",
+          },
+        };
       }
       return {
         status: 200,
@@ -112,12 +127,12 @@ describe("ApiStore routes registry ops to /v1", () => {
       "claude",
       operationId,
     )).currentRevision).toBe("8");
-    expect(calls.some((c) => c.method === "PUT" && c.url === `${BASE}/v1/current/claude/login`)).toBe(true);
+    expect(calls.some((c) => c.method === "PUT" && c.url === `${BASE}/v1/current/claude/login/activate`)).toBe(true);
   });
 
   test("rollback helpers restore nullable profile state and conditionally clear API current", async () => {
     const { calls, fetchImpl } = mockFetch((c) => {
-      if (c.url.endsWith("/accounts/claude/work/restore")) {
+      if (c.url.endsWith("/accounts/claude/work/login/restore")) {
         return { status: 200, body: { tool: "claude", name: "work", createdAt: "2020-01-01T00:00:00Z" } };
       }
       return { status: 200, body: { restored: true } };
@@ -129,13 +144,17 @@ describe("ApiStore routes registry ops to /v1", () => {
         tool: "claude",
         dir: "/profiles/work",
         createdAt: "2020-01-01T00:00:00Z",
+        incarnationId: "11111111-1111-4111-8111-111111111111",
       },
       { email: { expected: "failed@example.com", restore: null } },
     );
     expect(calls[0]).toMatchObject({
       method: "POST",
-      url: `${BASE}/v1/accounts/claude/work/restore`,
-      body: { email: { expected: "failed@example.com", restore: null } },
+      url: `${BASE}/v1/accounts/claude/work/login/restore`,
+      body: {
+        expectedIncarnationId: "11111111-1111-4111-8111-111111111111",
+        email: { expected: "failed@example.com", restore: null },
+      },
     });
     expect(await store.restoreCurrentGeneration!("claude", "work", "7")).toBe(true);
     expect(calls[1]).toMatchObject({
@@ -330,7 +349,7 @@ describe("ApiStore routes registry ops to /v1", () => {
       expect(calls[0]!.url).toBe(`${BASE}/v1/tools`);
     });
 
-    test("failed cloud login rollback removes its registry profile and newly created managed directory", async () => {
+    test("failed cloud login rollback leaves a created profile when the API cannot prove deletion ownership", async () => {
       const executableTool = { ...acme, bin: process.execPath };
       const profile = {
         tool: "acme",
@@ -345,6 +364,9 @@ describe("ApiStore routes registry ops to /v1", () => {
         }
         if (call.method === "GET" && call.url.endsWith("/accounts/acme/failed")) {
           return created ? { status: 200, body: profile } : { status: 404, body: { error: "not found" } };
+        }
+        if (call.method === "GET" && call.url.endsWith("/accounts?tool=acme")) {
+          return { status: 200, body: { accounts: created ? [profile] : [] } };
         }
         if (call.method === "POST" && call.url.endsWith("/accounts")) {
           created = true;
@@ -364,9 +386,9 @@ describe("ApiStore routes registry ops to /v1", () => {
       expect(existsSync(profile.dir)).toBe(true);
       await rollbackLoginPreparation(prepared, store);
 
-      expect(created).toBe(false);
-      expect(existsSync(profile.dir)).toBe(false);
-      expect(calls.some((call) => call.method === "DELETE" && call.url.endsWith("/accounts/acme/failed"))).toBe(true);
+      expect(created).toBe(true);
+      expect(existsSync(profile.dir)).toBe(true);
+      expect(calls.some((call) => call.method === "DELETE" && call.url.endsWith("/accounts/acme/failed"))).toBe(false);
     });
 
     test("login validation rejects a cloud custom tool before profile creation", async () => {
@@ -584,7 +606,9 @@ describe("ApiStore routes registry ops to /v1", () => {
       saveStore({
         version: 1,
         current: { acme: "old" },
+        currentRevisions: { acme: "current-old" },
         applied: { acme: "old" },
+        appliedRevisions: { acme: "applied-old" },
         toolLocks: { old: "acme" },
         profiles: [],
         tools: [],
@@ -605,6 +629,234 @@ describe("ApiStore routes registry ops to /v1", () => {
       await store.removeProfile("new", { tool: "acme" });
       expect(loadMachineStore().current).toEqual({});
       expect(loadMachineStore().applied).toEqual({});
+    });
+
+    for (const operation of ["rename", "remove"] as const) {
+      test(`delayed API ${operation} reconciliation cannot overwrite a newer local profile generation`, async () => {
+        const createdAt = "2020-01-01T00:00:00Z";
+        const profile = { tool: "acme", name: "old", dir: "", createdAt };
+        const authKey = "acme/old";
+        const initialIncarnation = profileAuthIncarnation(profile);
+        saveStore({
+          version: 1,
+          current: { acme: "old" },
+          currentRevisions: { acme: "current-initial" },
+          applied: { acme: "old" },
+          appliedRevisions: { acme: "applied-initial" },
+          profileAuthRevisions: { [authKey]: "auth-initial" },
+          profileAuthCommitRevisions: { [authKey]: "commit-initial" },
+          profileAuthIncarnations: { [authKey]: initialIncarnation },
+          toolLocks: { old: "acme" },
+          profiles: [],
+          tools: [],
+        });
+
+        let releaseResponse!: () => void;
+        const responseReleased = new Promise<void>((resolve) => { releaseResponse = resolve; });
+        let requestStarted!: () => void;
+        const requestReachedServer = new Promise<void>((resolve) => { requestStarted = resolve; });
+        const { fetchImpl } = mockFetch(async (call) => {
+          if (call.url.endsWith("/tools")) {
+            return { status: 200, body: { tools: [{ ...acme, builtin: false }] } };
+          }
+          if (call.method === "POST" && call.url.endsWith("/rename")) {
+            requestStarted();
+            await responseReleased;
+            return { status: 200, body: { ...profile, name: "new" } };
+          }
+          if (call.method === "DELETE") {
+            requestStarted();
+            await responseReleased;
+            return { status: 204, body: null };
+          }
+          return { status: 200, body: profile };
+        });
+        const store = resolveStore(cloudEnv, { fetchImpl });
+        const pending = operation === "rename"
+          ? store.renameProfile("old", "new", "acme")
+          : store.removeProfile("old", { tool: "acme" });
+        await requestReachedServer;
+
+        const concurrent = loadMachineStore();
+        concurrent.current.acme = "old";
+        concurrent.currentRevisions.acme = "current-concurrent";
+        concurrent.applied.acme = "old";
+        concurrent.appliedRevisions.acme = "applied-concurrent";
+        concurrent.profileAuthRevisions[authKey] = "auth-concurrent";
+        concurrent.profileAuthCommitRevisions[authKey] = "commit-concurrent";
+        concurrent.profileAuthIncarnations[authKey] = profileAuthIncarnation({
+          ...profile,
+          createdAt: "2020-01-02T00:00:00Z",
+        });
+        saveStore(concurrent);
+
+        releaseResponse();
+        await pending;
+        expect(loadMachineStore()).toMatchObject({
+          current: { acme: "old" },
+          currentRevisions: { acme: "current-concurrent" },
+          applied: { acme: "old" },
+          appliedRevisions: { acme: "applied-concurrent" },
+          profileAuthRevisions: { [authKey]: "auth-concurrent" },
+          profileAuthCommitRevisions: { [authKey]: "commit-concurrent" },
+          toolLocks: { old: "acme" },
+        });
+      });
+    }
+
+    test("delayed API remove deletes only its parked auth alias, not a recreated direct generation", async () => {
+      const profile = { tool: "acme", name: "old", dir: "", createdAt: "2020-01-01T00:00:00Z" };
+      const incarnation = profileAuthIncarnation(profile);
+      const parkedKey = `@incarnation/${incarnation}`;
+      const directKey = "acme/old";
+      saveStore({
+        version: 1,
+        current: {},
+        applied: {},
+        profileAuthRevisions: { [parkedKey]: "auth-removed" },
+        profileAuthCommitRevisions: { [parkedKey]: "commit-removed" },
+        profileAuthIncarnations: { [parkedKey]: incarnation },
+        toolLocks: {},
+        profiles: [],
+        tools: [],
+      });
+      let requestStarted!: () => void;
+      const requestReachedServer = new Promise<void>((resolve) => { requestStarted = resolve; });
+      let releaseResponse!: () => void;
+      const responseReleased = new Promise<void>((resolve) => { releaseResponse = resolve; });
+      const { fetchImpl } = mockFetch(async (call) => {
+        if (call.url.endsWith("/tools")) {
+          return { status: 200, body: { tools: [{ ...acme, builtin: false }] } };
+        }
+        if (call.method === "DELETE") {
+          requestStarted();
+          await responseReleased;
+          return { status: 204, body: null };
+        }
+        return { status: 200, body: profile };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      const pending = store.removeProfile(profile.name, { tool: profile.tool });
+      await requestReachedServer;
+
+      const concurrent = loadMachineStore();
+      concurrent.profileAuthRevisions[directKey] = "auth-recreated-apply";
+      concurrent.profileAuthCommitRevisions[directKey] = "commit-recreated-apply";
+      concurrent.profileAuthIncarnations[directKey] = incarnation;
+      saveStore(concurrent);
+      releaseResponse();
+      await pending;
+
+      const machine = loadMachineStore();
+      expect(machine.profileAuthRevisions[parkedKey]).toBeUndefined();
+      expect(machine.profileAuthCommitRevisions[parkedKey]).toBeUndefined();
+      expect(machine.profileAuthIncarnations[parkedKey]).toBeUndefined();
+      expect(machine.profileAuthRevisions[directKey]).toBe("auth-recreated-apply");
+      expect(machine.profileAuthCommitRevisions[directKey]).toBe("commit-recreated-apply");
+      expect(machine.profileAuthIncarnations[directKey]).toBe(incarnation);
+    });
+
+    test("API create rotates stale same-incarnation auth ownership", async () => {
+      const profile = {
+        tool: "claude",
+        name: "acct",
+        dir: join(home, "profiles", "claude", "acct"),
+        createdAt: "2020-01-01T00:00:00Z",
+      };
+      const authKey = "claude/acct";
+      saveStore({
+        version: 1,
+        current: {},
+        applied: {},
+        profileAuthRevisions: { [authKey]: "auth-removed-profile" },
+        profileAuthCommitRevisions: { [authKey]: "commit-removed-profile" },
+        profileAuthIncarnations: { [authKey]: profileAuthIncarnation(profile) },
+        toolLocks: {},
+        profiles: [],
+        tools: [],
+      });
+      const { fetchImpl } = mockFetch(() => ({ status: 201, body: profile }));
+      const store = resolveStore(cloudEnv, { fetchImpl });
+
+      await store.addProfile({ name: profile.name, tool: profile.tool });
+
+      const machine = loadMachineStore();
+      expect(machine.profileAuthRevisions[authKey]).not.toBe("auth-removed-profile");
+      expect(machine.profileAuthRevisions[authKey]).toBeTruthy();
+      expect(machine.profileAuthCommitRevisions[authKey]).toBeUndefined();
+      expect(machine.profileAuthIncarnations[authKey]).toBe(profileAuthIncarnation(profile));
+    });
+
+    test("API remove owns a just-created auth identity before its first commit", async () => {
+      const profile = {
+        tool: "claude",
+        name: "acct",
+        dir: join(home, "profiles", "claude", "acct"),
+        createdAt: "2020-01-01T00:00:00Z",
+      };
+      const authKey = "claude/acct";
+      const { fetchImpl } = mockFetch((call) => {
+        if (call.method === "POST") return { status: 201, body: profile };
+        if (call.method === "DELETE") return { status: 204, body: null };
+        return { status: 200, body: profile };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      await store.addProfile({ name: profile.name, tool: profile.tool });
+      expect(loadMachineStore().profileAuthRevisions[authKey]).toBeTruthy();
+      expect(loadMachineStore().profileAuthCommitRevisions[authKey]).toBeUndefined();
+
+      await store.removeProfile(profile.name, { tool: profile.tool });
+
+      expect(loadMachineStore().profileAuthRevisions[authKey]).toBeUndefined();
+      expect(loadMachineStore().profileAuthCommitRevisions[authKey]).toBeUndefined();
+      expect(loadMachineStore().profileAuthIncarnations[authKey]).toBeUndefined();
+    });
+
+    test("delayed API create cannot rotate a newer apply-owned auth generation", async () => {
+      const profile = {
+        tool: "claude",
+        name: "acct",
+        dir: join(home, "profiles", "claude", "acct"),
+        createdAt: "2020-01-01T00:00:00Z",
+      };
+      const authKey = "claude/acct";
+      saveStore({
+        version: 1,
+        current: {},
+        applied: {},
+        profileAuthRevisions: { [authKey]: "auth-before-create" },
+        profileAuthCommitRevisions: { [authKey]: "commit-before-create" },
+        profileAuthIncarnations: { [authKey]: profileAuthIncarnation(profile) },
+        toolLocks: {},
+        profiles: [],
+        tools: [],
+      });
+      let requestStarted!: () => void;
+      const requestReachedServer = new Promise<void>((resolve) => { requestStarted = resolve; });
+      let releaseResponse!: () => void;
+      const responseReleased = new Promise<void>((resolve) => { releaseResponse = resolve; });
+      const { fetchImpl } = mockFetch(async () => {
+        requestStarted();
+        await responseReleased;
+        return { status: 201, body: profile };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      const pending = store.addProfile({ name: profile.name, tool: profile.tool });
+      await requestReachedServer;
+
+      const concurrent = loadMachineStore();
+      concurrent.profileAuthRevisions[authKey] = "auth-concurrent-apply";
+      concurrent.profileAuthCommitRevisions[authKey] = "commit-concurrent-apply";
+      concurrent.profileAuthIncarnations[authKey] = "incarnation-concurrent-apply";
+      saveStore(concurrent);
+      releaseResponse();
+      await pending;
+
+      expect(loadMachineStore()).toMatchObject({
+        profileAuthRevisions: { [authKey]: "auth-concurrent-apply" },
+        profileAuthCommitRevisions: { [authKey]: "commit-concurrent-apply" },
+        profileAuthIncarnations: { [authKey]: "incarnation-concurrent-apply" },
+      });
     });
 
     test("switching from cloud to explicit local mode clears remote tool state", async () => {
@@ -665,5 +917,158 @@ describe("LocalStore reads/writes the on-box registry", () => {
 
     expect(await store.restoreCurrent("claude", "failed", "prior")).toBe(true);
     expect((await store.currentProfile("claude"))?.name).toBe("prior");
+  });
+
+  test("operation rollback never restores a recreated local profile with colliding legacy fields", async () => {
+    const store = resolveStore({ ACCOUNTS_HOME: home } as NodeJS.ProcessEnv);
+    const prior = await store.addProfile({ name: "prior", tool: "claude" });
+    const failed = await store.addProfile({ name: "failed", tool: "claude" });
+    await store.useProfile("prior", "claude");
+    const operationId = "local-incarnation-collision";
+    await store.useProfileForLogin!("failed", "claude", operationId, failed);
+
+    await store.removeProfile("prior", { tool: "claude" });
+    const replacement = await store.addProfile({ name: "prior", tool: "claude" });
+    const machine = loadMachineStore();
+    const replacementRecord = machine.profiles.find(
+      (profile) => profile.name === replacement.name && profile.tool === replacement.tool,
+    );
+    if (!replacementRecord) throw new Error("missing local incarnation replacement fixture");
+    replacementRecord.createdAt = prior.createdAt;
+    replacementRecord.dir = prior.dir;
+    saveStore(machine);
+
+    expect(await store.restoreCurrentOperation!("claude", "failed", operationId)).toBe(true);
+    expect(await store.currentProfile("claude")).toBeUndefined();
+  });
+
+  test("failed new-login preparation does not remove a same-metadata profile with a newer auth commit", async () => {
+    const store = resolveStore({
+      ACCOUNTS_HOME: home,
+      HASNA_ACCOUNTS_STORAGE_MODE: "local",
+    } as NodeJS.ProcessEnv);
+    const original = await store.addProfile({ name: "recreated", tool: "claude" });
+    const preparation = {
+      status: "ready" as const,
+      profile: original,
+      tool: getTool("claude"),
+      args: [],
+      created: true,
+      createdProfileDir: true,
+    };
+    const originalIdentity = "failed-login-auth-identity";
+    const originalCommit = "failed-login-auth-commit";
+    const originalKey = profileAuthRevisionKey(original.tool, original.name);
+    const originalMachine = loadMachineStore();
+    originalMachine.profileAuthRevisions[originalKey] = originalIdentity;
+    originalMachine.profileAuthCommitRevisions[originalKey] = originalCommit;
+    originalMachine.profileAuthIncarnations[originalKey] = profileAuthIncarnation(original);
+    saveStore(originalMachine);
+    await store.removeProfile(original.name, { tool: original.tool });
+    const replacement = await store.addProfile({ name: original.name, tool: original.tool });
+    const replacementIdentity = originalIdentity;
+    const replacementMachine = loadMachineStore();
+    const replacementRecord = replacementMachine.profiles.find(
+      (profile) => profile.name === replacement.name && profile.tool === replacement.tool,
+    );
+    if (!replacementRecord) throw new Error("missing replacement profile fixture");
+    replacementRecord.createdAt = original.createdAt;
+    replacementMachine.profileAuthRevisions[originalKey] = replacementIdentity;
+    replacementMachine.profileAuthCommitRevisions[originalKey] = "replacement-auth-commit";
+    replacementMachine.profileAuthIncarnations[originalKey] = profileAuthIncarnation(replacementRecord);
+    saveStore(replacementMachine);
+    writeFileSync(join(replacement.dir, "replacement.json"), '{"keep":true}\n', { mode: 0o600 });
+
+    await rollbackLoginPreparation(preparation, store, originalIdentity, originalCommit);
+
+    expect((await store.getProfile(replacement.name, replacement.tool)).createdAt).toBe(original.createdAt);
+    expect(loadMachineStore().profileAuthRevisions[originalKey]).toBe(replacementIdentity);
+    expect(existsSync(join(replacement.dir, "replacement.json"))).toBe(true);
+  });
+
+  test("failed-login email rollback does not mutate a recreated Claude profile", async () => {
+    const store = resolveStore({
+      ACCOUNTS_HOME: home,
+      HASNA_ACCOUNTS_STORAGE_MODE: "local",
+    } as NodeJS.ProcessEnv);
+    const original = await store.addProfile({
+      name: "email-aba",
+      tool: "claude",
+      email: "failed@example.test",
+    });
+    const authKey = profileAuthRevisionKey(original.tool, original.name);
+    const originalMachine = loadMachineStore();
+    originalMachine.profileAuthRevisions[authKey] = "original-auth-identity";
+    originalMachine.profileAuthCommitRevisions[authKey] = "original-auth-commit";
+    originalMachine.profileAuthIncarnations[authKey] = profileAuthIncarnation(original);
+    saveStore(originalMachine);
+
+    await store.removeProfile(original.name, { tool: original.tool });
+    const replacement = await store.addProfile({
+      name: original.name,
+      tool: original.tool,
+      email: "failed@example.test",
+    });
+    const replacementMachine = loadMachineStore();
+    replacementMachine.profileAuthRevisions[authKey] = "replacement-auth-identity";
+    replacementMachine.profileAuthCommitRevisions[authKey] = "replacement-auth-commit";
+    replacementMachine.profileAuthIncarnations[authKey] = profileAuthIncarnation(replacement);
+    saveStore(replacementMachine);
+
+    await store.restoreProfileState!(
+      original,
+      { email: { expected: "failed@example.test", restore: null } },
+      { authIdentity: "original-auth-identity", authCommitRevision: "original-auth-commit" },
+    );
+
+    expect((await store.getProfile(replacement.name, replacement.tool)).email).toBe("failed@example.test");
+  });
+
+  test("LocalStore persistently upgrades legacy profile incarnations before transactional reads", async () => {
+    const initial = resolveStore({ ACCOUNTS_HOME: home } as NodeJS.ProcessEnv);
+    const profile = await initial.addProfile({ name: "legacy-upgrade", tool: "codex" });
+    const legacy = loadMachineStore();
+    const record = legacy.profiles.find(
+      (candidate) => candidate.name === profile.name && candidate.tool === profile.tool,
+    );
+    if (!record) throw new Error("missing legacy upgrade fixture");
+    delete record.incarnationId;
+    saveStore(legacy);
+
+    const upgraded = resolveStore({ ACCOUNTS_HOME: home } as NodeJS.ProcessEnv);
+    const first = await upgraded.getProfile(profile.name, profile.tool);
+    const second = await resolveStore({ ACCOUNTS_HOME: home } as NodeJS.ProcessEnv).getProfile(
+      profile.name,
+      profile.tool,
+    );
+
+    expect(first.incarnationId).toMatch(/^[0-9a-f-]{36}$/i);
+    expect(second.incarnationId).toBe(first.incarnationId);
+  });
+
+  test("local non-Claude profile-field rollback fails closed without an incarnation token", async () => {
+    const store = resolveStore({
+      ACCOUNTS_HOME: home,
+      HASNA_ACCOUNTS_STORAGE_MODE: "local",
+    } as NodeJS.ProcessEnv);
+    const profile = await store.addProfile({
+      name: "legacy-field-rollback",
+      tool: "codex",
+      email: "failed@example.test",
+    });
+    const legacy = loadMachineStore();
+    const legacyRecord = legacy.profiles.find(
+      (candidate) => candidate.name === profile.name && candidate.tool === profile.tool,
+    );
+    if (!legacyRecord) throw new Error("missing legacy non-Claude rollback fixture");
+    delete legacyRecord.incarnationId;
+    delete profile.incarnationId;
+    saveStore(legacy);
+
+    await store.restoreProfileState!(profile, {
+      email: { expected: "failed@example.test", restore: null },
+    });
+
+    expect((await store.getProfile(profile.name, profile.tool)).email).toBe("failed@example.test");
   });
 });

@@ -22,13 +22,17 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   storage instead of inheriting a station-level cloud/API mode.
 - Login preparation awaits synchronous or asynchronous selected-tool validation
   before profile lookup, creation, tool locking, or API persistence.
-- Repeated `--permissions` options now fail during raw CLI validation before
-  profile, tool-lock, keychain, or process mutation, including same-value and
-  conflicting repetitions.
+- Repeated `--permissions` options and repeated direct Claude compatibility
+  flags now fail during raw CLI validation before profile, tool-lock, keychain,
+  or process mutation, including same-value and conflicting repetitions.
 - Failed, interrupted, signalled, and unfinalized login processes now return
   nonzero without retaining partial state, restore the prior active selection,
-  tool lock, and Claude keychain, and remove only profile state created by the
-  failed attempt. Claude login holds the shared keychain lease throughout the
+  tool lock, and Claude keychain. Local Claude created-profile cleanup is a
+  lock-held compare-and-swap over its exact auth identity and commit generation,
+  so it cannot remove a replacement or a later apply; other local tools and API
+  stores fail closed and retain a created profile when deletion ownership cannot
+  be proven.
+  Claude login holds the shared keychain lease throughout the
   child process and finalization, including repeated interrupt signals while
   the child is shutting down. Failed or interrupted finalization restores the
   exact pre-launch live Claude auth files and prior machine applied pointer,
@@ -36,7 +40,8 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   restores or clears API current state, and does not overwrite a newer
   concurrent apply. Local and API current selections and machine-local applies
   carry write generations so rollback also preserves newer same-profile
-  selections/applies; profile rollback is field-scoped and compare-and-restore,
+  selections/applies and their machine-local tool locks; profile rollback is
+  field-scoped and compare-and-restore,
   preserving unrelated concurrent metadata and email edits. Additive migration
   `0006` supplies database-enforced monotonic current-selection generations to
   self-hosted/API storage even during mixed-version server rollouts. API login
@@ -53,13 +58,48 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   attempts restore the selection they actually displaced instead of stale
   pre-child client state. Existing-profile failures restore raw Claude OAuth,
   credential, and auth-settings material while preserving unrelated JSON edits;
-  profile-auth rollback shares the apply lock and is skipped after a newer
-  applied generation takes ownership. Operation-owned current rollback is the
-  sole restorer of `lastUsedAt`, avoiding same-millisecond value collisions with
-  a later activation of the same profile.
+  profile-auth rollback shares the apply lock and is compare-and-swap protected
+  by a stable profile identity plus an immutable machine-owned auth snapshot
+  whose revision is published atomically with the applied pointer, so a failed
+  or signalled login cannot overwrite or leave partial auth around an apply
+  that commits before or after the child mutation. Rename preserves that
+  identity while remove/recreate invalidates it in both local and API modes,
+  including delayed API reconciliation and same-timestamp/path recreation.
+  Apply activation and rollback remain serialized while the unbounded
+  interactive login child does not hold the apply lock. A separate per-profile
+  login lease serializes same-profile interactive children on every platform
+  without blocking a later apply. POSIX keychain and profile-login leases use a
+  per-user `/tmp` namespace that is stable across differing `TMPDIR` values.
+  Login revalidates the prepared profile incarnation after acquiring that lease,
+  so remove/recreate cannot redirect the child or finalization to another profile.
+  Login preparation atomically captures and
+  claims the profile-name tool lock, and created-profile cleanup yields to a
+  later metadata/use adoption. New local profiles carry random incarnation
+  UUIDs, and LocalStore persistently upgrades legacy records before transactional
+  reads, preventing same-timestamp/path remove/recreate collisions. Login email
+  redetection is an expected-value compare-and-set in local and API stores, so a
+  same-incarnation email edit committed while the child runs is preserved and
+  never claimed by rollback. Immutable auth commits
+  retain only the published generation and are removed with their UUID-owned
+  profile identity. Pruning preflights every identity touched by one apply and
+  transactionally renames all stale revisions before best-effort tombstone
+  cleanup, so a later-identity failure cannot invalidate rollback references. Rollback
+  preflights all profile-auth destinations before mutating any of them.
+  Operation-owned current rollback is the sole restorer of `lastUsedAt`,
+  avoiding same-millisecond value collisions with a later activation of the
+  same profile.
   Additive migration `0007` records activation-owned rollback state without
   changing the checksum of the already-shipped `0006` migration.
-  Ordinary apply now shares the Claude keychain lease with login and launch;
+  Additive migration `0008` gives API account rows stable incarnation UUIDs and
+  records the displaced account incarnation in login operations, so failed-login
+  email rollback is an atomic no-op after remove/recreate ABA and current rollback
+  never activates a replacement under the displaced name. API login email update,
+  activation, and rollback use incarnation-required new-only routes that mixed old
+  replicas reject instead of stripping ownership fields.
+  Legacy local non-Claude profile-field rollback fails closed when the record
+  predates collision-proof incarnation tokens.
+  Ordinary apply and all CLI/switch/supervisor keychain writers now share the
+  Claude keychain lease with login and launch;
   keychain write errors fail closed and roll back live auth, profile snapshots,
   the applied pointer, and the prior keychain credential. Keychain locks are
   fully initialized before publication, malformed locks fail immediately, and
@@ -71,9 +111,11 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   across live-auth and applied-pointer mutation, clean partial lock acquisition,
   publish only fully initialized lock inodes, identify process incarnations
   across Linux and macOS PID reuse with timezone-normalized macOS start times,
-  fail closed on unverifiable same-PID ownership, enforce the acquisition
+  reject non-canonical owner records, fail closed on unverifiable same-PID
+  ownership, enforce the acquisition
   deadline before every retry, and atomically claim a stale inode before
-  reclaiming it so competing reclaimers cannot remove a replacement.
+  reclaiming it so competing reclaimers cannot remove a replacement. Apply-lock
+  acquire/release inode checks are serialized under that same registry lease.
   Abandoned reclaim claims are recovered, and cloud rename/remove reconciliation
   takes its snapshot only after acquiring the registry lock. The generated API
   contract requires an operation id or revision for transactional rollback.
@@ -88,8 +130,9 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 - The default Bun test preload neutralizes inherited station Accounts cloud/API
   configuration while explicit cloud fixtures remain supported.
 - Compatible transitive overrides keep the MCP SDK graph on patched
-  `body-parser` and Hono releases; the lockfile now passes `bun audit` without
-  changing the package version.
+  `body-parser` and Hono releases; the package's declared Node floor is now 20
+  to match patched `@hono/node-server`, and the lockfile passes `bun audit`
+  without changing the package version.
 
 ## [0.2.8] - 2026-07-15
 

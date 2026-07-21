@@ -1,7 +1,7 @@
 import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
 import { applyProfile } from "./apply.js";
-import { prepareClaudeProfileKeychain } from "./claude-auth.js";
+import { prepareClaudeProfileKeychainLocked } from "./claude-launch.js";
 import { claudeApiAuthClearingEnv, formatEnvAssignments, formatExportLines, profileEnv } from "./env.js";
 import { resolveStore, type AccountsStore } from "./store.js";
 import { getTool, mergeToolArgs, normalizePermissionPreset } from "./tools.js";
@@ -66,7 +66,7 @@ export async function switchProfile(
 
   const env = applied && tool.id === "claude" ? claudeApiAuthClearingEnv() : profileEnv(profile, tool);
   const command = commandFor(profile, tool, opts);
-  prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
+  await prepareClaudeProfileKeychainLocked(profile.dir, tool, profile.name);
   const restartRequired = opts.resume === true || applied || mode === "env";
   const message = applied
     ? `${profile.name} is now the live/default ${tool.label} profile`

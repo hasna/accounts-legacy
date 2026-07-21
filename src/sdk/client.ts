@@ -12,7 +12,7 @@ export interface VersionResponse { "version": string }
 
 export interface ErrorResponse { "error": string; "reason"?: string }
 
-export interface Account { "tool": string; "name": string; "email"?: string; "displayName"?: string; "identity"?: string; "cardLast4"?: string; "metadata": Record<string, unknown>; "dir"?: string; "description"?: string; "createdAt": string; "lastUsedAt"?: string }
+export interface Account { "tool": string; "name": string; "email"?: string; "displayName"?: string; "identity"?: string; "cardLast4"?: string; "metadata": Record<string, unknown>; "dir"?: string; "description"?: string; "createdAt": string; "incarnationId": string; "lastUsedAt"?: string }
 
 export interface AccountList { "accounts": Array<Account> }
 
@@ -22,7 +22,9 @@ export interface UpdateAccountInput { "email"?: string | null; "displayName"?: s
 
 export interface RestoreFieldInput { "expected": string | null; "restore": string | null }
 
-export interface RestoreAccountInput { "email"?: RestoreFieldInput; "lastUsedAt"?: RestoreFieldInput }
+export interface RestoreAccountInput { "expectedIncarnationId": string; "email"?: RestoreFieldInput; "lastUsedAt"?: RestoreFieldInput }
+
+export interface LoginUpdateAccountInput { "expectedIncarnationId": string; "expectedEmail": string; "email": string }
 
 export interface CurrentSelection { "tool": string; "name": string; "updatedAt": string; "revision"?: string; "operationId"?: string; "previousName"?: string; "previousTargetLastUsedAt"?: string }
 
@@ -30,7 +32,7 @@ export interface CurrentSelectionList { "current": Array<CurrentSelection>; "tra
 
 export interface SetCurrentInput { "name": string }
 
-export interface SetLoginCurrentInput { "name": string; "operationId": string }
+export interface SetLoginCurrentInput { "name": string; "operationId": string; "expectedIncarnationId": string }
 
 export interface RestoreCurrentInput { "expectedName": string; "name"?: string }
 
@@ -164,18 +166,27 @@ export class AccountsClient {
       });
     }
 
-    /** Rename an account */
-    async renameAccount(tool: string, name: string, body: RenameAccountInput, init?: RequestInit): Promise<Account> {
-      return this.request("POST", `/v1/accounts/${encodeURIComponent(String(tool))}/${encodeURIComponent(String(name))}/rename`, {
+    /** Conditionally restore fields changed by failed login finalization */
+    async restoreAccount(tool: string, name: string, body: RestoreAccountInput, init?: RequestInit): Promise<Account> {
+      return this.request("POST", `/v1/accounts/${encodeURIComponent(String(tool))}/${encodeURIComponent(String(name))}/login/restore`, {
         body,
         query: undefined,
         init,
       });
     }
 
-    /** Conditionally restore fields changed by failed login finalization */
-    async restoreAccount(tool: string, name: string, body: RestoreAccountInput, init?: RequestInit): Promise<Account> {
-      return this.request("POST", `/v1/accounts/${encodeURIComponent(String(tool))}/${encodeURIComponent(String(name))}/restore`, {
+    /** Update login-finalization fields for one exact account incarnation */
+    async updateAccountForLogin(tool: string, name: string, body: LoginUpdateAccountInput, init?: RequestInit): Promise<Account> {
+      return this.request("PATCH", `/v1/accounts/${encodeURIComponent(String(tool))}/${encodeURIComponent(String(name))}/login/update`, {
+        body,
+        query: undefined,
+        init,
+      });
+    }
+
+    /** Rename an account */
+    async renameAccount(tool: string, name: string, body: RenameAccountInput, init?: RequestInit): Promise<Account> {
+      return this.request("POST", `/v1/accounts/${encodeURIComponent(String(tool))}/${encodeURIComponent(String(name))}/rename`, {
         body,
         query: undefined,
         init,
@@ -211,7 +222,7 @@ export class AccountsClient {
 
     /** Set current through the transactional login-only endpoint */
     async setLoginCurrent(tool: string, body: SetLoginCurrentInput, init?: RequestInit): Promise<CurrentSelection> {
-      return this.request("PUT", `/v1/current/${encodeURIComponent(String(tool))}/login`, {
+      return this.request("PUT", `/v1/current/${encodeURIComponent(String(tool))}/login/activate`, {
         body,
         query: undefined,
         init,

@@ -3,9 +3,10 @@ import { randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { existsSync, mkdirSync, realpathSync, rmSync } from "node:fs";
 import { type NormalizedStore, type Profile, AccountsError, profileNameSchema } from "../types.js";
-import { loadStore, saveStore, profilesDir } from "../storage.js";
+import { loadStore, profileAuthIncarnation, profileAuthRevisionKey, saveStore, profilesDir, withStoreLock } from "../storage.js";
 import { DEFAULT_TOOL, getTool } from "./tools.js";
 import { detectEmail } from "./detect.js";
+import { removeClaudeProfileCommittedAuthSnapshots } from "./claude-auth.js";
 
 export type ProfileMetadataValue = string | number | boolean | null;
 export type ProfileMetadata = Record<string, ProfileMetadataValue>;
@@ -133,33 +134,65 @@ export function getProfileToolLock(name: string): string | undefined {
   return loadStore().toolLocks[name];
 }
 
-export function lockProfileTool(name: string, toolId: string): void {
+export function getProfileToolLockRevision(name: string): string | undefined {
+  return loadStore().toolLockRevisions[name];
+}
+
+export interface ProfileToolLockClaim {
+  revision: string;
+  previousTool?: string;
+  previousRevision?: string;
+}
+
+/** Claim a profile-name tool lock and capture the displaced lock atomically. */
+export function claimProfileToolLock(name: string, toolId: string): ProfileToolLockClaim {
   getTool(toolId);
   const nameCheck = profileNameSchema.safeParse(name);
   if (!nameCheck.success) throw new AccountsError(nameCheck.error.issues[0]?.message ?? "invalid profile name");
-  const store = loadStore();
-  if (!store.profiles.some((p) => p.name === name && p.tool === toolId)) {
-    throw new AccountsError(`no profile named "${name}" for tool "${toolId}"`);
-  }
-  store.toolLocks[name] = toolId;
-  saveStore(store);
-}
-
-/** Restore a profile-name tool lock to a previously captured value. */
-export function restoreProfileToolLock(name: string, toolId?: string): void {
-  const nameCheck = profileNameSchema.safeParse(name);
-  if (!nameCheck.success) throw new AccountsError(nameCheck.error.issues[0]?.message ?? "invalid profile name");
-  const store = loadStore();
-  if (toolId) {
-    getTool(toolId);
-    if (!store.profiles.some((profile) => profile.name === name && profile.tool === toolId)) {
+  return withStoreLock(() => {
+    const store = loadStore();
+    if (!store.profiles.some((p) => p.name === name && p.tool === toolId)) {
       throw new AccountsError(`no profile named "${name}" for tool "${toolId}"`);
     }
+    const previousTool = store.toolLocks[name];
+    const previousRevision = store.toolLockRevisions[name];
+    const revision = randomUUID();
     store.toolLocks[name] = toolId;
-  } else {
-    delete store.toolLocks[name];
-  }
-  saveStore(store);
+    store.toolLockRevisions[name] = revision;
+    saveStore(store);
+    return {
+      revision,
+      ...(previousTool ? { previousTool } : {}),
+      ...(previousRevision ? { previousRevision } : {}),
+    };
+  });
+}
+
+export function lockProfileTool(name: string, toolId: string): string {
+  return claimProfileToolLock(name, toolId).revision;
+}
+
+/** Restore a profile-name tool lock only while the failed preparation owns it. */
+export function restoreProfileToolLock(name: string, expectedRevision: string, toolId?: string): boolean {
+  const nameCheck = profileNameSchema.safeParse(name);
+  if (!nameCheck.success) throw new AccountsError(nameCheck.error.issues[0]?.message ?? "invalid profile name");
+  return withStoreLock(() => {
+    const store = loadStore();
+    if (store.toolLockRevisions[name] !== expectedRevision) return false;
+    if (toolId) {
+      getTool(toolId);
+      if (!store.profiles.some((profile) => profile.name === name && profile.tool === toolId)) {
+        throw new AccountsError(`no profile named "${name}" for tool "${toolId}"`);
+      }
+      store.toolLocks[name] = toolId;
+      store.toolLockRevisions[name] = randomUUID();
+    } else {
+      delete store.toolLocks[name];
+      delete store.toolLockRevisions[name];
+    }
+    saveStore(store);
+    return true;
+  });
 }
 
 export interface AddOptions {
@@ -209,6 +242,7 @@ export function addProfile(opts: AddOptions): Profile {
     dir,
     ...(opts.description ? { description: opts.description } : {}),
     createdAt: nowIso(),
+    incarnationId: randomUUID(),
   };
 
   store.profiles.push(profile);
@@ -251,8 +285,34 @@ export function removeProfile(
     delete store.applied[profile.tool];
     delete store.appliedRevisions[profile.tool];
   }
-  if (store.toolLocks[profile.name] === profile.tool) delete store.toolLocks[profile.name];
+  const authIncarnation = profileAuthIncarnation(profile);
+  const authKeys = new Set([
+    profileAuthRevisionKey(profile.tool, profile.name),
+    ...Object.entries(store.profileAuthIncarnations)
+      .filter(([, candidate]) => candidate === authIncarnation)
+      .map(([key]) => key),
+  ]);
+  const removedAuthIdentities = new Set<string>();
+  for (const authKey of authKeys) {
+    const identity = store.profileAuthRevisions[authKey];
+    if (identity) removedAuthIdentities.add(identity);
+    delete store.profileAuthRevisions[authKey];
+    delete store.profileAuthCommitRevisions[authKey];
+    delete store.profileAuthIncarnations[authKey];
+  }
+  if (store.toolLocks[profile.name] === profile.tool) {
+    delete store.toolLocks[profile.name];
+    delete store.toolLockRevisions[profile.name];
+  }
   saveStore(store);
+  for (const identity of removedAuthIdentities) {
+    // Legacy stores allowed arbitrary opaque identity strings. They cannot be
+    // converted into a safe commit-directory path, so leave only those legacy
+    // artifacts fail closed; all generated UUID identities are purged.
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(identity)) {
+      removeClaudeProfileCommittedAuthSnapshots(identity);
+    }
+  }
 
   let purged = false;
   let purgeNote: string | undefined;
@@ -297,9 +357,30 @@ export function renameProfile(oldName: string, newName: string, toolId?: string)
     store.applied[profile.tool] = newName;
     store.appliedRevisions[profile.tool] = randomUUID();
   }
+  const oldAuthKey = profileAuthRevisionKey(profile.tool, oldName);
+  const newAuthKey = profileAuthRevisionKey(profile.tool, newName);
+  const authIdentity = store.profileAuthRevisions[oldAuthKey];
+  if (authIdentity) {
+    delete store.profileAuthRevisions[oldAuthKey];
+    store.profileAuthRevisions[newAuthKey] = authIdentity;
+  }
+  const authCommitRevision = store.profileAuthCommitRevisions[oldAuthKey];
+  if (authCommitRevision) {
+    delete store.profileAuthCommitRevisions[oldAuthKey];
+    store.profileAuthCommitRevisions[newAuthKey] = authCommitRevision;
+  }
+  const authIncarnation = store.profileAuthIncarnations[oldAuthKey];
+  if (authIncarnation) {
+    delete store.profileAuthIncarnations[oldAuthKey];
+    store.profileAuthIncarnations[newAuthKey] = authIncarnation;
+  }
   if (store.toolLocks[oldName] === profile.tool) {
     delete store.toolLocks[oldName];
-    if (!store.toolLocks[newName]) store.toolLocks[newName] = profile.tool;
+    delete store.toolLockRevisions[oldName];
+    if (!store.toolLocks[newName]) {
+      store.toolLocks[newName] = profile.tool;
+      store.toolLockRevisions[newName] = randomUUID();
+    }
   }
   profile.name = newName;
   saveStore(store);
@@ -385,6 +466,7 @@ export function useProfile(
   store.current[profile.tool] = name;
   store.currentRevisions[profile.tool] = currentRevision;
   store.toolLocks[profile.name] = profile.tool;
+  store.toolLockRevisions[profile.name] = randomUUID();
   profile.lastUsedAt = nowIso();
   saveStore(store);
   return { profile, toolId: profile.tool, currentRevision };

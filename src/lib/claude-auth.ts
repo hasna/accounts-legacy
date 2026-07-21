@@ -1,7 +1,26 @@
-import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import {
+  chmodSync,
+  closeSync,
+  copyFileSync,
+  existsSync,
+  fsyncSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { randomUUID } from "node:crypto";
+import { basename, dirname, join } from "node:path";
 import type { ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
+import { accountsHome } from "../storage.js";
 import {
   CLAUDE_KEYCHAIN_SERVICE,
   liveClaudeBase,
@@ -41,6 +60,25 @@ export interface ClaudeProfileAuthSnapshot {
   files: ClaudeLiveAuthFileSnapshot[];
 }
 
+interface ClaudeProfileAuthPath {
+  id: "home" | "credentials" | "settings" | "oauth-snapshot" | "credentials-snapshot" | "keychain-snapshot";
+  path: string;
+  merge: NonNullable<ClaudeLiveAuthFileSnapshot["merge"]>;
+}
+
+interface CommittedProfileAuthFile {
+  id: ClaudeProfileAuthPath["id"];
+  contents?: string;
+  mode?: number;
+}
+
+interface CommittedProfileAuthSnapshot {
+  version: 1;
+  identity: string;
+  revision: string;
+  files: CommittedProfileAuthFile[];
+}
+
 export const CLAUDE_API_AUTH_ENV_KEYS = [
   "ANTHROPIC_API_KEY",
   "ANTHROPIC_AUTH_TOKEN",
@@ -64,6 +102,29 @@ function writeJsonFile(path: string, data: JsonRecord, stayUnder?: string): void
   assertSafeWritePath(path, stayUnder ? { mustStayUnder: stayUnder } : undefined);
   mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, JSON.stringify(data, null, 2) + "\n", { mode: 0o600 });
+}
+
+function writeJsonFileAtomic(path: string, data: JsonRecord, stayUnder: string): void {
+  assertSafeWritePath(path, { mustStayUnder: stayUnder });
+  mkdirSync(dirname(path), { recursive: true });
+  const temp = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
+  assertSafeWritePath(temp, { mustStayUnder: stayUnder });
+  let fd: number | undefined;
+  try {
+    fd = openSync(temp, "wx", 0o600);
+    writeFileSync(fd, JSON.stringify(data, null, 2) + "\n", { encoding: "utf8" });
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    // Hard-link publication is create-if-absent: unlike rename, it cannot
+    // replace a destination created between preflight and publication.
+    linkSync(temp, path);
+    unlinkSync(temp);
+    chmodSync(path, 0o600);
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+    rmSync(temp, { force: true });
+  }
 }
 
 function readOAuthFromPaths(paths: string[]): JsonRecord | undefined {
@@ -268,27 +329,275 @@ export function captureClaudeLiveAuthSnapshot(): ClaudeLiveAuthSnapshot {
   };
 }
 
+function profileAuthPaths(profileDir: string): ClaudeProfileAuthPath[] {
+  return [
+    { id: "home", path: join(profileDir, ".claude.json"), merge: "claude-home" },
+    { id: "credentials", path: join(profileDir, ".credentials.json"), merge: "claude-credentials" },
+    { id: "settings", path: join(profileDir, "settings.json"), merge: "claude-settings" },
+    { id: "oauth-snapshot", path: profileOAuthSnapshot(profileDir), merge: "claude-home" },
+    { id: "credentials-snapshot", path: profileCredentialsSnapshot(profileDir), merge: "claude-credentials" },
+    { id: "keychain-snapshot", path: profileKeychainSnapshot(profileDir), merge: "claude-keychain" },
+  ];
+}
+
+function captureProfileAuthFiles(profileDir: string): ClaudeLiveAuthFileSnapshot[] {
+  return profileAuthPaths(profileDir).map(({ path, merge }) => {
+    if (!existsSync(path)) return { path, merge };
+    const stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new AccountsError(`refusing to snapshot unsafe Claude profile auth path ${path}`);
+    }
+    return { path, contents: readFileSync(path), mode: stat.mode & 0o777, merge };
+  });
+}
+
 /** Capture profile-owned auth snapshots that finalization may refresh. */
 export function captureClaudeProfileAuthSnapshot(profileDir: string): ClaudeProfileAuthSnapshot {
-  const paths: Array<{ path: string; merge?: ClaudeLiveAuthFileSnapshot["merge"] }> = [
-    { path: join(profileDir, ".claude.json"), merge: "claude-home" },
-    { path: join(profileDir, ".credentials.json"), merge: "claude-credentials" },
-    { path: join(profileDir, "settings.json"), merge: "claude-settings" },
-    { path: profileOAuthSnapshot(profileDir), merge: "claude-home" },
-    { path: profileCredentialsSnapshot(profileDir), merge: "claude-credentials" },
-    { path: profileKeychainSnapshot(profileDir), merge: "claude-keychain" },
-  ];
   return {
     base: profileDir,
-    files: paths.map(({ path, merge }) => {
-      if (!existsSync(path)) return { path, ...(merge ? { merge } : {}) };
-      const stat = lstatSync(path);
-      if (!stat.isFile() || stat.isSymbolicLink()) {
-        throw new AccountsError(`refusing to snapshot unsafe Claude profile auth path ${path}`);
-      }
-      return { path, contents: readFileSync(path), mode: stat.mode & 0o777, ...(merge ? { merge } : {}) };
-    }),
+    files: captureProfileAuthFiles(profileDir),
   };
+}
+
+function assertAuthGenerationId(value: string, label: string): void {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)) {
+    throw new AccountsError(`invalid Claude profile auth ${label}`);
+  }
+}
+
+export function claudeProfileCommittedAuthPath(identity: string, revision: string): string {
+  assertAuthGenerationId(identity, "identity");
+  assertAuthGenerationId(revision, "revision");
+  return join(accountsHome(), ".auth-commits", identity, `${revision}.json`);
+}
+
+/** Persist the exact auth state owned by a successful apply generation. */
+export function writeClaudeProfileCommittedAuthSnapshot(
+  profileDir: string,
+  identity: string,
+  revision: string,
+): void {
+  const files = captureProfileAuthFiles(profileDir);
+  const paths = profileAuthPaths(profileDir);
+  const committed: CommittedProfileAuthSnapshot = {
+    version: 1,
+    identity,
+    revision,
+    files: files.map((file, index) => ({
+      id: paths[index]!.id,
+      ...(file.contents ? { contents: file.contents.toString("base64") } : {}),
+      ...(file.mode !== undefined ? { mode: file.mode } : {}),
+    })),
+  };
+  const committedPath = claudeProfileCommittedAuthPath(identity, revision);
+  if (existsSync(committedPath)) {
+    throw new AccountsError(`refusing to overwrite committed Claude profile auth at ${committedPath}`);
+  }
+  writeJsonFileAtomic(committedPath, committed as unknown as JsonRecord, accountsHome());
+}
+
+interface ClaudeProfileAuthPrunePlan {
+  identityDir: string;
+  stale: Array<{ path: string; entry: string }>;
+  priorTombstones: string[];
+}
+
+function planClaudeProfileCommittedAuthPrune(
+  identity: string,
+  keepRevision: string,
+): ClaudeProfileAuthPrunePlan | undefined {
+  assertAuthGenerationId(identity, "identity");
+  assertAuthGenerationId(keepRevision, "revision");
+  const identityDir = join(accountsHome(), ".auth-commits", identity);
+  assertSafeWritePath(identityDir, { mustStayUnder: accountsHome() });
+  if (!existsSync(identityDir)) return undefined;
+  const stat = lstatSync(identityDir);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new AccountsError(`refusing unsafe committed Claude profile auth directory ${identityDir}`);
+  }
+  const keepEntry = `${keepRevision}.json`;
+  const stale: Array<{ path: string; entry: string }> = [];
+  const priorTombstones: string[] = [];
+  let keepFound = false;
+  for (const entry of readdirSync(identityDir)) {
+    const path = join(identityDir, entry);
+    assertSafeWritePath(path, { mustStayUnder: identityDir });
+    const entryStat = lstatSync(path);
+    if (!entryStat.isFile() || entryStat.isSymbolicLink()) {
+      throw new AccountsError(`refusing unsafe committed Claude profile auth entry ${path}`);
+    }
+    if (entry === keepEntry) {
+      keepFound = true;
+      continue;
+    }
+    if (/^\.prune-[0-9a-f-]{36}-[0-9a-f-]{36}\.json$/i.test(entry)) {
+      priorTombstones.push(path);
+      continue;
+    }
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/i.test(entry)) {
+      throw new AccountsError(`refusing unexpected committed Claude profile auth entry ${entry}`);
+    }
+    stale.push({ path, entry });
+  }
+  if (!keepFound) {
+    throw new AccountsError(`missing committed Claude profile auth for generation ${keepRevision}`);
+  }
+  return { identityDir, stale, priorTombstones };
+}
+
+/** Atomically publish retention across every auth identity touched by one apply. */
+export function pruneClaudeProfileCommittedAuthSnapshotSets(
+  sets: Array<{ identity: string; keepRevision: string }>,
+): void {
+  const unique = new Map<string, string>();
+  for (const set of sets) {
+    const existing = unique.get(set.identity);
+    if (existing && existing !== set.keepRevision) {
+      throw new AccountsError("conflicting committed Claude profile auth revisions for one identity");
+    }
+    unique.set(set.identity, set.keepRevision);
+  }
+  // Plan every identity before moving the first revision. This makes unsafe or
+  // malformed state in a later identity a zero-mutation failure.
+  const plans = [...unique].map(([identity, keepRevision]) =>
+    planClaudeProfileCommittedAuthPrune(identity, keepRevision)
+  ).filter((plan): plan is ClaudeProfileAuthPrunePlan => Boolean(plan));
+
+  // Rename every stale revision across every identity before unlinking any of
+  // them. A rename failure restores all earlier identities as one transaction.
+  const transaction = randomUUID();
+  const moved: Array<{ path: string; tombstone: string }> = [];
+  try {
+    for (const plan of plans) {
+      for (const entry of plan.stale) {
+        const revision = entry.entry.slice(0, -".json".length);
+        const tombstone = join(plan.identityDir, `.prune-${transaction}-${revision}.json`);
+        assertSafeWritePath(tombstone, { mustStayUnder: plan.identityDir });
+        renameSync(entry.path, tombstone);
+        moved.push({ path: entry.path, tombstone });
+      }
+    }
+  } catch (error) {
+    let restoreError: unknown;
+    for (const entry of moved.reverse()) {
+      try {
+        renameSync(entry.tombstone, entry.path);
+      } catch (candidate) {
+        restoreError ??= candidate;
+      }
+    }
+    if (restoreError) {
+      throw new AccountsError("failed to restore immutable Claude auth revisions after prune failure");
+    }
+    throw error;
+  }
+  const priorTombstones = plans.flatMap((plan) => plan.priorTombstones);
+  for (const path of [...priorTombstones, ...moved.map((entry) => entry.tombstone)]) {
+    try {
+      unlinkSync(path);
+    } catch {
+      // The published generation is already consistent. Retain a safe hidden
+      // tombstone for a later prune instead of turning cleanup into rollback.
+    }
+  }
+}
+
+/** Retain only the currently published immutable commit for one auth identity. */
+export function pruneClaudeProfileCommittedAuthSnapshots(identity: string, keepRevision: string): void {
+  pruneClaudeProfileCommittedAuthSnapshotSets([{ identity, keepRevision }]);
+}
+
+/** Remove all immutable commits after their profile identity is unregistered. */
+export function removeClaudeProfileCommittedAuthSnapshots(identity: string): void {
+  assertAuthGenerationId(identity, "identity");
+  const identityDir = join(accountsHome(), ".auth-commits", identity);
+  assertSafeWritePath(identityDir, { mustStayUnder: accountsHome() });
+  if (!existsSync(identityDir)) return;
+  const stat = lstatSync(identityDir);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new AccountsError(`refusing unsafe committed Claude profile auth directory ${identityDir}`);
+  }
+  rmSync(identityDir, { recursive: true, force: true });
+}
+
+function decodeCommittedContents(value: unknown, path: string): Buffer | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+    throw new AccountsError(`invalid committed Claude profile auth contents at ${path}`);
+  }
+  return Buffer.from(value, "base64");
+}
+
+function readCommittedProfileAuthSnapshot(identity: string, revision: string): CommittedProfileAuthSnapshot {
+  const committedPath = claudeProfileCommittedAuthPath(identity, revision);
+  assertSafeWritePath(committedPath, { mustStayUnder: accountsHome() });
+  if (!existsSync(committedPath)) {
+    throw new AccountsError(`missing committed Claude profile auth for generation ${revision}`);
+  }
+  const stat = lstatSync(committedPath);
+  if (!stat.isFile() || stat.isSymbolicLink()) {
+    throw new AccountsError(`refusing unsafe committed Claude profile auth path ${committedPath}`);
+  }
+  const raw = readJsonFile(committedPath);
+  if (
+    raw?.version !== 1 ||
+    raw.identity !== identity ||
+    raw.revision !== revision ||
+    !Array.isArray(raw.files)
+  ) {
+    throw new AccountsError(`invalid committed Claude profile auth at ${committedPath}`);
+  }
+  return raw as unknown as CommittedProfileAuthSnapshot;
+}
+
+export function assertClaudeProfileCommittedAuthSnapshot(identity: string, revision: string): void {
+  validateCommittedProfileAuthFiles(readCommittedProfileAuthSnapshot(identity, revision), identity, revision);
+}
+
+function validateCommittedProfileAuthFiles(
+  raw: CommittedProfileAuthSnapshot,
+  identity: string,
+  revision: string,
+): ClaudeLiveAuthFileSnapshot[] {
+  const committedPath = claudeProfileCommittedAuthPath(identity, revision);
+  const entries = new Map<string, JsonRecord>();
+  for (const value of raw.files) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new AccountsError(`invalid committed Claude profile auth entry at ${committedPath}`);
+    }
+    const entry = value as unknown as JsonRecord;
+    if (typeof entry.id !== "string" || entries.has(entry.id)) {
+      throw new AccountsError(`invalid committed Claude profile auth id at ${committedPath}`);
+    }
+    entries.set(entry.id, entry);
+  }
+  return profileAuthPaths("").map(({ id, merge }) => {
+    const entry = entries.get(id);
+    if (!entry) throw new AccountsError(`missing committed Claude profile auth entry ${id}`);
+    const mode = entry.mode;
+    if (mode !== undefined && (!Number.isInteger(mode) || Number(mode) < 0 || Number(mode) > 0o777)) {
+      throw new AccountsError(`invalid committed Claude profile auth mode at ${committedPath}`);
+    }
+    return {
+      path: id,
+      contents: decodeCommittedContents(entry.contents, committedPath),
+      ...(mode !== undefined ? { mode: Number(mode) } : {}),
+      merge,
+    };
+  });
+}
+
+/** Restore the auth fields owned by the current published apply generation. */
+export function restoreClaudeProfileCommittedAuthSnapshot(
+  profileDir: string,
+  identity: string,
+  revision: string,
+): void {
+  const raw = readCommittedProfileAuthSnapshot(identity, revision);
+  const committedFiles = validateCommittedProfileAuthFiles(raw, identity, revision);
+  const paths = profileAuthPaths(profileDir);
+  const files = committedFiles.map((file, index) => ({ ...file, path: paths[index]!.path }));
+  restoreClaudeProfileAuthSnapshot({ base: profileDir, files });
 }
 
 function parseSnapshotJson(contents: Buffer | undefined, path: string): JsonRecord {
@@ -302,7 +611,16 @@ function parseSnapshotJson(contents: Buffer | undefined, path: string): JsonReco
   throw new AccountsError(`refusing to merge invalid Claude profile auth JSON at ${path}`);
 }
 
-function restoreMergedProfileJson(snapshot: ClaudeProfileAuthSnapshot, file: ClaudeLiveAuthFileSnapshot): void {
+interface PreparedMergedProfileRestore {
+  file: ClaudeLiveAuthFileSnapshot;
+  restored: JsonRecord;
+  remove: boolean;
+}
+
+function prepareMergedProfileJson(
+  snapshot: ClaudeProfileAuthSnapshot,
+  file: ClaudeLiveAuthFileSnapshot,
+): PreparedMergedProfileRestore {
   assertSafeWritePath(file.path, { mustStayUnder: snapshot.base });
   let current: JsonRecord = {};
   if (existsSync(file.path)) {
@@ -348,7 +666,24 @@ function restoreMergedProfileJson(snapshot: ClaudeProfileAuthSnapshot, file: Cla
   }
 
   if (file.contents === undefined && Object.keys(restored).length === 0) {
-    if (existsSync(file.path)) unlinkSync(file.path);
+    return { file, restored, remove: true };
+  }
+  return { file, restored, remove: false };
+}
+
+function applyMergedProfileJson(
+  snapshot: ClaudeProfileAuthSnapshot,
+  prepared: PreparedMergedProfileRestore,
+): void {
+  const { file, restored, remove } = prepared;
+  assertSafeWritePath(file.path, { mustStayUnder: snapshot.base });
+  if (remove) {
+    if (!existsSync(file.path)) return;
+    const stat = lstatSync(file.path);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new AccountsError(`refusing to remove unsafe Claude profile auth path ${file.path}`);
+    }
+    unlinkSync(file.path);
     return;
   }
   writeJsonFile(file.path, restored, snapshot.base);
@@ -383,10 +718,22 @@ export function restoreClaudeLiveAuthSnapshot(snapshot: ClaudeLiveAuthSnapshot):
 
 /** Restore exact profile-owned auth snapshots after failed finalization. */
 export function restoreClaudeProfileAuthSnapshot(snapshot: ClaudeProfileAuthSnapshot): void {
-  for (const file of snapshot.files) {
-    if (file.merge) restoreMergedProfileJson(snapshot, file);
-    else restoreClaudeAuthSnapshot({ base: snapshot.base, files: [file] }, "Claude profile auth");
+  const merged = snapshot.files.filter((file) => file.merge);
+  const exact = snapshot.files.filter((file) => !file.merge);
+  // Preflight every destination and JSON document before the first mutation,
+  // so one malformed or unsafe later file cannot leave a partial auth restore.
+  const prepared = merged.map((file) => prepareMergedProfileJson(snapshot, file));
+  for (const file of exact) {
+    assertSafeWritePath(file.path, { mustStayUnder: snapshot.base });
+    if (existsSync(file.path)) {
+      const stat = lstatSync(file.path);
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        throw new AccountsError(`refusing unsafe Claude profile auth path ${file.path}`);
+      }
+    }
   }
+  for (const item of prepared) applyMergedProfileJson(snapshot, item);
+  if (exact.length > 0) restoreClaudeAuthSnapshot({ base: snapshot.base, files: exact }, "Claude profile auth");
 }
 
 /** Email address of the account currently authenticated on the live Claude paths. */

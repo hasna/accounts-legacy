@@ -129,6 +129,55 @@ function writeRawAuthMutatingFailureTool(
   chmodSync(fakeBin, 0o755);
 }
 
+function writeBlockingRawAuthMutatingFailureTool(
+  binName: string,
+  envVar: string,
+  exit: "nonzero" | "signal",
+) {
+  const script = join(binDir, `${binName}-auth-race.ts`);
+  const fakeBin = join(binDir, binName);
+  writeFileSync(
+    script,
+    `
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+const profileDir = process.env[${JSON.stringify(envVar)}];
+if (!profileDir) throw new Error("missing profile directory");
+const loginId = process.env.FAKE_LOGIN_ID;
+if (process.env.FAKE_LOGIN_EVENTS && loginId) appendFileSync(process.env.FAKE_LOGIN_EVENTS, loginId + ":start\\n");
+if (process.env.FAKE_LOGIN_MUTATE) {
+  writeFileSync(process.env.FAKE_LOGIN_STARTED, "started");
+  while (!existsSync(process.env.FAKE_LOGIN_MUTATE)) await Bun.sleep(10);
+}
+writeFileSync(
+  join(profileDir, ".claude.json"),
+  JSON.stringify({ oauthAccount: { emailAddress: loginId ? loginId + "@example.com" : "rotated@example.com" }, laterProcessPreference: "keep" }) + "\\n",
+  { mode: 0o600 },
+);
+writeFileSync(
+  join(profileDir, ".credentials.json"),
+  JSON.stringify({
+    claudeAiOauth: {
+      accessToken: loginId ? loginId + "-access-token" : "rotated-access-token",
+      refreshToken: loginId ? loginId + "-refresh-token" : "rotated-refresh-token",
+      expiresAt: Date.now() + 60_000,
+    },
+    laterProcessPreference: "keep",
+  }) + "\\n",
+  { mode: 0o600 },
+);
+writeFileSync(process.env.FAKE_LOGIN_READY, "ready");
+while (!existsSync(process.env.FAKE_LOGIN_RELEASE)) await Bun.sleep(10);
+if (process.env.FAKE_LOGIN_EVENTS && loginId) appendFileSync(process.env.FAKE_LOGIN_EVENTS, loginId + ":exit\\n");
+if (process.env.FAKE_LOGIN_EXIT === "success") process.exit(0);
+${exit === "signal" ? 'process.kill(process.pid, "SIGTERM");' : "process.exit(23);"}
+await new Promise(() => {});
+`,
+  );
+  writeFileSync(fakeBin, `#!/bin/sh\nexec "${process.execPath}" run "${script}" "$@"\n`);
+  chmodSync(fakeBin, 0o755);
+}
+
 function writeFinalizationSignalTool(binName: string, envVar: string, toolName = binName) {
   const fakeBin = join(binDir, binName);
   writeFileSync(
@@ -343,10 +392,30 @@ function readLogEntries() {
 function readStore() {
   return JSON.parse(readFileSync(join(home, "accounts.json"), "utf8")) as {
     current?: Record<string, string>;
+    currentRevisions?: Record<string, string>;
     applied?: Record<string, string>;
+    appliedRevisions?: Record<string, string>;
+    profileAuthRevisions?: Record<string, string>;
+    profileAuthCommitRevisions?: Record<string, string>;
+    profileAuthIncarnations?: Record<string, string>;
     toolLocks?: Record<string, string>;
-    profiles?: Array<{ name: string; tool: string; dir: string; email?: string }>;
+    toolLockRevisions?: Record<string, string>;
+    profiles?: Array<{ name: string; tool: string; dir: string; createdAt: string; email?: string }>;
   };
+}
+
+function expectOnlyStableAuthTrackingAdded(beforeText: string, profileKey: string): void {
+  const before = JSON.parse(beforeText) as ReturnType<typeof readStore>;
+  const after = readStore();
+  expect({
+    ...after,
+    profileAuthRevisions: before.profileAuthRevisions,
+    profileAuthCommitRevisions: before.profileAuthCommitRevisions,
+    profileAuthIncarnations: before.profileAuthIncarnations,
+  }).toEqual(before);
+  expect(after.profileAuthRevisions?.[profileKey]).toMatch(/^[0-9a-f-]{36}$/i);
+  expect(after.profileAuthCommitRevisions?.[profileKey]).toMatch(/^[0-9a-f-]{36}$/i);
+  expect(after.profileAuthIncarnations?.[profileKey]).toMatch(/^[0-9a-f]{64}$/i);
 }
 
 function setupClaudeLogin(exit: "success" | "nonzero" | "signal") {
@@ -433,6 +502,10 @@ for (const duplicate of [
     label: "conflicting repeated --permissions",
     args: ["--permissions", "none", "--permissions", "dangerous"],
   },
+  {
+    label: "repeated direct Claude compatibility flags",
+    args: ["--dangerously-skip-permissions", "--dangerously-skip-permissions"],
+  },
 ]) {
   test(`login rejects ${duplicate.label} before profile, keychain, or spawn mutation`, () => {
     const fixture = setupClaudeLogin("nonzero");
@@ -461,7 +534,7 @@ test("nonzero Claude login restores the prior active profile and keychain withou
   });
 
   expect(result.status).toBe(23);
-  expect(readFileSync(join(home, "accounts.json"), "utf8")).toBe(storeBefore);
+  expectOnlyStableAuthTrackingAdded(storeBefore, "claude/acct");
   expect(readStore().current?.claude).toBe("prior");
   expect(readStore().applied?.claude).toBeUndefined();
   expect(readStore().toolLocks?.acct).toBeUndefined();
@@ -480,7 +553,7 @@ test("signalled Claude login returns nonzero and restores active profile and key
   const result = runCliWith(["login", "acct", "--tool", "claude"], { env: fixture.env });
 
   expect(result.status).toBe(143);
-  expect(readFileSync(join(home, "accounts.json"), "utf8")).toBe(storeBefore);
+  expectOnlyStableAuthTrackingAdded(storeBefore, "claude/acct");
   expect(readStore().current?.claude).toBe("prior");
   expect(readStore().applied?.claude).toBeUndefined();
   expect(readStore().toolLocks?.acct).toBeUndefined();
@@ -526,6 +599,592 @@ for (const failure of [
     });
   });
 }
+
+for (const failure of [
+  { label: "nonzero", exit: "nonzero" as const, status: 23 },
+  { label: "signalled", exit: "signal" as const, status: 143 },
+]) {
+  test(`${failure.label} login does not restore stale auth over a later same-profile apply`, async () => {
+    const ready = join(home, `${failure.label}-auth-race.ready`);
+    const release = join(home, `${failure.label}-auth-race.release`);
+    writeBlockingRawAuthMutatingFailureTool("claude", "CLAUDE_CONFIG_DIR", failure.exit);
+    expect(runCli("add", "prior", "--tool", "claude").status).toBe(0);
+    expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+    expect(runCli("use", "prior", "--tool", "claude").status).toBe(0);
+    const target = readStore().profiles?.find((profile) => profile.name === "acct" && profile.tool === "claude");
+    if (!target) throw new Error("missing existing Claude profile fixture");
+    writeFileSync(
+      join(target.dir, ".claude.json"),
+      '{"oauthAccount":{"emailAddress":"before@example.com"},"stablePreference":"before"}\n',
+      { mode: 0o600 },
+    );
+    writeFileSync(
+      join(target.dir, ".credentials.json"),
+      '{"claudeAiOauth":{"refreshToken":"before-refresh"}}\n',
+      { mode: 0o600 },
+    );
+
+    const login = spawnCliWith(["login", "acct", "--tool", "claude"], {
+      env: {
+        FAKE_LOGIN_READY: ready,
+        FAKE_LOGIN_RELEASE: release,
+      },
+    });
+    const loginResult = collect(login);
+    await waitFor(() => existsSync(ready));
+
+    const apply = runCli("apply", "acct", "--tool", "claude");
+    expect(apply.status).toBe(0);
+    expect(readStore().current?.claude).toBe("acct");
+    expect(readStore().applied?.claude).toBe("acct");
+    const laterHome = readFileSync(join(target.dir, ".claude.json"), "utf8");
+    const laterCredentials = readFileSync(join(target.dir, ".credentials.json"), "utf8");
+    const laterStore = readStore();
+
+    writeFileSync(release, "release");
+    const result = await loginResult;
+
+    expect(result.code).toBe(failure.status);
+    expect(result.signal).toBeNull();
+    expect(readStore().current?.claude).toBe("acct");
+    expect(readStore().applied?.claude).toBe("acct");
+    expect(readStore().currentRevisions?.claude).toBe(laterStore.currentRevisions?.claude);
+    expect(readStore().appliedRevisions?.claude).toBe(laterStore.appliedRevisions?.claude);
+    expect(readStore().toolLocks?.acct).toBe("claude");
+    expect(readStore().toolLockRevisions?.acct).toBe(laterStore.toolLockRevisions?.acct);
+    expect(readStore().profileAuthRevisions?.["claude/acct"]).toBe(
+      laterStore.profileAuthRevisions?.["claude/acct"],
+    );
+    expect(readStore().profileAuthCommitRevisions?.["claude/acct"]).toBe(
+      laterStore.profileAuthCommitRevisions?.["claude/acct"],
+    );
+    expect(readStore().profileAuthIncarnations?.["claude/acct"]).toBe(
+      laterStore.profileAuthIncarnations?.["claude/acct"],
+    );
+    expect(JSON.parse(readFileSync(join(target.dir, ".claude.json"), "utf8"))).toEqual(JSON.parse(laterHome));
+    expect(JSON.parse(readFileSync(join(target.dir, ".credentials.json"), "utf8"))).toEqual(JSON.parse(laterCredentials));
+    expect(JSON.parse(laterHome)).toEqual({
+      oauthAccount: { emailAddress: "rotated@example.com" },
+      laterProcessPreference: "keep",
+    });
+    expect(JSON.parse(laterCredentials)).toMatchObject({
+      claudeAiOauth: {
+        accessToken: "rotated-access-token",
+        refreshToken: "rotated-refresh-token",
+      },
+      laterProcessPreference: "keep",
+    });
+  });
+}
+
+for (const failure of [
+  { label: "nonzero", exit: "nonzero" as const, status: 23 },
+  { label: "signalled", exit: "signal" as const, status: 143 },
+]) {
+  test(`${failure.label} login restores auth owned by an apply that completed before the child mutation`, async () => {
+    const started = join(home, `${failure.label}-pre-mutation.started`);
+    const mutate = join(home, `${failure.label}-pre-mutation.mutate`);
+    const ready = join(home, `${failure.label}-pre-mutation.ready`);
+    const release = join(home, `${failure.label}-pre-mutation.release`);
+    writeBlockingRawAuthMutatingFailureTool("claude", "CLAUDE_CONFIG_DIR", failure.exit);
+    expect(runCli("add", "prior", "--tool", "claude").status).toBe(0);
+    expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+    expect(runCli("use", "prior", "--tool", "claude").status).toBe(0);
+    const target = readStore().profiles?.find((profile) => profile.name === "acct" && profile.tool === "claude");
+    if (!target) throw new Error("missing existing Claude profile fixture");
+    writeFileSync(
+      join(target.dir, ".claude.json"),
+      '{"oauthAccount":{"emailAddress":"apply-owned@example.com"},"stablePreference":"before"}\n',
+      { mode: 0o600 },
+    );
+    writeFileSync(
+      join(target.dir, ".credentials.json"),
+      '{"claudeAiOauth":{"refreshToken":"apply-owned-refresh"}}\n',
+      { mode: 0o600 },
+    );
+
+    const login = spawnCliWith(["login", "acct", "--tool", "claude"], {
+      env: {
+        FAKE_LOGIN_STARTED: started,
+        FAKE_LOGIN_MUTATE: mutate,
+        FAKE_LOGIN_READY: ready,
+        FAKE_LOGIN_RELEASE: release,
+      },
+    });
+    const loginResult = collect(login);
+    await waitFor(() => existsSync(started));
+
+    const apply = runCli("apply", "acct", "--tool", "claude");
+    expect(apply.status).toBe(0);
+    writeFileSync(mutate, "mutate");
+    await waitFor(() => existsSync(ready));
+    writeFileSync(release, "release");
+    const result = await loginResult;
+
+    expect(result.code).toBe(failure.status);
+    expect(result.signal).toBeNull();
+    expect(readStore().current?.claude).toBe("acct");
+    expect(readStore().applied?.claude).toBe("acct");
+    expect(JSON.parse(readFileSync(join(target.dir, ".claude.json"), "utf8"))).toEqual({
+      oauthAccount: { emailAddress: "apply-owned@example.com" },
+      stablePreference: "before",
+      laterProcessPreference: "keep",
+    });
+    expect(JSON.parse(readFileSync(join(target.dir, ".credentials.json"), "utf8"))).toEqual({
+      claudeAiOauth: { refreshToken: "apply-owned-refresh" },
+      laterProcessPreference: "keep",
+    });
+  });
+}
+
+test("failed login does not restore stale auth after the profile is removed and recreated", async () => {
+  const ready = join(home, "recreated-auth.ready");
+  const release = join(home, "recreated-auth.release");
+  writeBlockingRawAuthMutatingFailureTool("claude", "CLAUDE_CONFIG_DIR", "nonzero");
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  const original = readStore().profiles?.find((profile) => profile.name === "acct" && profile.tool === "claude");
+  if (!original) throw new Error("missing original Claude profile fixture");
+  writeClaudeAuth(original.dir, "before@example.com");
+
+  const login = spawnCliWith(["login", "acct", "--tool", "claude"], {
+    env: {
+      FAKE_LOGIN_READY: ready,
+      FAKE_LOGIN_RELEASE: release,
+    },
+  });
+  const loginResult = collect(login);
+  await waitFor(() => existsSync(ready));
+
+  expect(runCli("remove", "acct", "--tool", "claude").status).toBe(0);
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  const recreated = readStore().profiles?.find((profile) => profile.name === "acct" && profile.tool === "claude");
+  if (!recreated) throw new Error("missing recreated Claude profile fixture");
+  writeFileSync(
+    join(recreated.dir, ".claude.json"),
+    '{"oauthAccount":{"emailAddress":"recreated@example.com"},"recreatedPreference":"keep"}\n',
+    { mode: 0o600 },
+  );
+  writeFileSync(
+    join(recreated.dir, ".credentials.json"),
+    '{"claudeAiOauth":{"refreshToken":"recreated-refresh"},"recreatedPreference":"keep"}\n',
+    { mode: 0o600 },
+  );
+
+  writeFileSync(release, "release");
+  const result = await loginResult;
+
+  expect(result.code).toBe(23);
+  expect(JSON.parse(readFileSync(join(recreated.dir, ".claude.json"), "utf8"))).toEqual({
+    oauthAccount: { emailAddress: "recreated@example.com" },
+    recreatedPreference: "keep",
+  });
+  expect(JSON.parse(readFileSync(join(recreated.dir, ".credentials.json"), "utf8"))).toEqual({
+    claudeAiOauth: { refreshToken: "recreated-refresh" },
+    recreatedPreference: "keep",
+  });
+});
+
+test("same-timestamp profile reincarnation fails closed without restoring old auth", async () => {
+  const ready = join(home, "same-timestamp-recreated-auth.ready");
+  const release = join(home, "same-timestamp-recreated-auth.release");
+  writeBlockingRawAuthMutatingFailureTool("claude", "CLAUDE_CONFIG_DIR", "nonzero");
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  const original = readStore().profiles?.find((profile) => profile.name === "acct" && profile.tool === "claude");
+  if (!original) throw new Error("missing original same-timestamp profile fixture");
+  writeClaudeAuth(original.dir, "before@example.com");
+
+  const login = spawnCliWith(["login", "acct", "--tool", "claude"], {
+    env: { FAKE_LOGIN_READY: ready, FAKE_LOGIN_RELEASE: release },
+  });
+  const loginResult = collect(login);
+  await waitFor(() => existsSync(ready));
+
+  expect(runCli("remove", "acct", "--tool", "claude").status).toBe(0);
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  const registry = readStore();
+  const recreated = registry.profiles?.find((profile) => profile.name === "acct" && profile.tool === "claude");
+  if (!recreated) throw new Error("missing recreated same-timestamp profile fixture");
+  // Force the strongest possible incarnation-digest collision: same tool,
+  // managed directory, and timestamp. The independent auth identity must
+  // still prevent the old login from owning this new profile.
+  recreated.createdAt = original.createdAt;
+  writeFileSync(join(home, "accounts.json"), JSON.stringify(registry, null, 2) + "\n", { mode: 0o600 });
+  writeFileSync(
+    join(recreated.dir, ".claude.json"),
+    '{"oauthAccount":{"emailAddress":"recreated@example.com"},"recreatedPreference":"keep"}\n',
+    { mode: 0o600 },
+  );
+  writeFileSync(
+    join(recreated.dir, ".credentials.json"),
+    '{"claudeAiOauth":{"refreshToken":"recreated-refresh"},"recreatedPreference":"keep"}\n',
+    { mode: 0o600 },
+  );
+
+  writeFileSync(release, "release");
+  const result = await loginResult;
+
+  expect(result.code).toBe(1);
+  expect(result.stderr).toMatch(/missing Claude profile auth identity/);
+  expect(JSON.parse(readFileSync(join(recreated.dir, ".claude.json"), "utf8"))).toEqual({
+    oauthAccount: { emailAddress: "recreated@example.com" },
+    recreatedPreference: "keep",
+  });
+  expect(JSON.parse(readFileSync(join(recreated.dir, ".credentials.json"), "utf8"))).toEqual({
+    claudeAiOauth: { refreshToken: "recreated-refresh" },
+    recreatedPreference: "keep",
+  });
+});
+
+test("overlapping failed logins keep their shared committed auth baseline", async () => {
+  const readyA = join(home, "overlap-a.ready");
+  const releaseA = join(home, "overlap-a.release");
+  const readyB = join(home, "overlap-b.ready");
+  const releaseB = join(home, "overlap-b.release");
+  writeBlockingRawAuthMutatingFailureTool("claude", "CLAUDE_CONFIG_DIR", "nonzero");
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  const target = readStore().profiles?.find((profile) => profile.name === "acct" && profile.tool === "claude");
+  if (!target) throw new Error("missing overlapping login profile fixture");
+  writeFileSync(
+    join(target.dir, ".claude.json"),
+    '{"oauthAccount":{"emailAddress":"baseline@example.com"},"stablePreference":"before"}\n',
+    { mode: 0o600 },
+  );
+  writeFileSync(
+    join(target.dir, ".credentials.json"),
+    '{"claudeAiOauth":{"refreshToken":"baseline-refresh"}}\n',
+    { mode: 0o600 },
+  );
+
+  const loginA = spawnCliWith(["login", "acct", "--tool", "claude"], {
+    env: { FAKE_LOGIN_READY: readyA, FAKE_LOGIN_RELEASE: releaseA },
+  });
+  const resultA = collect(loginA);
+  await waitFor(() => existsSync(readyA));
+  const loginB = spawnCliWith(["login", "acct", "--tool", "claude"], {
+    env: { FAKE_LOGIN_READY: readyB, FAKE_LOGIN_RELEASE: releaseB },
+  });
+  const resultB = collect(loginB);
+  await Bun.sleep(200);
+  expect(existsSync(readyB)).toBe(false);
+
+  writeFileSync(releaseA, "release");
+  expect((await resultA).code).toBe(23);
+  await waitFor(() => existsSync(readyB));
+  // The second child is still live and may write again after A rolls back.
+  writeFileSync(
+    join(target.dir, ".claude.json"),
+    '{"oauthAccount":{"emailAddress":"second-child@example.com"},"overlapPreference":"keep"}\n',
+    { mode: 0o600 },
+  );
+  writeFileSync(
+    join(target.dir, ".credentials.json"),
+    '{"claudeAiOauth":{"refreshToken":"second-child-refresh"},"overlapPreference":"keep"}\n',
+    { mode: 0o600 },
+  );
+  writeFileSync(releaseB, "release");
+  expect((await resultB).code).toBe(23);
+
+  expect(JSON.parse(readFileSync(join(target.dir, ".claude.json"), "utf8"))).toEqual({
+    oauthAccount: { emailAddress: "baseline@example.com" },
+    stablePreference: "before",
+    overlapPreference: "keep",
+  });
+  expect(JSON.parse(readFileSync(join(target.dir, ".credentials.json"), "utf8"))).toEqual({
+    claudeAiOauth: { refreshToken: "baseline-refresh" },
+    overlapPreference: "keep",
+  });
+  expect(readStore().profileAuthRevisions?.["claude/acct"]).toBeTruthy();
+  expect(readStore().profileAuthCommitRevisions?.["claude/acct"]).toBeTruthy();
+  expect(readStore().profileAuthIncarnations?.["claude/acct"]).toBeTruthy();
+});
+
+test("same-profile login children are serialized without blocking a later apply", async () => {
+  const readyA = join(home, "serialized-a.ready");
+  const releaseA = join(home, "serialized-a.release");
+  const readyB = join(home, "serialized-b.ready");
+  const releaseB = join(home, "serialized-b.release");
+  const events = join(home, "serialized-login-events");
+  const tmpA = join(home, "tmp-a");
+  const tmpB = join(home, "tmp-b");
+  mkdirSync(tmpA, { recursive: true });
+  mkdirSync(tmpB, { recursive: true });
+  writeBlockingRawAuthMutatingFailureTool("claude", "CLAUDE_CONFIG_DIR", "nonzero");
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+
+  const loginA = spawnCliWith(["login", "acct", "--tool", "claude"], {
+    env: {
+      FAKE_LOGIN_ID: "a",
+      FAKE_LOGIN_EVENTS: events,
+      FAKE_LOGIN_READY: readyA,
+      FAKE_LOGIN_RELEASE: releaseA,
+      TMPDIR: tmpA,
+    },
+  });
+  const resultA = collect(loginA);
+  await waitFor(() => existsSync(readyA));
+  const loginB = spawnCliWith(["login", "acct", "--tool", "claude"], {
+    env: {
+      FAKE_LOGIN_ID: "b",
+      FAKE_LOGIN_EXIT: "success",
+      FAKE_LOGIN_EVENTS: events,
+      FAKE_LOGIN_READY: readyB,
+      FAKE_LOGIN_RELEASE: releaseB,
+      TMPDIR: tmpB,
+    },
+  });
+  const resultB = collect(loginB);
+  await Bun.sleep(800);
+  expect(existsSync(readyB)).toBe(false);
+  writeFileSync(releaseA, "release");
+  expect((await resultA).code).toBe(23);
+  await waitFor(() => existsSync(readyB));
+  writeFileSync(releaseB, "release");
+  expect((await resultB).code).toBe(0);
+
+  const order = readFileSync(events, "utf8").trim().split("\n");
+  expect(order.indexOf("a:exit")).toBeLessThan(order.indexOf("b:start"));
+  const target = readStore().profiles?.find((profile) => profile.name === "acct" && profile.tool === "claude");
+  if (!target) throw new Error("missing serialized login profile fixture");
+  expect(JSON.parse(readFileSync(join(target.dir, ".claude.json"), "utf8"))).toMatchObject({
+    oauthAccount: { emailAddress: "b@example.com" },
+  });
+  expect(JSON.parse(readFileSync(join(target.dir, ".credentials.json"), "utf8"))).toMatchObject({
+    claudeAiOauth: { accessToken: "b-access-token", refreshToken: "b-refresh-token" },
+  });
+});
+
+test("a login waiting on the profile lease never crosses a remove and recreate", async () => {
+  const readyA = join(home, "recreate-lease-a.ready");
+  const releaseA = join(home, "recreate-lease-a.release");
+  const readyB = join(home, "recreate-lease-b.ready");
+  const releaseB = join(home, "recreate-lease-b.release");
+  writeBlockingRawAuthMutatingFailureTool("claude", "CLAUDE_CONFIG_DIR", "nonzero");
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+
+  const loginA = spawnCliWith(["login", "acct", "--tool", "claude"], {
+    env: {
+      FAKE_LOGIN_ID: "a",
+      FAKE_LOGIN_READY: readyA,
+      FAKE_LOGIN_RELEASE: releaseA,
+    },
+  });
+  const resultA = collect(loginA);
+  await waitFor(() => existsSync(readyA));
+
+  const loginB = spawnCliWith(["login", "acct", "--tool", "claude"], {
+    env: {
+      FAKE_LOGIN_ID: "b",
+      FAKE_LOGIN_READY: readyB,
+      FAKE_LOGIN_RELEASE: releaseB,
+    },
+  });
+  const resultB = collect(loginB);
+  await Bun.sleep(300);
+  expect(existsSync(readyB)).toBe(false);
+
+  expect(runCli("remove", "acct", "--tool", "claude").status).toBe(0);
+  await Bun.sleep(20);
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  writeFileSync(releaseA, "release");
+  expect((await resultA).code).toBe(23);
+
+  await waitFor(() => existsSync(readyB) || loginB.exitCode !== null);
+  if (existsSync(readyB)) writeFileSync(releaseB, "release");
+  const failed = await resultB;
+  expect(failed.code).toBe(1);
+  expect(failed.stderr).toMatch(/profile changed before Claude auth capture/);
+  expect(existsSync(readyB)).toBe(false);
+});
+
+test("SIGTERM rollback waits beyond the old five-second apply window", async () => {
+  const ready = join(home, "long-apply-wait.ready");
+  const release = join(home, "long-apply-wait.release");
+  writeBlockingRawAuthMutatingFailureTool("claude", "CLAUDE_CONFIG_DIR", "nonzero");
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  const target = readStore().profiles?.find((profile) => profile.name === "acct" && profile.tool === "claude");
+  if (!target) throw new Error("missing long apply wait profile fixture");
+  writeClaudeAuth(target.dir, "before-long-apply@example.com");
+
+  const login = spawnCliWith(["login", "acct", "--tool", "claude"], {
+    env: { FAKE_LOGIN_READY: ready, FAKE_LOGIN_RELEASE: release },
+  });
+  const resultPromise = collect(login);
+  await waitFor(() => existsSync(ready));
+  const applyLock = join(home, ".apply.lock");
+  writeFileSync(applyLock, "99999\n", { mode: 0o600 });
+  const releaseLock = setTimeout(() => rmSync(applyLock, { force: true }), 5_200);
+  login.kill("SIGTERM");
+  const result = await resultPromise;
+  clearTimeout(releaseLock);
+  rmSync(applyLock, { force: true });
+
+  expect(result.code).toBe(143);
+  expect(result.stderr).not.toMatch(/timed out waiting for the accounts apply lock/);
+  expect(JSON.parse(readFileSync(join(target.dir, ".claude.json"), "utf8"))).toMatchObject({
+    oauthAccount: { emailAddress: "before-long-apply@example.com" },
+    laterProcessPreference: "keep",
+  });
+  expect(JSON.parse(readFileSync(join(target.dir, ".credentials.json"), "utf8"))).toMatchObject({
+    claudeAiOauth: { refreshToken: "before-long-apply@example.com-refresh-token" },
+    laterProcessPreference: "keep",
+  });
+}, 8_000);
+
+test("failed login follows a concurrent profile rename without restoring a stale identity", async () => {
+  const ready = join(home, "renamed-auth.ready");
+  const release = join(home, "renamed-auth.release");
+  writeBlockingRawAuthMutatingFailureTool("claude", "CLAUDE_CONFIG_DIR", "nonzero");
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  const original = readStore().profiles?.find((profile) => profile.name === "acct" && profile.tool === "claude");
+  if (!original) throw new Error("missing original Claude profile fixture");
+  writeFileSync(
+    join(original.dir, ".claude.json"),
+    '{"oauthAccount":{"emailAddress":"before-rename@example.com"},"stablePreference":"before"}\n',
+    { mode: 0o600 },
+  );
+  writeFileSync(
+    join(original.dir, ".credentials.json"),
+    '{"claudeAiOauth":{"refreshToken":"before-rename-refresh"}}\n',
+    { mode: 0o600 },
+  );
+
+  const login = spawnCliWith(["login", "acct", "--tool", "claude"], {
+    env: {
+      FAKE_LOGIN_READY: ready,
+      FAKE_LOGIN_RELEASE: release,
+    },
+  });
+  const loginResult = collect(login);
+  await waitFor(() => existsSync(ready));
+
+  expect(runCli("rename", "acct", "renamed", "--tool", "claude").status).toBe(0);
+  writeFileSync(release, "release");
+  const result = await loginResult;
+  const renamed = readStore().profiles?.find((profile) => profile.name === "renamed" && profile.tool === "claude");
+  if (!renamed) throw new Error("missing renamed Claude profile fixture");
+
+  expect(result.code).toBe(23);
+  expect(JSON.parse(readFileSync(join(renamed.dir, ".claude.json"), "utf8"))).toEqual({
+    oauthAccount: { emailAddress: "before-rename@example.com" },
+    stablePreference: "before",
+    laterProcessPreference: "keep",
+  });
+  expect(JSON.parse(readFileSync(join(renamed.dir, ".credentials.json"), "utf8"))).toEqual({
+    claudeAiOauth: { refreshToken: "before-rename-refresh" },
+    laterProcessPreference: "keep",
+  });
+});
+
+test("rename between login lookup and auth publication preserves a later apply", async () => {
+  const captureReady = join(home, "rename-gap.capture-ready");
+  const childReady = join(home, "rename-gap.child-ready");
+  const release = join(home, "rename-gap.release");
+  writeBlockingRawAuthMutatingFailureTool("claude", "CLAUDE_CONFIG_DIR", "nonzero");
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  const original = readStore().profiles?.find((profile) => profile.name === "acct" && profile.tool === "claude");
+  if (!original) throw new Error("missing rename-gap profile fixture");
+  writeClaudeAuth(original.dir, "before-gap@example.com");
+
+  const login = spawnCliWith(["login", "acct", "--tool", "claude"], {
+    env: {
+      ACCOUNTS_TEST_LOGIN_CAPTURE_READY: captureReady,
+      ACCOUNTS_TEST_LOGIN_CAPTURE_DELAY_MS: "500",
+      FAKE_LOGIN_READY: childReady,
+      FAKE_LOGIN_RELEASE: release,
+    },
+  });
+  const loginResult = collect(login);
+  await waitFor(() => existsSync(captureReady));
+  expect(runCli("rename", "acct", "renamed", "--tool", "claude").status).toBe(0);
+  await waitFor(() => existsSync(childReady));
+
+  const apply = runCli("apply", "renamed", "--tool", "claude");
+  expect(apply.status).toBe(0);
+  const renamed = readStore().profiles?.find((profile) => profile.name === "renamed" && profile.tool === "claude");
+  if (!renamed) throw new Error("missing renamed gap profile fixture");
+  const laterHome = readFileSync(join(renamed.dir, ".claude.json"), "utf8");
+  const laterCredentials = readFileSync(join(renamed.dir, ".credentials.json"), "utf8");
+  writeFileSync(release, "release");
+  expect((await loginResult).code).toBe(23);
+
+  expect(readStore().current?.claude).toBe("renamed");
+  expect(readStore().applied?.claude).toBe("renamed");
+  expect(JSON.parse(readFileSync(join(renamed.dir, ".claude.json"), "utf8"))).toEqual(JSON.parse(laterHome));
+  expect(JSON.parse(readFileSync(join(renamed.dir, ".credentials.json"), "utf8"))).toEqual(
+    JSON.parse(laterCredentials),
+  );
+  expect(readStore().profileAuthRevisions?.["claude/acct"]).toBeUndefined();
+  expect(readStore().profileAuthCommitRevisions?.["claude/acct"]).toBeUndefined();
+  expect(readStore().profileAuthIncarnations?.["claude/acct"]).toBeUndefined();
+  expect(readStore().profileAuthRevisions?.["claude/renamed"]).toBeTruthy();
+  expect(readStore().profileAuthCommitRevisions?.["claude/renamed"]).toBeTruthy();
+  expect(readStore().profileAuthIncarnations?.["claude/renamed"]).toBeTruthy();
+});
+
+test("stale login lookup never moves pre-existing auth ownership back across rename", async () => {
+  const captureReady = join(home, "rename-existing.capture-ready");
+  writeRawAuthMutatingFailureTool("claude", "CLAUDE_CONFIG_DIR", "nonzero");
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  const original = readStore().profiles?.find((profile) => profile.name === "acct" && profile.tool === "claude");
+  if (!original) throw new Error("missing pre-existing rename profile fixture");
+  writeClaudeAuth(original.dir, "before-existing-rename@example.com");
+  expect(runCli("apply", "acct", "--tool", "claude").status).toBe(0);
+
+  const login = spawnCliWith(["login", "acct", "--tool", "claude"], {
+    env: {
+      ACCOUNTS_TEST_LOGIN_CAPTURE_READY: captureReady,
+      ACCOUNTS_TEST_LOGIN_CAPTURE_DELAY_MS: "500",
+    },
+  });
+  const loginResult = collect(login);
+  await waitFor(() => existsSync(captureReady));
+  expect(runCli("rename", "acct", "renamed", "--tool", "claude").status).toBe(0);
+  const failed = await loginResult;
+  expect(failed.code).toBe(23);
+
+  const machine = readStore();
+  expect(machine.current?.claude).toBe("renamed");
+  expect(machine.applied?.claude).toBe("renamed");
+  expect(machine.profileAuthRevisions?.["claude/acct"]).toBeUndefined();
+  expect(machine.profileAuthCommitRevisions?.["claude/acct"]).toBeUndefined();
+  expect(machine.profileAuthIncarnations?.["claude/acct"]).toBeUndefined();
+  expect(machine.profileAuthRevisions?.["claude/renamed"]).toBeTruthy();
+  expect(machine.profileAuthCommitRevisions?.["claude/renamed"]).toBeTruthy();
+  expect(machine.profileAuthIncarnations?.["claude/renamed"]).toBeTruthy();
+  expect(JSON.parse(readFileSync(join(original.dir, ".claude.json"), "utf8"))).toMatchObject({
+    oauthAccount: { emailAddress: "before-existing-rename@example.com" },
+  });
+});
+
+test("removing a renamed profile cleans stale pre-rename auth ownership before name reuse", async () => {
+  const captureReady = join(home, "rename-remove.capture-ready");
+  writeRawAuthMutatingFailureTool("claude", "CLAUDE_CONFIG_DIR", "nonzero");
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  const original = readStore().profiles?.find((profile) => profile.name === "acct" && profile.tool === "claude");
+  if (!original) throw new Error("missing rename/remove profile fixture");
+  writeClaudeAuth(original.dir, "before-remove@example.com");
+
+  const login = spawnCliWith(["login", "acct", "--tool", "claude"], {
+    env: {
+      ACCOUNTS_TEST_LOGIN_CAPTURE_READY: captureReady,
+      ACCOUNTS_TEST_LOGIN_CAPTURE_DELAY_MS: "500",
+    },
+  });
+  const loginResult = collect(login);
+  await waitFor(() => existsSync(captureReady));
+  expect(runCli("rename", "acct", "renamed", "--tool", "claude").status).toBe(0);
+  expect((await loginResult).code).toBe(23);
+  expect(readStore().profileAuthRevisions?.["claude/acct"]).toBeTruthy();
+
+  expect(runCli("remove", "renamed", "--tool", "claude").status).toBe(0);
+  expect(readStore().profileAuthRevisions).toEqual({});
+  expect(readStore().profileAuthCommitRevisions).toEqual({});
+  expect(readStore().profileAuthIncarnations).toEqual({});
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  const reused = runCli("login", "acct", "--tool", "claude");
+  expect(reused.status).toBe(23);
+  expect(reused.stderr).not.toContain("profile changed before Claude auth capture");
+});
 
 test("post-child SIGTERM rolls back finalization without Claude keychain support", async () => {
   const completed = join(home, "non-keychain-login-completed");
@@ -593,7 +1252,7 @@ test("repeated parent SIGINT rolls back while holding the shared Claude keychain
   const result = await resultPromise;
   expect(result.code).toBe(130);
   expect(result.signal).toBeNull();
-  expect(readFileSync(join(home, "accounts.json"), "utf8")).toBe(storeBefore);
+  expectOnlyStableAuthTrackingAdded(storeBefore, "claude/acct");
   expect(JSON.parse(readFileSync(fixture.keychainState, "utf8"))).toEqual({
     account: "prior",
     secret: "prior-secret",
@@ -701,6 +1360,9 @@ test("SIGINT during finalization restores live auth, applied state, profile meta
     ...restoredStore,
     currentRevisions: storeBefore.currentRevisions,
     appliedRevisions: storeBefore.appliedRevisions,
+    profileAuthRevisions: storeBefore.profileAuthRevisions,
+    profileAuthCommitRevisions: storeBefore.profileAuthCommitRevisions,
+    profileAuthIncarnations: storeBefore.profileAuthIncarnations,
   }).toEqual(storeBefore);
   expect(restoredStore.currentRevisions.claude).not.toBe(storeBefore.currentRevisions.claude);
   expect(restoredStore.appliedRevisions.claude).not.toBe(storeBefore.appliedRevisions.claude);
@@ -765,10 +1427,19 @@ test("failed login restores a pre-existing tool lock for the same profile name",
   const result = runCli("login", "shared", "--tool", "claude");
 
   expect(result.status).toBe(23);
-  expect(readFileSync(join(home, "accounts.json"), "utf8")).toBe(storeBefore);
-  expect(readStore().toolLocks?.shared).toBe("codex");
-  expect(readStore().current?.codex).toBe("shared");
-  expect(readStore().current?.claude).toBeUndefined();
+  const before = JSON.parse(storeBefore) as ReturnType<typeof readStore>;
+  const after = readStore();
+  expect({
+    ...after,
+    profileAuthRevisions: before.profileAuthRevisions,
+    profileAuthCommitRevisions: before.profileAuthCommitRevisions,
+    profileAuthIncarnations: before.profileAuthIncarnations,
+    toolLockRevisions: before.toolLockRevisions,
+  }).toEqual(before);
+  expect(after.toolLocks?.shared).toBe("codex");
+  expect(after.toolLockRevisions?.shared).not.toBe(before.toolLockRevisions?.shared);
+  expect(after.current?.codex).toBe("shared");
+  expect(after.current?.claude).toBeUndefined();
 });
 
 test("failed new login removes its profile but preserves a pre-existing managed directory", () => {
@@ -784,6 +1455,35 @@ test("failed new login removes its profile but preserves a pre-existing managed 
   expect(readStore().profiles?.some((profile) => profile.name === "preexisting-dir" && profile.tool === "claude")).toBe(false);
   expect(readStore().toolLocks?.["preexisting-dir"]).toBeUndefined();
   expect(readFileSync(sentinel, "utf8")).toBe("keep");
+});
+
+test("failed new login preserves a profile adopted by a later update and use", async () => {
+  const ready = join(home, "adopted-created.ready");
+  const release = join(home, "adopted-created.release");
+  writeBlockingRawAuthMutatingFailureTool("claude", "CLAUDE_CONFIG_DIR", "nonzero");
+
+  const login = spawnCliWith(["login", "adopted", "--tool", "claude"], {
+    env: { FAKE_LOGIN_READY: ready, FAKE_LOGIN_RELEASE: release },
+  });
+  const loginResult = collect(login);
+  await waitFor(() => existsSync(ready));
+
+  expect(runCli("set", "adopted", "--tool", "claude", "--description", "adopted elsewhere").status).toBe(0);
+  expect(runCli("use", "adopted", "--tool", "claude").status).toBe(0);
+  const adopted = readStore();
+  const adoptedRevision = adopted.currentRevisions?.claude;
+  const adoptedToolLockRevision = adopted.toolLockRevisions?.adopted;
+
+  writeFileSync(release, "release");
+  expect((await loginResult).code).toBe(23);
+
+  const after = readStore();
+  expect(after.profiles?.find((profile) => profile.name === "adopted" && profile.tool === "claude")?.description)
+    .toBe("adopted elsewhere");
+  expect(after.current?.claude).toBe("adopted");
+  expect(after.currentRevisions?.claude).toBe(adoptedRevision);
+  expect(after.toolLocks?.adopted).toBe("claude");
+  expect(after.toolLockRevisions?.adopted).toBe(adoptedToolLockRevision);
 });
 
 test("successful Claude login still finalizes, applies, and keeps the profile keychain", () => {

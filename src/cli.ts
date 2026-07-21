@@ -40,6 +40,7 @@ import { captureClaudeKeychain, keychainSupported, restoreClaudeKeychain } from 
 import { formatEnvAssignments, formatExportLines, profileEnv } from "./lib/env.js";
 import {
   captureLoginFinalizationState,
+  commitLoginFinalization,
   finalizeLogin,
   prepareLogin,
   rollbackLoginFinalization,
@@ -59,6 +60,8 @@ import {
 } from "./lib/supervisor.js";
 import {
   acquireClaudeKeychainLock,
+  acquireClaudeProfileLoginLock,
+  prepareClaudeProfileKeychainLocked,
   planClaudeLaunch,
   redactArgv,
   runClaudeLaunch,
@@ -323,12 +326,14 @@ function validateCliPermissionSyntax(opts: PermissionCliOptions): void {
 }
 
 function validateUniquePermissionsArg(argv: string[]): void {
-  let occurrences = 0;
+  let permissionsOccurrences = 0;
+  let compatibilityOccurrences = 0;
   for (const arg of argv) {
     if (arg === "--") break;
-    if (arg === "--permissions" || arg.startsWith("--permissions=")) occurrences += 1;
+    if (arg === "--permissions" || arg.startsWith("--permissions=")) permissionsOccurrences += 1;
+    if (arg === CLAUDE_DANGEROUS_PERMISSION_ARG) compatibilityOccurrences += 1;
   }
-  if (occurrences > 1) {
+  if (permissionsOccurrences > 1 || compatibilityOccurrences > 1) {
     throw new AccountsError("--permissions may be supplied only once");
   }
 }
@@ -668,6 +673,7 @@ program
       let priorKeychain: ReturnType<typeof captureClaudeKeychain>;
       let keychainCaptured = false;
       let releaseKeychainLock: (() => void) | undefined;
+      let releaseProfileLoginLock: (() => void) | undefined;
       let finalizationState: LoginFinalizationState | undefined;
       let pendingSignal: NodeJS.Signals | undefined;
       const lockAbort = new AbortController();
@@ -677,24 +683,34 @@ program
       };
       const onSigint = () => rememberSignal("SIGINT");
       const onSigterm = () => rememberSignal("SIGTERM");
-      let rolledBack = false;
+      let rollbackPromise: Promise<void> | undefined;
       const rollback = async () => {
-        if (rolledBack) return;
-        rolledBack = true;
-        try {
-          if (finalizationState) await rollbackLoginFinalization(finalizationState, store);
-        } finally {
+        rollbackPromise ??= (async () => {
           try {
-            await rollbackLoginPreparation(prepared, store);
+            if (finalizationState) await rollbackLoginFinalization(finalizationState, store);
           } finally {
-            if (keychainCaptured) restoreClaudeKeychain(priorKeychain);
+            try {
+              await rollbackLoginPreparation(
+                prepared,
+                store,
+                finalizationState?.profileClaudeIdentityRevision,
+                finalizationState?.profileClaudeCommitRevision,
+              );
+            } finally {
+              if (keychainCaptured) restoreClaudeKeychain(priorKeychain);
+            }
           }
-        }
+        })();
+        await rollbackPromise;
       };
       process.on("SIGINT", onSigint);
       process.on("SIGTERM", onSigterm);
       try {
-        finalizationState = await captureLoginFinalizationState(name, tool, store);
+        if (tool.id === "claude") {
+          releaseProfileLoginLock = await acquireClaudeProfileLoginLock(profile.dir, lockAbort.signal);
+          if (pendingSignal) throw new AccountsError("login interrupted before Claude launch");
+        }
+        finalizationState = await captureLoginFinalizationState(name, tool, store, profile);
         await new Promise<void>((resolve) => setImmediate(resolve));
         if (pendingSignal) throw new AccountsError("login interrupted before tool launch");
         const env = profileEnv(profile, tool);
@@ -740,13 +756,24 @@ program
           process.exitCode = signalExitCode(pendingSignal);
           return;
         }
+        const committed = await commitLoginFinalization(finalizationState, () => !pendingSignal);
+        if (!committed) {
+          await rollback();
+          process.exitCode = signalExitCode(pendingSignal!);
+          return;
+        }
         if (finalized.applied) {
           console.log(chalk.green(`✓ ${chalk.bold(name)} is now the live/default ${tool.label} account`));
         } else {
           console.log(chalk.green(`✓ ${chalk.bold(name)} login finished and profile is active`));
         }
       } catch (error) {
-        await rollback();
+        try {
+          await rollback();
+        } catch (rollbackError) {
+          const message = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
+          throw new AccountsError(`login rollback failed: ${message}`);
+        }
         if (pendingSignal) {
           process.exitCode = signalExitCode(pendingSignal);
           return;
@@ -756,6 +783,7 @@ program
         process.removeListener("SIGINT", onSigint);
         process.removeListener("SIGTERM", onSigterm);
         releaseKeychainLock?.();
+        releaseProfileLoginLock?.();
       }
     }),
   );
@@ -778,7 +806,7 @@ program
         console.log(chalk.dim("  applied to live Claude paths"));
       } else if (result.mode === "env") {
         const tool = getTool(result.profile.tool);
-        prepareClaudeProfileKeychain(result.profile.dir, tool, result.profile.name);
+        await prepareClaudeProfileKeychainLocked(result.profile.dir, tool, result.profile.name);
         console.log(formatExportLines(profileEnv(result.profile, tool)));
       }
     }),
@@ -945,7 +973,7 @@ program
       const profile = name ? await store.getProfile(name, opts.tool) : await store.currentProfile(toolId);
       if (!profile) die(`no active profile for "${toolId}". Use \`accounts use <name>\` first.`);
       const tool = getTool(profile.tool);
-      prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
+      await prepareClaudeProfileKeychainLocked(profile.dir, tool, profile.name);
       console.log(formatExportLines(profileEnv(profile, tool)));
     }),
   );
@@ -1140,7 +1168,7 @@ program
       await store.useProfile(name, tool.id);
       const shell = process.env.SHELL || "/bin/sh";
       console.log(chalk.dim(`→ subshell with ${formatEnvAssignments(env)} (exit to leave)`));
-      prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
+      await prepareClaudeProfileKeychainLocked(profile.dir, tool, profile.name);
       const res = spawnSync(shell, ["-i"], {
         stdio: "inherit",
         env: { ...process.env, ...env, ACCOUNTS_ACTIVE: profile.name },

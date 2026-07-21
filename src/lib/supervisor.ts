@@ -6,7 +6,7 @@ import { basename, join } from "node:path";
 import { accountsHome, loadAppliedMap } from "../storage.js";
 import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
-import { prepareClaudeProfileKeychain } from "./claude-auth.js";
+import { prepareClaudeProfileKeychainLocked } from "./claude-launch.js";
 import { profileEnv } from "./env.js";
 import { resolveStore, type AccountsStore } from "./store.js";
 import { switchProfile, type SwitchMode, type SwitchResult } from "./switch.js";
@@ -408,7 +408,7 @@ export async function runSupervisedTool(
     await store.useProfile(profile.name, tool.id);
     const env = profileEnv(profile, tool);
     log(`accounts supervisor: starting ${tool.bin} for ${profile.name}`);
-    prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
+    await prepareClaudeProfileKeychainLocked(profile.dir, tool, profile.name);
     const proc = spawn(tool.bin, childArgs, {
       stdio: opts.stdio ?? "inherit",
       env: { ...process.env, ...env, ACCOUNTS_SUPERVISOR: "1", ACCOUNTS_ACTIVE: profile.name },

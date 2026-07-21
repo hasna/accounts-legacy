@@ -13,6 +13,7 @@ const OLD_ROW = {
   dir: null,
   description: null,
   created_at: "2020-01-01T00:00:00Z",
+  incarnation_id: "11111111-1111-4111-8111-111111111111",
   last_used_at: null,
 };
 
@@ -119,6 +120,28 @@ function transactionalClient(failOnAccountWrite: boolean) {
 }
 
 describe("AccountsRepo account/current atomicity", () => {
+  test("login email redetection is a no-op after a concurrent same-incarnation edit", async () => {
+    const concurrent = { ...OLD_ROW, email: "concurrent@example.test" };
+    const statements: string[] = [];
+    const client = {
+      pool: {} as never,
+      close: async () => {},
+      async get(sql: string) {
+        statements.push(sql);
+        return sql.startsWith("UPDATE accounts") ? null : concurrent;
+      },
+    } as unknown as PoolQueryClient;
+
+    const updated = await new AccountsRepo(client).updateForLogin("claude", "old", {
+      expectedIncarnationId: OLD_ROW.incarnation_id,
+      expectedEmail: OLD_ROW.email,
+      email: "detected@example.test",
+    } as never);
+
+    expect(updated.email).toBe("concurrent@example.test");
+    expect(statements[0]).toContain("email IS NOT DISTINCT FROM");
+  });
+
   test("restoreProfile conditionally touches only finalization-owned fields", async () => {
     const statements: string[] = [];
     const client = {
@@ -130,12 +153,40 @@ describe("AccountsRepo account/current atomicity", () => {
       },
     } as unknown as PoolQueryClient;
     const restored = await new AccountsRepo(client).restoreProfile("claude", "old", {
+      expectedIncarnationId: OLD_ROW.incarnation_id,
       email: { expected: "failed@example.com", restore: null },
       lastUsedAt: { expected: "2026-07-21T00:00:00.000Z", restore: null },
     });
     expect(restored.name).toBe("old");
     expect(statements[0]).toContain("IS NOT DISTINCT FROM");
+    expect(statements[0]).toContain("incarnation_id");
     expect(statements[0]).not.toContain("description =");
+  });
+
+  test("restoreProfile is a no-op for a replacement account incarnation", async () => {
+    const replacement = {
+      ...OLD_ROW,
+      email: "fixture@example.test",
+      incarnation_id: "22222222-2222-4222-8222-222222222222",
+    };
+    const statements: string[] = [];
+    const client = {
+      pool: {} as never,
+      close: async () => {},
+      async get(sql: string) {
+        statements.push(sql);
+        return sql.startsWith("UPDATE accounts") ? null : replacement;
+      },
+    } as unknown as PoolQueryClient;
+
+    const restored = await new AccountsRepo(client).restoreProfile("claude", "old", {
+      expectedIncarnationId: OLD_ROW.incarnation_id,
+      email: { expected: "fixture@example.test", restore: null },
+    });
+
+    expect(restored.email).toBe("fixture@example.test");
+    expect(restored.incarnationId).toBe(replacement.incarnation_id);
+    expect(statements[0]).toContain("incarnation_id =");
   });
 
   test("setCurrent uses a wire-stable millisecond timestamp for last-used rollback", async () => {
