@@ -6,6 +6,8 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.9] - 2026-07-21
+
 ### Fixed
 
 - `accounts login <name> --permissions <preset>` now validates the selected
