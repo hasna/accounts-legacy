@@ -96,6 +96,16 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   never activates a replacement under the displaced name. API login email update,
   activation, and rollback use incarnation-required new-only routes that mixed old
   replicas reject instead of stripping ownership fields.
+  Additive migration `0009` persists the original target incarnation on each
+  completed login operation. Every replay now checks both the cached binding
+  and the live account, so a changed-payload retry cannot return stale success
+  after delete/recreate; older operation rows without provable ownership fail
+  closed. Local operation replay applies the same incarnation binding.
+  Permission input normalization now validates Accounts presets, the direct
+  Claude compatibility flag, and native pass-through arguments as one source
+  before switch/apply mutation. Repeated native dangerous flags, conflicting
+  preset/pass-through sources, and unsupported presets all fail closed before
+  profile selection or child launch.
   Legacy local non-Claude profile-field rollback fails closed when the record
   predates collision-proof incarnation tokens.
   Ordinary apply and all CLI/switch/supervisor keychain writers now share the

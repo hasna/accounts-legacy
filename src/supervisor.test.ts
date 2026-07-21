@@ -206,6 +206,23 @@ test("supervisor switch preflights configs before queueing or stopping the curre
     await waitFor(() => (existsSync(supervisorSocketPath("codewith")) ? true : undefined));
     await waitFor(() => (readLog(logPath).some((entry) => entry.active === "one") ? true : undefined));
 
+    const callsBeforeInvalidPermissions = calls.length;
+    const invalidPermissions = await sendSupervisorRequest("codewith", {
+      type: "switch_profile",
+      name: "bad",
+      resume: false,
+      args: [scriptPath],
+      permissions: "definitely-unsupported",
+    });
+
+    expect(invalidPermissions?.ok).toBe(false);
+    expect(invalidPermissions && !invalidPermissions.ok ? invalidPermissions.error : "").toContain(
+      "does not support permissions",
+    );
+    expect(calls.length).toBe(callsBeforeInvalidPermissions);
+    expect(existsSync(join(bad.dir, ".hasna", "session-render-manifest.json"))).toBe(false);
+    expect(currentProfile("codewith")?.name).toBe("one");
+
     const failed = await sendSupervisorRequest("codewith", {
       type: "switch_profile",
       name: "two",
@@ -326,5 +343,68 @@ test("switch --supervisor sends configs prelaunch flags to the supervisor", asyn
   } finally {
     server.close();
     rmSync(supervisorSocketPath("codewith"), { force: true });
+  }
+});
+
+test("supervisor CLI routes preserve a single native Claude permission source", async () => {
+  addProfile({ name: "two", tool: "claude" });
+
+  const requests: Array<Record<string, unknown>> = [];
+  const server = createServer((socket) => {
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      const request = JSON.parse(chunk.trim()) as Record<string, unknown>;
+      requests.push(request);
+      socket.end(
+        JSON.stringify({
+          ok: true,
+          queued: true,
+          result: { profile: { name: "two" }, command: ["claude"], commandLine: "claude" },
+          state: { version: 1, tool: "claude", profile: "one", pid: process.pid, socketPath: supervisorSocketPath("claude"), command: ["claude"], startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() },
+          restartDelayMs: 1,
+        }) + "\n",
+      );
+    });
+  });
+
+  try {
+    rmSync(supervisorSocketPath("claude"), { force: true });
+    mkdirSync(dirname(supervisorSocketPath("claude")), { recursive: true });
+    await listen(server, supervisorSocketPath("claude"));
+
+    for (const route of [["switch", "two", "--tool", "claude", "--supervisor"], ["supervisor", "switch", "two", "--tool", "claude"]]) {
+      const proc = Bun.spawn({
+        cmd: [
+          process.execPath,
+          "run",
+          "src/cli.ts",
+          ...route,
+          "--",
+          "--dangerously-skip-permissions",
+        ],
+        env: { ...process.env, ACCOUNTS_HOME: home },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      const [exitCode, stderr] = await Promise.all([
+        proc.exited,
+        new Response(proc.stderr).text(),
+      ]);
+      expect({ exitCode, stderr }).toMatchObject({ exitCode: 0, stderr: "" });
+    }
+
+    expect(requests).toHaveLength(2);
+    for (const request of requests) {
+      expect(request).toMatchObject({
+        type: "switch_profile",
+        name: "two",
+        tool: "claude",
+        args: ["--dangerously-skip-permissions"],
+      });
+      expect(request).not.toHaveProperty("permissions");
+    }
+  } finally {
+    server.close();
+    rmSync(supervisorSocketPath("claude"), { force: true });
   }
 });

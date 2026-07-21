@@ -420,9 +420,11 @@ export class AccountsRepo implements AccountsStore {
         previous_name: string | null;
         previous_incarnation_id: string | null;
         previous_target_last_used_at: string | Date | null;
+        target_incarnation_id: string | null;
       }>(
         `SELECT operation_id, tool, name, state, updated_at, revision,
-                previous_name, previous_incarnation_id, previous_target_last_used_at
+                previous_name, previous_incarnation_id, previous_target_last_used_at,
+                target_incarnation_id
            FROM current_login_operations
           WHERE operation_id = $1`,
         [operationId],
@@ -437,11 +439,18 @@ export class AccountsRepo implements AccountsStore {
         if (completed.updated_at === null || completed.revision === null) {
           throw new AccountsError("completed login operation is missing its activation result");
         }
-        if (expectedIncarnationId) {
-          const account = await this.getWith(client, tool, name, { forUpdate: true });
-          if (!account || account.incarnationId !== expectedIncarnationId) {
-            throw new AccountsError("profile changed while login activation was in progress");
-          }
+        if (!completed.target_incarnation_id) {
+          throw new AccountsError("completed login operation is missing its target incarnation");
+        }
+        if (
+          expectedIncarnationId &&
+          completed.target_incarnation_id !== expectedIncarnationId
+        ) {
+          throw new AccountsError("login operation id is already bound to another profile incarnation");
+        }
+        const account = await this.getWith(client, tool, name, { forUpdate: true });
+        if (!account || account.incarnationId !== completed.target_incarnation_id) {
+          throw new AccountsError("profile changed while login activation was in progress");
         }
         return {
           tool: completed.tool,
@@ -495,8 +504,8 @@ export class AccountsRepo implements AccountsStore {
       await client.execute(
         `INSERT INTO current_login_operations
            (operation_id, tool, name, state, updated_at, revision, previous_name,
-            previous_incarnation_id, previous_target_last_used_at)
-         VALUES ($1::uuid, $2, $3, 'completed', $4::timestamptz, $5::bigint, $6, $7::uuid, $8::timestamptz)`,
+            previous_incarnation_id, previous_target_last_used_at, target_incarnation_id)
+         VALUES ($1::uuid, $2, $3, 'completed', $4::timestamptz, $5::bigint, $6, $7::uuid, $8::timestamptz, $9::uuid)`,
         [
           operationId,
           row.tool,
@@ -506,6 +515,7 @@ export class AccountsRepo implements AccountsStore {
           displaced?.name ?? null,
           displaced?.incarnation_id ?? null,
           account.lastUsedAt ?? null,
+          account.incarnationId,
         ],
       );
       return {

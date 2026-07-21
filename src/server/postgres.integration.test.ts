@@ -178,7 +178,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
     await adminPool?.end();
   });
 
-  test("migrations 0003 through 0008 upgrade existing data and are restart-idempotent", async () => {
+  test("migrations 0003 through 0009 upgrade existing data and are restart-idempotent", async () => {
     const appMigrations = accountsMigrations().filter((migration) =>
       migration.id.startsWith("accounts_"),
     );
@@ -261,6 +261,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
     expect(pendingRollbackState.pending).toEqual([
       "accounts_0007_login_operation_rollback_state",
       "accounts_0008_account_incarnations",
+      "accounts_0009_login_operation_target_incarnation",
     ]);
     expect(pendingRollbackState.checksumMismatches).toEqual([]);
     const upgraded = await new MigrationLedger(client, appMigrations).migrate();
@@ -271,9 +272,24 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       upgraded.plan.find((item) => item.migration.id === "accounts_0008_account_incarnations")?.state,
     ).toBe("pending");
     expect(
+      upgraded.plan.find(
+        (item) => item.migration.id === "accounts_0009_login_operation_target_incarnation",
+      )?.state,
+    ).toBe("pending");
+    expect(
       await client.get<{ present: boolean }>(
         "SELECT incarnation_id IS NOT NULL AS present FROM accounts WHERE tool = $1 AND name = $2",
         ["migration-probe", "valid"],
+      ),
+    ).toEqual({ present: true });
+    expect(
+      await client.get<{ present: boolean }>(
+        `SELECT EXISTS (
+           SELECT 1 FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = 'current_login_operations'
+              AND column_name = 'target_incarnation_id'
+         ) AS present`,
       ),
     ).toEqual({ present: true });
 
@@ -524,6 +540,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       "accounts_0006_current_selection_revisions",
       "accounts_0007_login_operation_rollback_state",
       "accounts_0008_account_incarnations",
+      "accounts_0009_login_operation_target_incarnation",
     ]);
     expect(() => assertMigrationStatusCompatible(legacyStatus)).toThrow(
       /not recognized by this build \(downgrade\?\)/,
@@ -711,6 +728,9 @@ describePostgres("PostgreSQL migration and repository integration", () => {
     await expect(
       repo.setCurrentForLogin(tool, target, operationId, original.incarnationId),
     ).rejects.toThrow(/profile changed while login activation was in progress/);
+    await expect(
+      repo.setCurrentForLogin(tool, target, operationId, replacement.incarnationId),
+    ).rejects.toThrow(/operation id is already bound to another profile incarnation/);
     expect(await repo.getCurrent(tool)).toBeNull();
   });
 

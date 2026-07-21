@@ -21,6 +21,7 @@ describe("accounts migrations", () => {
     expect(ids).toContain("accounts_0006_current_selection_revisions");
     expect(ids).toContain("accounts_0007_login_operation_rollback_state");
     expect(ids).toContain("accounts_0008_account_incarnations");
+    expect(ids).toContain("accounts_0009_login_operation_target_incarnation");
     expect(ids.some((id) => id.startsWith("hasna_auth_"))).toBe(true);
     for (const m of migrations) {
       expect(m.checksum.startsWith("sha256:")).toBe(true);
@@ -52,6 +53,9 @@ describe("accounts migrations", () => {
     const revisions = migrations.find((item) => item.id === "accounts_0006_current_selection_revisions");
     const rollbackState = migrations.find((item) => item.id === "accounts_0007_login_operation_rollback_state");
     const accountIncarnations = migrations.find((item) => item.id === "accounts_0008_account_incarnations");
+    const operationTargetIncarnation = migrations.find(
+      (item) => item.id === "accounts_0009_login_operation_target_incarnation",
+    );
     expect(revisions?.checksum).toBe(
       "sha256:fb55c634d8062524ffa86cf4ab45630d294f7750fd3c817e0c0a90c6b53d873c",
     );
@@ -59,5 +63,8 @@ describe("accounts migrations", () => {
     expect(rollbackState?.sql).toMatch(/ADD COLUMN IF NOT EXISTS previous_target_last_used_at TIMESTAMPTZ/);
     expect(accountIncarnations?.sql).toMatch(/ADD COLUMN IF NOT EXISTS incarnation_id UUID/);
     expect(accountIncarnations?.sql).toMatch(/SET DEFAULT pg_catalog\.gen_random_uuid\(\)/);
+    expect(operationTargetIncarnation?.sql).toMatch(
+      /ADD COLUMN IF NOT EXISTS target_incarnation_id UUID/,
+    );
   });
 });

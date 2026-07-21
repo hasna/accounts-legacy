@@ -4,7 +4,7 @@ import { applyProfile } from "./apply.js";
 import { prepareClaudeProfileKeychainLocked } from "./claude-launch.js";
 import { claudeApiAuthClearingEnv, formatEnvAssignments, formatExportLines, profileEnv } from "./env.js";
 import { resolveStore, type AccountsStore } from "./store.js";
-import { getTool, mergeToolArgs, normalizePermissionPreset } from "./tools.js";
+import { getTool, mergeToolArgs, resolvePermissionInputs } from "./tools.js";
 
 export type SwitchMode = "auto" | "apply" | "env" | "active";
 
@@ -55,6 +55,14 @@ export async function switchProfile(
   if (!["auto", "apply", "env", "active"].includes(mode)) {
     throw new AccountsError(`invalid switch mode "${mode}"`);
   }
+  const resolvedPermissions = resolvePermissionInputs(tool, {
+    permissions: opts.permissions,
+    passthroughArgs: opts.args,
+  });
+  const command = commandFor(profile, tool, {
+    ...opts,
+    permissions: resolvedPermissions.preset,
+  });
   let applied = false;
 
   if (mode === "apply" || (mode === "auto" && tool.id === "claude")) {
@@ -65,7 +73,6 @@ export async function switchProfile(
   }
 
   const env = applied && tool.id === "claude" ? claudeApiAuthClearingEnv() : profileEnv(profile, tool);
-  const command = commandFor(profile, tool, opts);
   await prepareClaudeProfileKeychainLocked(profile.dir, tool, profile.name);
   const restartRequired = opts.resume === true || applied || mode === "env";
   const message = applied
@@ -81,7 +88,7 @@ export async function switchProfile(
     exports: formatExportLines(env),
     command,
     commandLine: commandLine(env, command),
-    ...(opts.permissions ? { permissions: normalizePermissionPreset(opts.permissions) } : {}),
+    ...(resolvedPermissions.preset ? { permissions: resolvedPermissions.preset } : {}),
     restartRequired,
     message,
   };

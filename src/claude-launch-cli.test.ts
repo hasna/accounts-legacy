@@ -537,6 +537,16 @@ test("launch rejects duplicate or non-Claude direct dangerous-permissions inputs
     "--",
     "--dangerously-skip-permissions",
   ]);
+  const repeatedNativePassthrough = runCli([
+    "launch",
+    "acct",
+    "--tool",
+    "claude",
+    "--skip-configs",
+    "--",
+    "--dangerously-skip-permissions",
+    "--dangerously-skip-permissions",
+  ]);
 
   expect(duplicate.status).toBe(1);
   expect(duplicate.stderr).toContain("cannot be combined");
@@ -544,6 +554,8 @@ test("launch rejects duplicate or non-Claude direct dangerous-permissions inputs
   expect(nonClaude.stderr).toContain("only supported for Claude");
   expect(duplicatePassthrough.status).toBe(1);
   expect(duplicatePassthrough.stderr).toContain("cannot be combined");
+  expect(repeatedNativePassthrough.status).toBe(1);
+  expect(repeatedNativePassthrough.stderr).toContain("may be supplied only once");
   expect(claudeEntries()).toEqual([]);
 });
 

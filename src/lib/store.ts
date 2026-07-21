@@ -169,6 +169,8 @@ class LocalStore implements AccountsStore {
   private readonly loginOperations = new Map<string, {
     tool: string;
     name: string;
+    targetIncarnation: string;
+    activatedProfileLastUsedAt: string;
     previousCurrentName?: string;
     previousCurrentIncarnation?: string;
     previousProfileLastUsedAt?: string;
@@ -337,8 +339,32 @@ class LocalStore implements AccountsStore {
         );
       }
       const profile = matches[0]!;
-      if (expectedProfile && profileAuthIncarnation(profile) !== profileAuthIncarnation(expectedProfile)) {
+      const targetIncarnation = profileAuthIncarnation(profile);
+      if (expectedProfile && targetIncarnation !== profileAuthIncarnation(expectedProfile)) {
         throw new AccountsError("profile changed while login activation was in progress");
+      }
+      const completed = this.loginOperations.get(operationId);
+      if (completed) {
+        if (completed.tool !== profile.tool || completed.name !== profile.name) {
+          throw new AccountsError("login operation id is already bound to another profile");
+        }
+        if (completed.targetIncarnation !== targetIncarnation) {
+          throw new AccountsError("login operation id is already bound to another profile incarnation");
+        }
+        return {
+          profile: structuredClone({
+            ...profile,
+            lastUsedAt: completed.activatedProfileLastUsedAt,
+          }),
+          toolId: profile.tool,
+          currentRevision: operationId,
+          ...(completed.previousCurrentName
+            ? { previousCurrentName: completed.previousCurrentName }
+            : {}),
+          ...(completed.previousProfileLastUsedAt
+            ? { previousProfileLastUsedAt: completed.previousProfileLastUsedAt }
+            : {}),
+        };
       }
       const previousCurrentName = machine.current[profile.tool];
       const previousCurrentProfile = previousCurrentName
@@ -357,6 +383,8 @@ class LocalStore implements AccountsStore {
       this.loginOperations.set(operationId, {
         tool: profile.tool,
         name: profile.name,
+        targetIncarnation,
+        activatedProfileLastUsedAt: profile.lastUsedAt,
         ...(previousCurrentName ? { previousCurrentName } : {}),
         ...(previousCurrentProfile
           ? { previousCurrentIncarnation: profileAuthIncarnation(previousCurrentProfile) }

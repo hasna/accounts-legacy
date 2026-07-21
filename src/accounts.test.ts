@@ -26,6 +26,8 @@ import {
   mergeToolArgs,
   normalizePermissionPreset,
   permissionArgsFor,
+  resolvePermissionInputs,
+  validateRawPermissionInputs,
 } from "./lib/tools.js";
 import { formatExportLines, profileEnv } from "./lib/env.js";
 import { AccountsError } from "./types.js";
@@ -97,6 +99,39 @@ test("built-in tools expose tool-specific permission presets", () => {
   expect(permissionArgsFor(getTool("hermes"), "danger")).toEqual(["--yolo"]);
   expect(permissionArgsFor(getTool("kimi"), "auto")).toEqual(["--auto"]);
   expect(normalizePermissionPreset("bypassPermissions")).toBe("bypass");
+});
+
+test("permission source normalization rejects duplicates and preset/pass-through conflicts", () => {
+  const claude = getTool("claude");
+  expect(resolvePermissionInputs(claude, {
+    passthroughArgs: ["--dangerously-skip-permissions"],
+  })).toEqual({
+    preset: "dangerous",
+    args: ["--dangerously-skip-permissions"],
+  });
+  expect(() => resolvePermissionInputs(claude, {
+    permissions: "none",
+    passthroughArgs: ["--dangerously-skip-permissions"],
+  })).toThrow(/cannot be combined/);
+  expect(() => validateRawPermissionInputs([
+    "launch",
+    "acct",
+    "--",
+    "--dangerously-skip-permissions",
+    "--dangerously-skip-permissions",
+  ])).toThrow(/may be supplied only once/);
+  expect(() => resolvePermissionInputs(claude, {
+    permissions: "none",
+    passthroughArgs: ["--permissions", "dangerous"],
+  })).toThrow(/cannot be supplied both/);
+  expect(() => validateRawPermissionInputs([
+    "switch",
+    "acct",
+    "--permissions",
+    "none",
+    "--",
+    "--permissions=dangerous",
+  ])).toThrow(/may be supplied only once/);
 });
 
 test("mergeToolArgs prepends permission args without duplicating explicit flags", () => {

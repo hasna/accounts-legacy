@@ -182,6 +182,19 @@ export interface ToolArgOptions {
   profile?: Profile;
 }
 
+export const CLAUDE_DANGEROUS_PERMISSION_ARG = "--dangerously-skip-permissions";
+
+export interface PermissionInputs {
+  permissions?: string;
+  dangerouslySkipPermissions?: boolean;
+  passthroughArgs?: readonly string[];
+}
+
+export interface ResolvedPermissionInputs {
+  preset?: string;
+  args: string[];
+}
+
 const PERMISSION_ALIASES = new Map<string, string>([
   ["danger", "dangerous"],
   ["dangerously-skip-permissions", "dangerous"],
@@ -201,6 +214,90 @@ const PERMISSION_ALIASES = new Map<string, string>([
 export function normalizePermissionPreset(value: string): string {
   const normalized = value.trim().replace(/^--/, "").replaceAll("_", "-").toLowerCase();
   return PERMISSION_ALIASES.get(normalized) ?? normalized;
+}
+
+/**
+ * Validate permission sources before tool selection or any profile mutation.
+ * Native Claude pass-through remains supported, but it is one permission
+ * source: it cannot be repeated or combined with an Accounts preset/alias.
+ */
+export function validatePermissionInputs(inputs: PermissionInputs): void {
+  const passthroughArgs = inputs.passthroughArgs ?? [];
+  const nativeOccurrences = passthroughArgs.filter(
+    (arg) => arg === CLAUDE_DANGEROUS_PERMISSION_ARG,
+  ).length;
+  const passthroughPresetOccurrences = passthroughArgs.filter(
+    (arg) => arg === "--permissions" || arg.startsWith("--permissions="),
+  ).length;
+  if (nativeOccurrences > 1) {
+    throw new AccountsError("--permissions may be supplied only once");
+  }
+  if (passthroughPresetOccurrences > 1) {
+    throw new AccountsError("--permissions may be supplied only once");
+  }
+  if (inputs.dangerouslySkipPermissions && inputs.permissions) {
+    throw new AccountsError(`${CLAUDE_DANGEROUS_PERMISSION_ARG} cannot be combined with --permissions`);
+  }
+  if (inputs.dangerouslySkipPermissions && nativeOccurrences > 0) {
+    throw new AccountsError(
+      `${CLAUDE_DANGEROUS_PERMISSION_ARG} cannot be supplied both directly and after --`,
+    );
+  }
+  if (inputs.permissions && nativeOccurrences > 0) {
+    throw new AccountsError(
+      `--permissions cannot be combined with ${CLAUDE_DANGEROUS_PERMISSION_ARG} after --`,
+    );
+  }
+  if (inputs.permissions && passthroughPresetOccurrences > 0) {
+    throw new AccountsError("--permissions cannot be supplied both directly and after --");
+  }
+  if (inputs.dangerouslySkipPermissions && passthroughPresetOccurrences > 0) {
+    throw new AccountsError(`${CLAUDE_DANGEROUS_PERMISSION_ARG} cannot be combined with --permissions after --`);
+  }
+  if (nativeOccurrences > 0 && passthroughPresetOccurrences > 0) {
+    throw new AccountsError(
+      `${CLAUDE_DANGEROUS_PERMISSION_ARG} cannot be combined with --permissions after --`,
+    );
+  }
+}
+
+/** Reject duplicate Accounts/native permission switches directly from argv. */
+export function validateRawPermissionInputs(argv: readonly string[]): void {
+  let permissionsOccurrences = 0;
+  let compatibilityOccurrences = 0;
+  for (const arg of argv) {
+    if (arg === "--permissions" || arg.startsWith("--permissions=")) {
+      permissionsOccurrences += 1;
+    }
+    if (arg === CLAUDE_DANGEROUS_PERMISSION_ARG) compatibilityOccurrences += 1;
+  }
+  if (permissionsOccurrences > 1 || compatibilityOccurrences > 1) {
+    throw new AccountsError("--permissions may be supplied only once");
+  }
+}
+
+export function resolvePermissionInputs(
+  tool: ToolDef,
+  inputs: PermissionInputs,
+): ResolvedPermissionInputs {
+  validatePermissionInputs(inputs);
+  const hasNativePassthrough = (inputs.passthroughArgs ?? []).includes(
+    CLAUDE_DANGEROUS_PERMISSION_ARG,
+  );
+  if ((inputs.dangerouslySkipPermissions || hasNativePassthrough) && tool.id !== "claude") {
+    throw new AccountsError(
+      `${CLAUDE_DANGEROUS_PERMISSION_ARG} is only supported for Claude; ` +
+      "use --permissions <preset> for tool-specific modes",
+    );
+  }
+  const requested = inputs.dangerouslySkipPermissions || hasNativePassthrough
+    ? "dangerous"
+    : inputs.permissions;
+  const preset = requested ? normalizePermissionPreset(requested) : undefined;
+  return {
+    ...(preset ? { preset } : {}),
+    args: permissionArgsFor(tool, preset),
+  };
 }
 
 export function permissionArgsFor(tool: ToolDef, permissions?: string): string[] {

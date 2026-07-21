@@ -20,6 +20,7 @@ const OLD_ROW = {
 function transactionalClient(failOnAccountWrite: boolean) {
   let transactions = 0;
   let rolledBack = false;
+  let accountRow = OLD_ROW;
   let completedOperation: {
     operation_id: string;
     tool: string;
@@ -28,6 +29,7 @@ function transactionalClient(failOnAccountWrite: boolean) {
     updated_at: string | null;
     revision: string | null;
     previous_name: string | null;
+    target_incarnation_id: string | null;
     previous_target_last_used_at: string | null;
   } | null = null;
   const statements: string[] = [];
@@ -63,7 +65,7 @@ function transactionalClient(failOnAccountWrite: boolean) {
       if (sql.includes("SELECT updated_at") && sql.includes("FROM current_selections")) {
         return { updated_at: "2026-07-21T00:00:00.000Z" };
       }
-      return params?.[1] === "old" ? OLD_ROW : null;
+      return params?.[1] === "old" ? accountRow : null;
     },
     async one(sql, params) {
       statements.push(sql);
@@ -93,7 +95,10 @@ function transactionalClient(failOnAccountWrite: boolean) {
           updated_at: sql.includes("'cancelled'") ? null : String(params?.[3]),
           revision: sql.includes("'cancelled'") ? null : String(params?.[4]),
           previous_name: sql.includes("'cancelled'") ? null : String(params?.[5]),
-          previous_target_last_used_at: sql.includes("'cancelled'") ? null : (params?.[6] as string | null),
+          target_incarnation_id: sql.includes("target_incarnation_id")
+            ? String(params?.[8])
+            : null,
+          previous_target_last_used_at: sql.includes("'cancelled'") ? null : (params?.[7] as string | null),
         };
       }
     },
@@ -116,7 +121,13 @@ function transactionalClient(failOnAccountWrite: boolean) {
       }
     },
   } as unknown as PoolQueryClient;
-  return { client, evidence: () => ({ transactions, rolledBack, statements }) };
+  return {
+    client,
+    replaceAccount(row: typeof OLD_ROW) {
+      accountRow = row;
+    },
+    evidence: () => ({ transactions, rolledBack, statements }),
+  };
 }
 
 describe("AccountsRepo account/current atomicity", () => {
@@ -212,6 +223,26 @@ describe("AccountsRepo account/current atomicity", () => {
     );
     expect(rollbackAccountLock).toBeGreaterThanOrEqual(0);
     expect(rollbackCurrentLock).toBeGreaterThan(rollbackAccountLock);
+  });
+
+  test("completed login operation remains bound to its original target incarnation", async () => {
+    const fixture = transactionalClient(false);
+    const repo = new AccountsRepo(fixture.client);
+    const operationId = "22222222-2222-4222-8222-222222222222";
+    await repo.setCurrentForLogin("claude", "old", operationId, OLD_ROW.incarnation_id);
+    fixture.replaceAccount({
+      ...OLD_ROW,
+      incarnation_id: "22222222-2222-4222-8222-222222222222",
+    });
+
+    await expect(
+      repo.setCurrentForLogin(
+        "claude",
+        "old",
+        operationId,
+        "22222222-2222-4222-8222-222222222222",
+      ),
+    ).rejects.toThrow(/operation id is already bound to another profile incarnation/);
   });
 
   test("rollback before activation durably cancels the operation", async () => {

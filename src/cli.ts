@@ -14,7 +14,9 @@ import {
   isBuiltinTool,
   mergeToolArgs,
   normalizePermissionPreset,
-  permissionArgsFor,
+  resolvePermissionInputs,
+  validatePermissionInputs,
+  validateRawPermissionInputs,
 } from "./lib/tools.js";
 import {
   expandPath,
@@ -317,25 +319,15 @@ interface PermissionCliOptions {
   dangerouslySkipPermissions?: boolean;
 }
 
-const CLAUDE_DANGEROUS_PERMISSION_ARG = "--dangerously-skip-permissions";
-
 function validateCliPermissionSyntax(opts: PermissionCliOptions): void {
-  if (opts.dangerouslySkipPermissions && opts.permissions) {
-    throw new AccountsError(`${CLAUDE_DANGEROUS_PERMISSION_ARG} cannot be combined with --permissions`);
-  }
+  validatePermissionInputs({
+    permissions: opts.permissions,
+    dangerouslySkipPermissions: opts.dangerouslySkipPermissions,
+  });
 }
 
 function validateUniquePermissionsArg(argv: string[]): void {
-  let permissionsOccurrences = 0;
-  let compatibilityOccurrences = 0;
-  for (const arg of argv) {
-    if (arg === "--") break;
-    if (arg === "--permissions" || arg.startsWith("--permissions=")) permissionsOccurrences += 1;
-    if (arg === CLAUDE_DANGEROUS_PERMISSION_ARG) compatibilityOccurrences += 1;
-  }
-  if (permissionsOccurrences > 1 || compatibilityOccurrences > 1) {
-    throw new AccountsError("--permissions may be supplied only once");
-  }
+  validateRawPermissionInputs(argv);
 }
 
 interface ResolvedCliPermissions {
@@ -348,20 +340,11 @@ function resolveCliPermissions(
   opts: PermissionCliOptions,
   passthroughArgs: string[] = [],
 ): ResolvedCliPermissions {
-  validateCliPermissionSyntax(opts);
-  const hasNativePassthrough = tool.id === "claude" && passthroughArgs.includes(CLAUDE_DANGEROUS_PERMISSION_ARG);
-  if (opts.dangerouslySkipPermissions && hasNativePassthrough) {
-    throw new AccountsError(`${CLAUDE_DANGEROUS_PERMISSION_ARG} cannot be supplied both directly and after --`);
-  }
-  if (opts.permissions && hasNativePassthrough) {
-    throw new AccountsError(`--permissions cannot be combined with ${CLAUDE_DANGEROUS_PERMISSION_ARG} after --`);
-  }
-  if (opts.dangerouslySkipPermissions && tool.id !== "claude") {
-    throw new AccountsError(`${CLAUDE_DANGEROUS_PERMISSION_ARG} is only supported for Claude; use --permissions <preset> for tool-specific modes`);
-  }
-
-  const preset = opts.dangerouslySkipPermissions ? "dangerous" : opts.permissions;
-  return { preset, args: permissionArgsFor(tool, preset) };
+  return resolvePermissionInputs(tool, {
+    permissions: opts.permissions,
+    dangerouslySkipPermissions: opts.dangerouslySkipPermissions,
+    passthroughArgs,
+  });
 }
 
 interface ConfigsCliOptions {
@@ -869,6 +852,10 @@ addConfigsOptions(program
         const store = resolveStore();
         if (opts.supervisor) {
           const profile = await store.getProfile(name, opts.tool);
+          resolvePermissionInputs(getTool(profile.tool), {
+            permissions: opts.permissions,
+            passthroughArgs: args,
+          });
           const response = await sendSupervisorRequest(
             profile.tool,
             {
@@ -1031,8 +1018,13 @@ addConfigsOptions(program
     action(async (target: string, args: string[], opts: { profile?: string; tool?: string; resume?: boolean; permissions?: string } & ClaudeLaunchOptions & ConfigsCliOptions) => {
       const plan = await resolveSupervisorLaunch(target, { profile: opts.profile, tool: opts.tool });
       const launch = planClaudeLaunch(plan.tool, [...(opts.resume ? (plan.tool.resumeArgs ?? []) : []), ...args], opts);
+      const { preset: permissions } = resolveCliPermissions(
+        plan.tool,
+        { permissions: opts.permissions },
+        launch.args,
+      );
       const runArgs = mergeToolArgs(plan.tool, launch.args, {
-        permissions: opts.permissions,
+        permissions,
         profile: plan.profile,
       });
       if (launch.nonInteractive) {
@@ -1113,6 +1105,10 @@ addConfigsOptions(supervisor
         opts: { tool?: string; mode: SwitchMode; resume?: boolean; permissions?: string; json?: boolean } & ConfigsCliOptions,
       ) => {
       const profile = await resolveStore().getProfile(name, opts.tool);
+      resolvePermissionInputs(getTool(profile.tool), {
+        permissions: opts.permissions,
+        passthroughArgs: args,
+      });
       const response = await sendSupervisorRequest(
         profile.tool,
         {

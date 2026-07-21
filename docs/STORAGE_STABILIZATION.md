@@ -140,17 +140,17 @@ manifest are revalidated.
 | Client | Server | Result |
 | --- | --- | --- |
 | Old | Old | Existing account and selection operations are unchanged. |
-| Old | New | Compatible after migrations through 0008. Account creation with a previously local, unseen custom tool id succeeds without a tools-registration call. A durably removed id is rejected; a database trigger advances current-selection generations for legacy conflict updates. |
+| Old | New | Compatible after migrations through 0009. Account creation with a previously local, unseen custom tool id succeeds without a tools-registration call. A durably removed id is rejected; a database trigger advances current-selection generations for legacy conflict updates. |
 | New | Old | Existing non-login operations work. Minimal legacy built-in Tool responses are accepted. Login preflight, rename, custom-tool mutations, and generation-owned failed-login rollback require a server upgrade and fail with an actionable error. Transactional activation and rollback use new-only routes, so old replicas reject rather than partially execute them. |
-| New | New before migrations 0003 through 0008 | `/ready` is unavailable with a pending-migration reason. Do not send traffic. |
-| New | New after migrations 0003 through 0008 | Full AccountsStore routing, durable tool lifecycle state, row/advisory-locked account/tool mutations, incarnation-owned profile-field rollback, durable response-loss-safe operation-owned login rollback with rollback-first cancellation, rename/remove/current updates, and pointer reconciliation are available. |
+| New | New before migrations 0003 through 0009 | `/ready` is unavailable with a pending-migration reason. Do not send traffic. |
+| New | New after migrations 0003 through 0009 | Full AccountsStore routing, durable tool lifecycle state, row/advisory-locked account/tool mutations, incarnation-owned profile-field rollback, target-incarnation-bound response-loss-safe operation-owned login rollback with rollback-first cancellation, rename/remove/current updates, and pointer reconciliation are available. |
 
 ## Rollback And Forward Fix
 
 - Before client rollout, an application image may be rolled back only if it
   retains the new migration manifest/readiness code; an older image that treats
-  migration `0008` as unknown remains unavailable and must be forward-fixed.
-  Leave migrations `0003` through `0008` in place. Database triggers
+  migration `0009` as unknown remains unavailable and must be forward-fixed.
+  Leave migrations `0003` through `0009` in place. Database triggers
   make older account writers observe tombstones and turn older direct
   `custom_tools` deletes into durable removals. An explicit registration is
   the only operation that clears a tombstone.
@@ -158,7 +158,7 @@ manifest are revalidated.
   migration `0005` functions, their locked `search_path`, and the grants
   applied by the new owner-run migrator. Do not switch the server to the owner
   DSN as a rollback shortcut.
-- Never run a pre-`0003`/`0005`/`0006`/`0007`/`0008` `accounts-migrate` binary after newer
+- Never run a pre-`0003`/`0005`/`0006`/`0007`/`0008`/`0009` `accounts-migrate` binary after newer
   migrations are recorded. The checksum ledger rejects migrations unknown to
   the supplied manifest as a deterministic downgrade guard. An application
   rollback must retain the new migrator binary/job; otherwise forward-fix.
@@ -182,7 +182,8 @@ manifest are revalidated.
   `HASNA_ACCOUNTS_TEST_DATABASE_URL`. It uses an isolated schema to verify the
   `0003` upgrade, `0004` orphan archival and valid-row preservation, `0005`
   tool tombstones, `0006` database-enforced current-selection generations,
-  `0007` operation rollback state, `0008` account incarnations,
+  `0007` operation rollback state, `0008` account incarnations, `0009`
+  target-incarnation-bound operation replay,
   direct-SQL idempotency, unseen legacy ids, durable removal rejection,
   old-server current-update generation advancement, durable operation-token
   replay after an intervening selection, wire-stable activation timestamps,

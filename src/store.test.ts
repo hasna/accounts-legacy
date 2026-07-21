@@ -919,6 +919,20 @@ describe("LocalStore reads/writes the on-box registry", () => {
     expect((await store.currentProfile("claude"))?.name).toBe("prior");
   });
 
+  test("local login operation replay rejects a replacement target incarnation", async () => {
+    const store = resolveStore({ ACCOUNTS_HOME: home } as NodeJS.ProcessEnv);
+    const original = await store.addProfile({ name: "target", tool: "claude" });
+    const operationId = "local-target-incarnation-binding";
+    await store.useProfileForLogin!("target", "claude", operationId, original);
+    await store.removeProfile("target", { tool: "claude" });
+    const replacement = await store.addProfile({ name: "target", tool: "claude" });
+
+    await expect(
+      store.useProfileForLogin!("target", "claude", operationId, replacement),
+    ).rejects.toThrow(/operation id is already bound to another profile incarnation/);
+    expect(await store.currentProfile("claude")).toBeUndefined();
+  });
+
   test("operation rollback never restores a recreated local profile with colliding legacy fields", async () => {
     const store = resolveStore({ ACCOUNTS_HOME: home } as NodeJS.ProcessEnv);
     const prior = await store.addProfile({ name: "prior", tool: "claude" });

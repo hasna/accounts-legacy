@@ -10,7 +10,7 @@ import { prepareClaudeProfileKeychainLocked } from "./claude-launch.js";
 import { profileEnv } from "./env.js";
 import { resolveStore, type AccountsStore } from "./store.js";
 import { switchProfile, type SwitchMode, type SwitchResult } from "./switch.js";
-import { getTool } from "./tools.js";
+import { getTool, resolvePermissionInputs } from "./tools.js";
 import { configsSessionToolFor, runConfigsPrelaunch, type ConfigsPrelaunchOptions, type ConfigsPrelaunchResult } from "./configs-prelaunch.js";
 import { getConfigsPrelaunchSummary, type ConfigsPrelaunchSummary } from "./configs-prelaunch-status.js";
 
@@ -461,6 +461,10 @@ export async function runSupervisedTool(
     try {
       const store = resolveStore();
       const nextProfile = await store.getProfile(request.name, tool.id);
+      resolvePermissionInputs(tool, {
+        permissions: request.permissions,
+        passthroughArgs: request.args,
+      });
       const configOpts = configsOptionsFor(request);
       const preflightedConfigs = runConfigsPrelaunch(nextProfile, tool, configOpts);
       const result = await switchProfile(request.name, {

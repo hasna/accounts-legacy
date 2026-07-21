@@ -60,6 +60,83 @@ test("switch CLI accepts --permissions and returns tool-specific command args", 
   expect(parsed.command).toEqual(["codex", "--dangerously-bypass-approvals-and-sandbox", "resume", "--last"]);
 });
 
+test("switch rejects preset and native pass-through conflicts before changing the active profile", () => {
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  expect(runCli("add", "target", "--tool", "claude").status).toBe(0);
+  expect(runCli("use", "acct", "--tool", "claude").status).toBe(0);
+
+  const result = runCli(
+    "switch",
+    "target",
+    "--tool",
+    "claude",
+    "--mode",
+    "active",
+    "--permissions",
+    "none",
+    "--",
+    "--dangerously-skip-permissions",
+  );
+
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain("--permissions");
+  const current = runCli("current", "--tool", "claude");
+  expect(current.status).toBe(0);
+  expect(current.stdout).toContain("acct");
+  expect(current.stdout).not.toContain("target");
+});
+
+test("switch rejects preset and pass-through permission flags before changing the active profile", () => {
+  expect(runCli("add", "prior", "--tool", "claude").status).toBe(0);
+  expect(runCli("add", "target", "--tool", "claude").status).toBe(0);
+  expect(runCli("use", "prior", "--tool", "claude").status).toBe(0);
+
+  const result = runCli(
+    "switch",
+    "target",
+    "--tool",
+    "claude",
+    "--mode",
+    "active",
+    "--permissions",
+    "none",
+    "--",
+    "--permissions",
+    "dangerous",
+  );
+
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain("--permissions");
+  const current = runCli("current", "--tool", "claude");
+  expect(current.status).toBe(0);
+  expect(current.stdout).toContain("prior");
+  expect(current.stdout).not.toContain("target");
+});
+
+test("switch validates unsupported permissions before changing the active profile", () => {
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  expect(runCli("add", "target", "--tool", "claude").status).toBe(0);
+  expect(runCli("use", "acct", "--tool", "claude").status).toBe(0);
+
+  const result = runCli(
+    "switch",
+    "target",
+    "--tool",
+    "claude",
+    "--mode",
+    "active",
+    "--permissions",
+    "definitely-unsupported",
+  );
+
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain("does not support permissions");
+  const current = runCli("current", "--tool", "claude");
+  expect(current.status).toBe(0);
+  expect(current.stdout).toContain("acct");
+  expect(current.stdout).not.toContain("target");
+});
+
 test("profile metadata can be added, shown, and updated through the CLI", () => {
   const add = runCli(
     "add",
