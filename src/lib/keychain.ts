@@ -166,3 +166,25 @@ export function writeClaudeKeychain(cred: KeychainCredential): void {
     throw new AccountsError(`keychain write failed: ${keychainWriteFailureMessage(err)}`);
   }
 }
+
+/** Remove all Claude Code credential entries from the login keychain. */
+export function clearClaudeKeychain(): void {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      execFileSync(securityExecutable(), ["delete-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE], {
+        stdio: "ignore",
+      });
+    } catch (error) {
+      if (commandStatus(error) === 44) return;
+      if (captureClaudeKeychain() === undefined) return;
+      throw new AccountsError("keychain restore failed after Claude process");
+    }
+  }
+  throw new AccountsError("keychain restore found too many Claude credential entries");
+}
+
+/** Restore an exact captured credential, or restore the absence of one. */
+export function restoreClaudeKeychain(previous: KeychainCredential | undefined): void {
+  if (previous) writeClaudeKeychain(previous);
+  else clearClaudeKeychain();
+}

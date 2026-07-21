@@ -1,4 +1,4 @@
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -6,11 +6,10 @@ import { delimiter, extname, isAbsolute, join } from "node:path";
 import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
 import { claudeKeychainCredentialFromProfile } from "./claude-auth.js";
-import { CLAUDE_KEYCHAIN_SERVICE } from "./claude-layout.js";
 import {
   captureClaudeKeychain,
   keychainSupported,
-  securityExecutable,
+  restoreClaudeKeychain,
   writeClaudeKeychain,
 } from "./keychain.js";
 
@@ -270,25 +269,7 @@ async function acquireKeychainLock(): Promise<() => void> {
   }
 }
 
-function clearClaudeKeychain(): void {
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    try {
-      execFileSync(securityExecutable(), ["delete-generic-password", "-s", CLAUDE_KEYCHAIN_SERVICE], {
-        stdio: "ignore",
-      });
-    } catch (error) {
-      const status = error && typeof error === "object" && "status" in error
-        ? Number((error as { status?: unknown }).status)
-        : undefined;
-      if (status === 44) return;
-      if (captureClaudeKeychain() === undefined) return;
-      throw new AccountsError("keychain restore failed after Claude launch");
-    }
-  }
-  throw new AccountsError("keychain restore found too many Claude credential entries");
-}
-
-function signalExitCode(signal: NodeJS.Signals | null): number {
+export function signalExitCode(signal: NodeJS.Signals | null): number {
   if (signal === "SIGINT") return 130;
   if (signal === "SIGTERM") return 143;
   return signal ? 1 : 0;
@@ -429,8 +410,7 @@ export async function runClaudeLaunch(
   } finally {
     try {
       if (keychainTouched) {
-        if (prior) writeClaudeKeychain(prior);
-        else clearClaudeKeychain();
+        restoreClaudeKeychain(prior);
       }
     } finally {
       process.removeListener("SIGINT", rememberSigint);

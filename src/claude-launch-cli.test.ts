@@ -581,17 +581,22 @@ test("run headless and background bypass the Accounts supervisor", () => {
 test("conflicts fail before prelaunch, keychain access, profile selection, or Claude", () => {
   addProfile("acct", "profile-credential-value");
   setKeychain("prior", "prior-credential-value");
+  const env = {
+    ACCOUNTS_TEST_KEYCHAIN: "1",
+    ACCOUNTS_TEST_SECURITY_BIN: securityBin,
+  };
   const result = runCli(
     ["launch", "acct", "--tool", "claude", "--headless", "--", "--bg", "Prompt"],
-    {
-      env: {
-        ACCOUNTS_TEST_KEYCHAIN: "1",
-        ACCOUNTS_TEST_SECURITY_BIN: securityBin,
-      },
-    },
+    { env },
+  );
+  const repeatedPermissions = runCli(
+    ["launch", "acct", "--tool", "claude", "--permissions", "none", "--permissions=dangerous"],
+    { env },
   );
   expect(result.status).toBe(1);
   expect(result.stderr).toContain("cannot be combined");
+  expect(repeatedPermissions.status).toBe(1);
+  expect(repeatedPermissions.stderr).toContain("--permissions may be supplied only once");
   expect(claudeEntries()).toEqual([]);
   expect(entries(securityLog)).toEqual([]);
   expect(readKeychain()).toEqual({ account: "prior", secret: "prior-credential-value" });

@@ -36,8 +36,9 @@ import { importProfile } from "./lib/import-profile.js";
 import { pickProfile, resolvePickMode } from "./lib/pick.js";
 import { installHook, uninstallHook, shellSnippet, hookPath } from "./lib/hook.js";
 import { prepareClaudeProfileKeychain, profileHasAuth } from "./lib/claude-auth.js";
+import { captureClaudeKeychain, keychainSupported, restoreClaudeKeychain } from "./lib/keychain.js";
 import { formatEnvAssignments, formatExportLines, profileEnv } from "./lib/env.js";
-import { finalizeLogin, prepareLogin } from "./lib/login.js";
+import { finalizeLogin, prepareLogin, rollbackLoginPreparation } from "./lib/login.js";
 import { switchProfile, type SwitchMode } from "./lib/switch.js";
 import { configsSessionToolFor, runConfigsPrelaunch, type ConfigsPrelaunchMode, type ConfigsPrelaunchOptions } from "./lib/configs-prelaunch.js";
 import { getConfigsPrelaunchSummary, type ConfigsPrelaunchSummary } from "./lib/configs-prelaunch-status.js";
@@ -53,6 +54,7 @@ import {
   planClaudeLaunch,
   redactArgv,
   runClaudeLaunch,
+  signalExitCode,
   type ClaudeLaunchOptions,
 } from "./lib/claude-launch.js";
 import {
@@ -308,6 +310,17 @@ const CLAUDE_DANGEROUS_PERMISSION_ARG = "--dangerously-skip-permissions";
 function validateCliPermissionSyntax(opts: PermissionCliOptions): void {
   if (opts.dangerouslySkipPermissions && opts.permissions) {
     throw new AccountsError(`${CLAUDE_DANGEROUS_PERMISSION_ARG} cannot be combined with --permissions`);
+  }
+}
+
+function validateUniquePermissionsArg(argv: string[]): void {
+  let occurrences = 0;
+  for (const arg of argv) {
+    if (arg === "--") break;
+    if (arg === "--permissions" || arg.startsWith("--permissions=")) occurrences += 1;
+  }
+  if (occurrences > 1) {
+    throw new AccountsError("--permissions may be supplied only once");
   }
 }
 
@@ -644,7 +657,6 @@ program
         ...baseLoginArgs,
       ];
       const env = profileEnv(profile, tool);
-      await store.useProfile(name, tool.id);
       console.log(chalk.green(`→ launching ${tool.bin} for profile ${chalk.bold(name)}`));
       console.log(chalk.dim(`  config dir: ${profile.dir}`));
       console.log(chalk.dim(`  env: ${formatEnvAssignments(env)}`));
@@ -652,13 +664,39 @@ program
       if (tool.id === "claude") {
         console.log(chalk.dim("  After Claude exits, accounts will make this the live/default Claude account."));
       }
-      prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
-      const res = spawnSync(tool.bin, loginArgs, {
-        stdio: "inherit",
-        env: { ...process.env, ...env },
-      });
-      if (res.error) die(`failed to launch ${tool.bin}: ${res.error.message}`);
-      if ((res.status ?? 0) !== 0) process.exit(res.status ?? 1);
+      let priorKeychain: ReturnType<typeof captureClaudeKeychain>;
+      let keychainCaptured = false;
+      let rolledBack = false;
+      const rollback = async () => {
+        if (rolledBack) return;
+        rolledBack = true;
+        try {
+          await rollbackLoginPreparation(prepared, store);
+        } finally {
+          if (keychainCaptured) restoreClaudeKeychain(priorKeychain);
+        }
+      };
+      try {
+        if (tool.id === "claude" && keychainSupported()) {
+          priorKeychain = captureClaudeKeychain();
+          keychainCaptured = true;
+        }
+        prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
+        const res = spawnSync(tool.bin, loginArgs, {
+          stdio: "inherit",
+          env: { ...process.env, ...env },
+        });
+        if (res.error) throw new AccountsError(`failed to launch ${tool.bin}: ${res.error.message}`);
+        const exitCode = res.status ?? signalExitCode(res.signal);
+        if (exitCode !== 0) {
+          await rollback();
+          process.exitCode = exitCode;
+          return;
+        }
+      } catch (error) {
+        await rollback();
+        throw error;
+      }
       const finalized = await finalizeLogin(name, tool.id, store);
       if (finalized.applied) {
         console.log(chalk.green(`✓ ${chalk.bold(name)} is now the live/default ${tool.label} account`));
@@ -1500,6 +1538,12 @@ contracts
 
 registerEventsCommands(program, { source: "accounts", createClient: () => createAccountsEventsClient() });
 
+try {
+  validateUniquePermissionsArg(process.argv.slice(2));
+} catch (error) {
+  if (error instanceof AccountsError) die(error.message);
+  throw error;
+}
 program.parseAsync(process.argv);
 
 function getVersion(): string {

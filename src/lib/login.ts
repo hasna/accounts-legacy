@@ -1,12 +1,12 @@
-import { accessSync, constants, existsSync } from "node:fs";
+import { accessSync, constants, existsSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, isAbsolute, join } from "node:path";
+import { delimiter, isAbsolute, join, resolve } from "node:path";
 import { createInterface, type Interface } from "node:readline";
 import type { Profile } from "../types.js";
 import { AccountsError } from "../types.js";
 import { applyProfile } from "./apply.js";
 import { ensureProfileAuthSnapshot } from "./claude-auth.js";
-import { getProfileToolLock, lockProfileTool } from "./profiles.js";
+import { getProfileToolLock, lockProfileTool, restoreProfileToolLock } from "./profiles.js";
 import { resolveStore, type AccountsStore } from "./store.js";
 import { getTool, mergeToolArgs } from "./tools.js";
 import type { ToolDef } from "../types.js";
@@ -56,6 +56,9 @@ export interface LoginPreparationReady {
   profile: Profile;
   tool: ToolDef;
   args: string[];
+  created: boolean;
+  createdProfileDir: boolean;
+  previousToolLock?: string;
 }
 
 export interface LoginPreparationStopped {
@@ -63,6 +66,9 @@ export interface LoginPreparationStopped {
   profile: Profile;
   tool: ToolDef;
   message: string;
+  created: boolean;
+  createdProfileDir: boolean;
+  previousToolLock?: string;
 }
 
 export type LoginPreparation = LoginPreparationReady | LoginPreparationStopped;
@@ -299,14 +305,29 @@ async function promptForUnavailableTool(
   }
 }
 
-async function existingOrCreateProfile(name: string, tool: ToolDef, store: AccountsStore): Promise<Profile> {
+interface PreparedProfile {
+  profile: Profile;
+  created: boolean;
+  createdProfileDir: boolean;
+  previousToolLock?: string;
+}
+
+async function existingOrCreateProfile(name: string, tool: ToolDef, store: AccountsStore): Promise<PreparedProfile> {
   const existing = await store.findProfile(name, tool.id);
+  const previousToolLock = store.transport === "local" ? getProfileToolLock(name) : undefined;
+  const managedDir = managedProfileDir(name, tool.id);
+  const createdProfileDir = !existing && !existsSync(managedDir);
   const profile = existing ?? (await store.addProfile({ name, tool: tool.id, description: "created for login" }));
   // The tool lock is a machine-local disambiguation for bare commands; only the
   // LocalStore keeps it. In api mode the shared registry (+ explicit --tool)
   // resolves the profile, so there is no local lock to write.
   if (store.transport === "local") lockProfileTool(profile.name, profile.tool);
-  return profile;
+  return {
+    profile,
+    created: !existing,
+    createdProfileDir,
+    ...(previousToolLock ? { previousToolLock } : {}),
+  };
 }
 
 async function selectLoginTool(
@@ -347,12 +368,12 @@ export async function prepareLogin(name: string, opts: PrepareLoginOptions = {})
       const availability = detectToolAvailability(tool, opts.env);
       if (availability.available) {
         await opts.validateTool?.(tool);
-        const profile = await existingOrCreateProfile(name, tool, store);
+        const prepared = await existingOrCreateProfile(name, tool, store);
         return {
           status: "ready",
-          profile,
+          ...prepared,
           tool,
-          args: mergeToolArgs(tool, tool.loginArgs ?? [], { profile }),
+          args: mergeToolArgs(tool, tool.loginArgs ?? [], { profile: prepared.profile }),
         };
       }
 
@@ -363,10 +384,10 @@ export async function prepareLogin(name: string, opts: PrepareLoginOptions = {})
       }
       if (action === "keep") {
         await opts.validateTool?.(tool);
-        const profile = await existingOrCreateProfile(name, tool, store);
+        const prepared = await existingOrCreateProfile(name, tool, store);
         return {
           status: "stopped",
-          profile,
+          ...prepared,
           tool,
           message: await unavailableToolMessage(name, tool, availability, store),
         };
@@ -375,6 +396,33 @@ export async function prepareLogin(name: string, opts: PrepareLoginOptions = {})
     }
   } finally {
     closePrompt(session);
+  }
+}
+
+/** Roll back only state created or changed while preparing a failed login. */
+export async function rollbackLoginPreparation(
+  preparation: LoginPreparationReady,
+  store: AccountsStore = resolveStore(),
+): Promise<void> {
+  try {
+    if (preparation.created) {
+      await store.removeProfile(preparation.profile.name, {
+        tool: preparation.tool.id,
+        purge: preparation.createdProfileDir,
+      });
+      if (
+        store.transport === "api" &&
+        preparation.createdProfileDir &&
+        resolve(preparation.profile.dir) === resolve(managedProfileDir(preparation.profile.name, preparation.tool.id)) &&
+        existsSync(preparation.profile.dir)
+      ) {
+        rmSync(preparation.profile.dir, { recursive: true, force: true });
+      }
+    }
+  } finally {
+    if (store.transport === "local") {
+      restoreProfileToolLock(preparation.profile.name, preparation.previousToolLock);
+    }
   }
 }
 

@@ -144,6 +144,23 @@ export function lockProfileTool(name: string, toolId: string): void {
   saveStore(store);
 }
 
+/** Restore a profile-name tool lock to a previously captured value. */
+export function restoreProfileToolLock(name: string, toolId?: string): void {
+  const nameCheck = profileNameSchema.safeParse(name);
+  if (!nameCheck.success) throw new AccountsError(nameCheck.error.issues[0]?.message ?? "invalid profile name");
+  const store = loadStore();
+  if (toolId) {
+    getTool(toolId);
+    if (!store.profiles.some((profile) => profile.name === name && profile.tool === toolId)) {
+      throw new AccountsError(`no profile named "${name}" for tool "${toolId}"`);
+    }
+    store.toolLocks[name] = toolId;
+  } else {
+    delete store.toolLocks[name];
+  }
+  saveStore(store);
+}
+
 export interface AddOptions {
   name: string;
   tool?: string;

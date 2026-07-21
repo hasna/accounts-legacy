@@ -22,6 +22,12 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
   storage instead of inheriting a station-level cloud/API mode.
 - Login preparation awaits synchronous or asynchronous selected-tool validation
   before profile lookup, creation, tool locking, or API persistence.
+- Repeated `--permissions` options now fail during raw CLI validation before
+  profile, tool-lock, keychain, or process mutation, including same-value and
+  conflicting repetitions.
+- Failed and signalled login processes now return nonzero without finalizing the
+  profile, restore the prior active selection, tool lock, and Claude keychain,
+  and remove only profile state created by the failed attempt.
 - The default Bun test preload neutralizes inherited station Accounts cloud/API
   configuration while explicit cloud fixtures remain supported.
 - Compatible transitive overrides keep the MCP SDK graph on patched

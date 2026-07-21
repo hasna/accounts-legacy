@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -58,6 +58,20 @@ function writeFakeTool(binName: string, envVar: string, toolName = binName, exit
       `home="\${${envVar}:-}"`,
       `printf '{"tool":"${toolName}","args":"%s","home":"%s"}\\n' "$*" "$home" >> "$FAKE_LOGIN_LOG"`,
       `exit ${exitCode}`,
+    ].join("\n"),
+  );
+  chmodSync(fakeBin, 0o755);
+}
+
+function writeSignalledFakeTool(binName: string, envVar: string, toolName = binName) {
+  const fakeBin = join(binDir, binName);
+  writeFileSync(
+    fakeBin,
+    [
+      "#!/bin/sh",
+      `home="\${${envVar}:-}"`,
+      `printf '{"tool":"${toolName}","args":"%s","home":"%s"}\\n' "$*" "$home" >> "$FAKE_LOGIN_LOG"`,
+      "kill -TERM $$",
     ].join("\n"),
   );
   chmodSync(fakeBin, 0o755);
@@ -121,6 +135,51 @@ function writeFakeSecurity() {
   return fakeSecurity;
 }
 
+function writeStatefulFakeSecurity() {
+  const script = join(binDir, "stateful-security.ts");
+  const fakeSecurity = join(binDir, "stateful-security");
+  writeFileSync(
+    script,
+    `
+import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+const args = process.argv.slice(2);
+const command = args[0];
+const statePath = process.env.FAKE_KEYCHAIN_STATE;
+const logPath = process.env.FAKE_SECURITY_LOG;
+const state = existsSync(statePath) ? JSON.parse(readFileSync(statePath, "utf8")) : undefined;
+const valueAfter = (flag) => {
+  const index = args.indexOf(flag);
+  return index < 0 ? undefined : args[index + 1];
+};
+if (command === "find-generic-password") {
+  if (!state) process.exit(44);
+  appendFileSync(logPath, JSON.stringify({ operation: "find", account: state.account }) + "\\n");
+  if (args.includes("-w")) process.stdout.write(state.secret + "\\n");
+  else process.stdout.write('"acct"<blob>="' + state.account + '"\\n');
+  process.exit(0);
+}
+if (command === "delete-generic-password") {
+  appendFileSync(logPath, JSON.stringify({ operation: "delete", account: valueAfter("-a") }) + "\\n");
+  if (!state) process.exit(44);
+  rmSync(statePath, { force: true });
+  process.exit(0);
+}
+if (command === "add-generic-password") {
+  const account = valueAfter("-a");
+  const secret = valueAfter("-w");
+  if (!account || !secret) process.exit(64);
+  appendFileSync(logPath, JSON.stringify({ operation: "add", account }) + "\\n");
+  writeFileSync(statePath, JSON.stringify({ account, secret }), { mode: 0o600 });
+  process.exit(0);
+}
+process.exit(64);
+`,
+  );
+  writeFileSync(fakeSecurity, `#!/bin/sh\nexec "${process.execPath}" run "${script}" "$@"\n`);
+  chmodSync(fakeSecurity, 0o755);
+  return fakeSecurity;
+}
+
 function writeClaudeAuth(profileDir: string, email: string) {
   writeFileSync(join(profileDir, ".claude.json"), JSON.stringify({ oauthAccount: { emailAddress: email } }));
   writeFileSync(
@@ -165,8 +224,35 @@ function readLogEntries() {
 
 function readStore() {
   return JSON.parse(readFileSync(join(home, "accounts.json"), "utf8")) as {
+    current?: Record<string, string>;
+    applied?: Record<string, string>;
     toolLocks?: Record<string, string>;
-    profiles?: Array<{ name: string; tool: string; dir: string }>;
+    profiles?: Array<{ name: string; tool: string; dir: string; email?: string }>;
+  };
+}
+
+function setupClaudeLogin(exit: "success" | "nonzero" | "signal") {
+  if (exit === "signal") writeSignalledFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
+  else writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude", exit === "nonzero" ? 23 : 0);
+  const fakeSecurity = writeStatefulFakeSecurity();
+  const securityLog = join(home, "stateful-security.log");
+  const keychainState = join(home, "stateful-keychain.json");
+  expect(runCli("add", "prior", "--tool", "claude").status).toBe(0);
+  expect(runCli("add", "acct", "--tool", "claude").status).toBe(0);
+  expect(runCli("use", "prior", "--tool", "claude").status).toBe(0);
+  const profile = readStore().profiles?.find((entry) => entry.name === "acct" && entry.tool === "claude");
+  expect(profile).toBeTruthy();
+  writeClaudeAuth(profile!.dir, "acct@example.com");
+  writeFileSync(keychainState, JSON.stringify({ account: "prior", secret: "prior-secret" }), { mode: 0o600 });
+  return {
+    env: {
+      ACCOUNTS_TEST_KEYCHAIN: "1",
+      ACCOUNTS_TEST_SECURITY_BIN: fakeSecurity,
+      FAKE_SECURITY_LOG: securityLog,
+      FAKE_KEYCHAIN_STATE: keychainState,
+    },
+    keychainState,
+    securityLog,
   };
 }
 
@@ -217,6 +303,132 @@ test("login rejects unsupported and duplicate permission inputs before launching
   expect(readLogEntries()).toEqual([]);
 });
 
+for (const duplicate of [
+  {
+    label: "same-value repeated --permissions",
+    args: ["--permissions", "dangerous", "--permissions=dangerous"],
+  },
+  {
+    label: "conflicting repeated --permissions",
+    args: ["--permissions", "none", "--permissions", "dangerous"],
+  },
+]) {
+  test(`login rejects ${duplicate.label} before profile, keychain, or spawn mutation`, () => {
+    const fixture = setupClaudeLogin("nonzero");
+    const storeBefore = readFileSync(join(home, "accounts.json"), "utf8");
+    const keychainBefore = readFileSync(fixture.keychainState, "utf8");
+
+    const result = runCliWith(["login", "acct", "--tool", "claude", ...duplicate.args], {
+      env: fixture.env,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("--permissions may be supplied only once");
+    expect(readFileSync(join(home, "accounts.json"), "utf8")).toBe(storeBefore);
+    expect(readFileSync(fixture.keychainState, "utf8")).toBe(keychainBefore);
+    expect(existsSync(fixture.securityLog)).toBe(false);
+    expect(readLogEntries()).toEqual([]);
+  });
+}
+
+test("nonzero Claude login restores the prior active profile and keychain without finalizing", () => {
+  const fixture = setupClaudeLogin("nonzero");
+  const storeBefore = readFileSync(join(home, "accounts.json"), "utf8");
+
+  const result = runCliWith(["login", "acct", "--tool", "claude", "--permissions", "dangerous"], {
+    env: fixture.env,
+  });
+
+  expect(result.status).toBe(23);
+  expect(readFileSync(join(home, "accounts.json"), "utf8")).toBe(storeBefore);
+  expect(readStore().current?.claude).toBe("prior");
+  expect(readStore().applied?.claude).toBeUndefined();
+  expect(readStore().toolLocks?.acct).toBeUndefined();
+  expect(readStore().profiles?.find((profile) => profile.name === "acct")?.email).toBeUndefined();
+  expect(JSON.parse(readFileSync(fixture.keychainState, "utf8"))).toEqual({
+    account: "prior",
+    secret: "prior-secret",
+  });
+  expect(readLogEntries()).toHaveLength(1);
+});
+
+test("signalled Claude login returns nonzero and restores active profile and keychain without finalizing", () => {
+  const fixture = setupClaudeLogin("signal");
+  const storeBefore = readFileSync(join(home, "accounts.json"), "utf8");
+
+  const result = runCliWith(["login", "acct", "--tool", "claude"], { env: fixture.env });
+
+  expect(result.status).toBe(143);
+  expect(readFileSync(join(home, "accounts.json"), "utf8")).toBe(storeBefore);
+  expect(readStore().current?.claude).toBe("prior");
+  expect(readStore().applied?.claude).toBeUndefined();
+  expect(readStore().toolLocks?.acct).toBeUndefined();
+  expect(readStore().profiles?.find((profile) => profile.name === "acct")?.email).toBeUndefined();
+  expect(JSON.parse(readFileSync(fixture.keychainState, "utf8"))).toEqual({
+    account: "prior",
+    secret: "prior-secret",
+  });
+  expect(readLogEntries()).toHaveLength(1);
+});
+
+test("failed Claude login restores an initially empty keychain", () => {
+  const fixture = setupClaudeLogin("nonzero");
+  rmSync(fixture.keychainState, { force: true });
+
+  const result = runCliWith(["login", "acct", "--tool", "claude"], { env: fixture.env });
+
+  expect(result.status).toBe(23);
+  expect(existsSync(fixture.keychainState)).toBe(false);
+  expect(readStore().current?.claude).toBe("prior");
+});
+
+test("failed login restores a pre-existing tool lock for the same profile name", () => {
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude", 23);
+  expect(runCli("add", "shared", "--tool", "codex").status).toBe(0);
+  expect(runCli("add", "shared", "--tool", "claude").status).toBe(0);
+  expect(runCli("use", "shared", "--tool", "codex").status).toBe(0);
+  const storeBefore = readFileSync(join(home, "accounts.json"), "utf8");
+
+  const result = runCli("login", "shared", "--tool", "claude");
+
+  expect(result.status).toBe(23);
+  expect(readFileSync(join(home, "accounts.json"), "utf8")).toBe(storeBefore);
+  expect(readStore().toolLocks?.shared).toBe("codex");
+  expect(readStore().current?.codex).toBe("shared");
+  expect(readStore().current?.claude).toBeUndefined();
+});
+
+test("failed new login removes its profile but preserves a pre-existing managed directory", () => {
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude", 23);
+  const profileDir = join(home, "profiles", "claude", "preexisting-dir");
+  const sentinel = join(profileDir, "keep.txt");
+  mkdirSync(profileDir, { recursive: true });
+  writeFileSync(sentinel, "keep");
+
+  const result = runCli("login", "preexisting-dir", "--tool", "claude");
+
+  expect(result.status).toBe(23);
+  expect(readStore().profiles?.some((profile) => profile.name === "preexisting-dir" && profile.tool === "claude")).toBe(false);
+  expect(readStore().toolLocks?.["preexisting-dir"]).toBeUndefined();
+  expect(readFileSync(sentinel, "utf8")).toBe("keep");
+});
+
+test("successful Claude login still finalizes, applies, and keeps the profile keychain", () => {
+  const fixture = setupClaudeLogin("success");
+
+  const result = runCliWith(["login", "acct", "--tool", "claude", "--permissions", "dangerous"], {
+    env: fixture.env,
+  });
+
+  expect(result.status).toBe(0);
+  expect(result.stdout).toContain("acct is now the live/default Claude Code account");
+  expect(readStore().current?.claude).toBe("acct");
+  expect(readStore().applied?.claude).toBe("acct");
+  expect(readStore().profiles?.find((profile) => profile.name === "acct")?.email).toBe("acct@example.com");
+  expect(JSON.parse(readFileSync(fixture.keychainState, "utf8")).account).toBe("acct");
+  expect(readLogEntries().map((entry) => entry.args)).toEqual(["--dangerously-skip-permissions"]);
+});
+
 test("duplicate permissions for a nonexistent login do not create profile state", () => {
   writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude");
 
@@ -262,9 +474,7 @@ test("valid permissions survive interactive tool selection for a new login", () 
 
   expect(result.status).toBe(23);
   expect(readLogEntries().map((entry) => entry.args)).toEqual(["--dangerously-skip-permissions"]);
-  const store = readStore();
-  expect(store.profiles?.some((profile) => profile.name === "new-valid" && profile.tool === "claude")).toBe(true);
-  expect(store.toolLocks?.["new-valid"]).toBe("claude");
+  expectNoProfileState("new-valid", "claude");
 });
 
 test("launch syncs Claude profile credentials into keychain before spawning", () => {

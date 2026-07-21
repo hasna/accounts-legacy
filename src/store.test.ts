@@ -6,7 +6,7 @@ import { PassThrough } from "node:stream";
 import { resolveStore, type AccountsStore } from "./lib/store.js";
 import { resolveSupervisorLaunch } from "./lib/supervisor.js";
 import { clearCustomToolsCache, getTool } from "./lib/tools.js";
-import { loginToolChoices, prepareLogin } from "./lib/login.js";
+import { loginToolChoices, prepareLogin, rollbackLoginPreparation } from "./lib/login.js";
 import { importProfile } from "./lib/import-profile.js";
 import { loadMachineStore, saveStore } from "./storage.js";
 
@@ -273,6 +273,45 @@ describe("ApiStore routes registry ops to /v1", () => {
       expect(prepared.status).toBe("ready");
       expect(prepared.tool.id).toBe("acme");
       expect(calls[0]!.url).toBe(`${BASE}/v1/tools`);
+    });
+
+    test("failed cloud login rollback removes its registry profile and newly created managed directory", async () => {
+      const executableTool = { ...acme, bin: process.execPath };
+      const profile = {
+        tool: "acme",
+        name: "failed",
+        dir: join(home, "profiles", "acme", "failed"),
+        createdAt: "2020-01-01T00:00:00Z",
+      };
+      let created = false;
+      const { calls, fetchImpl } = mockFetch((call) => {
+        if (call.url.endsWith("/tools")) {
+          return { status: 200, body: { tools: [{ ...executableTool, builtin: false }] } };
+        }
+        if (call.method === "GET" && call.url.endsWith("/accounts/acme/failed")) {
+          return created ? { status: 200, body: profile } : { status: 404, body: { error: "not found" } };
+        }
+        if (call.method === "POST" && call.url.endsWith("/accounts")) {
+          created = true;
+          return { status: 201, body: profile };
+        }
+        if (call.method === "DELETE" && call.url.endsWith("/accounts/acme/failed")) {
+          created = false;
+          return { status: 204, body: {} };
+        }
+        return { status: 500, body: { error: "unexpected request" } };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      const prepared = await prepareLogin("failed", { toolId: "acme", env: process.env, store });
+      if (prepared.status !== "ready") throw new Error("expected ready login preparation");
+
+      expect(prepared.created).toBe(true);
+      expect(existsSync(profile.dir)).toBe(true);
+      await rollbackLoginPreparation(prepared, store);
+
+      expect(created).toBe(false);
+      expect(existsSync(profile.dir)).toBe(false);
+      expect(calls.some((call) => call.method === "DELETE" && call.url.endsWith("/accounts/acme/failed"))).toBe(true);
     });
 
     test("login validation rejects a cloud custom tool before profile creation", async () => {
