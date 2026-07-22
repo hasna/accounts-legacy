@@ -12,11 +12,13 @@ export interface VersionResponse { "version": string }
 
 export interface ErrorResponse { "error": string; "reason"?: string }
 
-export interface Account { "tool": string; "name": string; "email"?: string; "displayName"?: string; "identity"?: string; "cardLast4"?: string; "metadata": Record<string, unknown>; "dir"?: string; "description"?: string; "createdAt": string; "incarnationId": string; "lastUsedAt"?: string }
+export interface Account { "tool": string; "name": string; "email"?: string; "displayName"?: string; "identity"?: string; "cardLast4"?: string; "metadata": Record<string, unknown>; "dir"?: string; "description"?: string; "createdAt": string; "incarnationId"?: string; "lastUsedAt"?: string }
 
 export interface AccountList { "accounts": Array<Account> }
 
 export interface CreateAccountInput { "name": string; "tool": string; "email"?: string; "displayName"?: string; "identity"?: string; "cardLast4"?: string; "metadata"?: Record<string, unknown>; "dir"?: string; "description"?: string }
+
+export interface CreateLoginAccountInput { "name": string; "tool": string; "email"?: string; "displayName"?: string; "identity"?: string; "cardLast4"?: string; "metadata"?: Record<string, unknown>; "dir"?: string; "description"?: string; "expectedIncarnationId": string }
 
 export interface UpdateAccountInput { "email"?: string | null; "displayName"?: string; "identity"?: string; "cardLast4"?: string; "metadata"?: Record<string, unknown>; "dir"?: string; "description"?: string; "lastUsedAt"?: string | null }
 
@@ -24,11 +26,15 @@ export interface RestoreFieldInput { "expected": string | null; "restore": strin
 
 export interface RestoreAccountInput { "expectedIncarnationId": string; "email"?: RestoreFieldInput; "lastUsedAt"?: RestoreFieldInput }
 
-export interface LoginUpdateAccountInput { "expectedIncarnationId": string; "expectedEmail": string; "email": string }
+export interface LoginUpdateAccountInput { "expectedIncarnationId": string; "expectedEmail": string | null; "email": string }
+
+export interface RemoveCreatedAccountInput { "cleanupOperationId": string; "expectedIncarnationId": string; "expectedCreatedAt": string; "expectedEmail": string | null; "expectedDisplayName": string | null; "expectedIdentity": string | null; "expectedCardLast4": string | null; "expectedMetadata": Record<string, unknown>; "expectedDir": string | null; "expectedDescription": string | null; "expectedLastUsedAt": string | null }
+
+export interface RemoveCreatedAccountResult { "removed": boolean }
 
 export interface CurrentSelection { "tool": string; "name": string; "updatedAt": string; "revision"?: string; "operationId"?: string; "previousName"?: string; "previousTargetLastUsedAt"?: string }
 
-export interface CurrentSelectionList { "current": Array<CurrentSelection>; "transactionalLoginRollback"?: true }
+export interface CurrentSelectionList { "current": Array<CurrentSelection>; "transactionalLoginRollback"?: true; "transactionalLoginProfileCleanup"?: true }
 
 export interface SetCurrentInput { "name": string }
 
@@ -139,6 +145,15 @@ export class AccountsClient {
       });
     }
 
+    /** Idempotently create an account for transactional login */
+    async createLoginAccount(body: CreateLoginAccountInput, init?: RequestInit): Promise<Account> {
+      return this.request("POST", `/v1/accounts/login/create`, {
+        body,
+        query: undefined,
+        init,
+      });
+    }
+
     /** Get one account */
     async getAccount(tool: string, name: string, init?: RequestInit): Promise<Account> {
       return this.request("GET", `/v1/accounts/${encodeURIComponent(String(tool))}/${encodeURIComponent(String(name))}`, {
@@ -160,6 +175,15 @@ export class AccountsClient {
     /** Update an account */
     async updateAccount(tool: string, name: string, body: UpdateAccountInput, init?: RequestInit): Promise<Account> {
       return this.request("PATCH", `/v1/accounts/${encodeURIComponent(String(tool))}/${encodeURIComponent(String(name))}`, {
+        body,
+        query: undefined,
+        init,
+      });
+    }
+
+    /** Idempotently remove an unchanged account created for a failed login */
+    async removeLoginCreatedAccount(tool: string, name: string, body: RemoveCreatedAccountInput, init?: RequestInit): Promise<RemoveCreatedAccountResult> {
+      return this.request("POST", `/v1/accounts/${encodeURIComponent(String(tool))}/${encodeURIComponent(String(name))}/login/remove-created-operation`, {
         body,
         query: undefined,
         init,

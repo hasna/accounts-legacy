@@ -5,7 +5,7 @@ const RUNTIME_TABLES = [
   "current_selections",
   "custom_tools",
 ] as const;
-const APPEND_ONLY_TABLES = ["current_login_operations"] as const;
+const APPEND_ONLY_TABLES = ["current_login_operations", "account_login_cleanup_operations"] as const;
 const READ_ONLY_TABLES = ["schema_migrations", "api_keys"] as const;
 const OWNER_ONLY_SEQUENCES = ["current_selection_revision_seq"] as const;
 const TRIGGER_FUNCTIONS = [

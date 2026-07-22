@@ -13,6 +13,7 @@ import {
   currentProfile,
   claimProfileToolLock,
   getProfile,
+  getProfileToolLock,
   getProfileToolLockRevision,
   lockProfileTool,
   updateProfile,
@@ -294,6 +295,87 @@ test("finalizeLogin refreshes a stale auth snapshot from the profile dir", async
   rmSync(workDir, { recursive: true, force: true });
 });
 
+test("finalizeLogin rejects a custom ToolDef redefinition before any stale tool mutation", async () => {
+  const originalTool = {
+    id: "redefined-login-tool",
+    label: "Original Login Tool",
+    envVar: "REDEFINED_LOGIN_HOME",
+    defaultDir: join(home, "original-default"),
+    bin: process.execPath,
+    accountFile: "account.json",
+    emailPath: ["email"],
+  };
+  const localStore = resolveStore({
+    ACCOUNTS_HOME: home,
+    HASNA_ACCOUNTS_STORAGE_MODE: "local",
+  } as NodeJS.ProcessEnv);
+  await localStore.addTool(originalTool);
+  const profile = await localStore.addProfile({ name: "redefined", tool: originalTool.id });
+  const state = await captureLoginFinalizationState(profile.name, originalTool, localStore, profile);
+  const redefinedMachine = loadMachineStore();
+  redefinedMachine.tools = redefinedMachine.tools.map((candidate) =>
+    candidate.id === originalTool.id
+      ? { ...candidate, label: "Redefined Login Tool", bin: "replacement-bin" }
+      : candidate,
+  );
+  saveStore(redefinedMachine);
+  let redetectCalls = 0;
+  let activationCalls = 0;
+  const redefinedStore = new Proxy(localStore, {
+    get(store, property, receiver) {
+      if (property === "redetectEmail") {
+        return async (...args: Parameters<AccountsStore["redetectEmail"]>) => {
+          redetectCalls += 1;
+          return store.redetectEmail(...args);
+        };
+      }
+      if (property === "useProfileForLogin") {
+        return async (...args: Parameters<NonNullable<AccountsStore["useProfileForLogin"]>>) => {
+          activationCalls += 1;
+          return store.useProfileForLogin!(...args);
+        };
+      }
+      const value = Reflect.get(store, property, receiver);
+      return typeof value === "function" ? value.bind(store) : value;
+    },
+  }) as AccountsStore;
+
+  await expect(
+    finalizeLogin(profile.name, profile.tool, redefinedStore, state),
+  ).rejects.toThrow(/tool definition changed.*login/i);
+  expect(redetectCalls).toBe(0);
+  expect(activationCalls).toBe(0);
+  expect(await localStore.currentProfile(profile.tool)).toBeUndefined();
+});
+
+test("rollback re-resolves a tombstoned ToolDef and avoids stale tool-specific behavior", async () => {
+  const tool = {
+    id: "tombstoned-login-tool",
+    label: "Tombstoned Login Tool",
+    envVar: "TOMBSTONED_LOGIN_HOME",
+    defaultDir: join(home, "tombstoned-default"),
+    bin: process.execPath,
+  };
+  const localStore = resolveStore({
+    ACCOUNTS_HOME: home,
+    HASNA_ACCOUNTS_STORAGE_MODE: "local",
+  } as NodeJS.ProcessEnv);
+  await localStore.addTool(tool);
+  const profile = await localStore.addProfile({ name: "tombstoned", tool: tool.id });
+  const state = await captureLoginFinalizationState(profile.name, tool, localStore, profile);
+  const tombstonedMachine = loadMachineStore();
+  tombstonedMachine.tools = tombstonedMachine.tools.filter((candidate) => candidate.id !== tool.id);
+  saveStore(tombstonedMachine);
+  await expect(localStore.resolveTool(tool.id)).rejects.toThrow(/unknown tool/);
+
+  await rollbackLoginFinalization(state, localStore);
+
+  expect(await localStore.getProfile(profile.name, profile.tool)).toMatchObject({
+    name: profile.name,
+    tool: profile.tool,
+  });
+});
+
 test("lost API activation response restores prior current, live Claude auth, and applied pointer", async () => {
   const prior = addProfile({ name: "prior-finalize" });
   const target = addProfile({ name: "target-finalize" });
@@ -568,6 +650,26 @@ test("operation rollback preserves a newer tool-lock-only generation", async () 
 
   expect(currentProfile(target.tool)?.name).toBe(prior.name);
   expect(getProfileToolLockRevision(target.name)).toBe(newerToolLockRevision);
+});
+
+test("failed non-Claude finalization restores legacy tool-lock revision absence exactly", async () => {
+  addProfile({ name: "legacy-lock", tool: "opencode" });
+  const target = addProfile({ name: "legacy-lock", tool: "codex" });
+  const machine = loadMachineStore();
+  machine.toolLocks[target.name] = "opencode";
+  delete machine.toolLockRevisions[target.name];
+  saveStore(machine);
+  const store = resolveStore({
+    ACCOUNTS_HOME: home,
+    HASNA_ACCOUNTS_STORAGE_MODE: "local",
+  } as NodeJS.ProcessEnv);
+  const operationId = randomUUID();
+
+  await store.useProfileForLogin!(target.name, target.tool, operationId, target);
+  expect(await store.restoreCurrentOperation!(target.tool, target.name, operationId)).toBe(true);
+
+  expect(getProfileToolLock(target.name)).toBe("opencode");
+  expect(getProfileToolLockRevision(target.name)).toBeUndefined();
 });
 
 test("login tool-lock claim atomically captures the displaced generation", () => {

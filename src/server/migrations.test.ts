@@ -22,6 +22,7 @@ describe("accounts migrations", () => {
     expect(ids).toContain("accounts_0007_login_operation_rollback_state");
     expect(ids).toContain("accounts_0008_account_incarnations");
     expect(ids).toContain("accounts_0009_login_operation_target_incarnation");
+    expect(ids).toContain("accounts_0010_login_cleanup_operations");
     expect(ids.some((id) => id.startsWith("hasna_auth_"))).toBe(true);
     for (const m of migrations) {
       expect(m.checksum.startsWith("sha256:")).toBe(true);
@@ -56,6 +57,9 @@ describe("accounts migrations", () => {
     const operationTargetIncarnation = migrations.find(
       (item) => item.id === "accounts_0009_login_operation_target_incarnation",
     );
+    const cleanupOperations = migrations.find(
+      (item) => item.id === "accounts_0010_login_cleanup_operations",
+    );
     expect(revisions?.checksum).toBe(
       "sha256:fb55c634d8062524ffa86cf4ab45630d294f7750fd3c817e0c0a90c6b53d873c",
     );
@@ -66,5 +70,9 @@ describe("accounts migrations", () => {
     expect(operationTargetIncarnation?.sql).toMatch(
       /ADD COLUMN IF NOT EXISTS target_incarnation_id UUID/,
     );
+    expect(cleanupOperations?.sql).toMatch(
+      /CREATE TABLE IF NOT EXISTS account_login_cleanup_operations/,
+    );
+    expect(cleanupOperations?.sql).toMatch(/operation_id UUID PRIMARY KEY/);
   });
 });

@@ -94,6 +94,9 @@ export interface AccountsCloudApi {
   list(tool?: string): Promise<Profile[]>;
   get(name: string, tool?: string): Promise<Profile | undefined>;
   create(input: CloudCreateInput): Promise<Profile>;
+  createForLogin?(input: CloudCreateInput, expectedIncarnationId: string): Promise<Profile>;
+  assertLoginProfileCleanup?(): Promise<void>;
+  removeCreatedProfile?(profile: Profile, cleanupOperationId: string): Promise<boolean>;
   update(name: string, tool: string, input: CloudUpdateInput): Promise<Profile>;
   restoreProfile?(
     name: string,
@@ -106,7 +109,7 @@ export interface AccountsCloudApi {
     tool: string,
     email: string,
     expectedIncarnationId: string,
-    expectedEmail?: string,
+    expectedEmail: string | null,
   ): Promise<Profile>;
   rename(oldName: string, newName: string, tool: string): Promise<Profile>;
   remove(name: string, tool?: string): Promise<Profile>;
@@ -266,7 +269,11 @@ function makeApi(client: HasnaStorageClient): AccountsCloudApi {
   };
 
   const currentListResponse = () =>
-    t.get<{ current?: CloudCurrentSelection[]; transactionalLoginRollback?: boolean }>("/current");
+    t.get<{
+      current?: CloudCurrentSelection[];
+      transactionalLoginRollback?: boolean;
+      transactionalLoginProfileCleanup?: boolean;
+    }>("/current");
 
   const api: AccountsCloudApi = {
     baseUrl: client.baseUrl,
@@ -304,6 +311,56 @@ function makeApi(client: HasnaStorageClient): AccountsCloudApi {
       if (input.description) body.description = input.description;
       const created = await client.create<CloudAccount>("accounts", body);
       return toProfile(created);
+    },
+
+    async createForLogin(input: CloudCreateInput, expectedIncarnationId: string): Promise<Profile> {
+      try {
+        const created = await t.post<CloudAccount>(
+          "/accounts/login/create",
+          { ...input, expectedIncarnationId },
+          { idempotencyKey: expectedIncarnationId, ...LOGIN_TRANSACTION_REQUEST },
+        );
+        return toProfile(created);
+      } catch (err) {
+        if (isEndpointMissing(err)) throw endpointMissingError("accounts transactional login profile creation");
+        throw err;
+      }
+    },
+
+    async assertLoginProfileCleanup(): Promise<void> {
+      const raw = await currentListResponse();
+      if (raw?.transactionalLoginProfileCleanup !== true) {
+        throw transactionalLoginServerError(
+          "accounts-serve did not advertise conditional login-created profile cleanup",
+        );
+      }
+    },
+
+    async removeCreatedProfile(profile: Profile, cleanupOperationId: string): Promise<boolean> {
+      if (!profile.incarnationId) return false;
+      try {
+        const result = await t.post<{ removed: boolean }>(
+          `/accounts/${encodeURIComponent(profile.tool)}/${encodeURIComponent(profile.name)}/login/remove-created-operation`,
+          {
+            cleanupOperationId,
+            expectedIncarnationId: profile.incarnationId,
+            expectedCreatedAt: profile.createdAt,
+            expectedEmail: profile.email ?? null,
+            expectedDisplayName: profile.displayName ?? null,
+            expectedIdentity: profile.identity ?? null,
+            expectedCardLast4: profile.cardLast4 ?? null,
+            expectedMetadata: profile.metadata ?? {},
+            expectedDir: profile.dir || null,
+            expectedDescription: profile.description ?? null,
+            expectedLastUsedAt: profile.lastUsedAt ?? null,
+          },
+          { idempotencyKey: cleanupOperationId, ...LOGIN_TRANSACTION_REQUEST },
+        );
+        return result.removed === true;
+      } catch (err) {
+        if (isEndpointMissing(err)) throw endpointMissingError("accounts login-created profile cleanup");
+        throw err;
+      }
     },
 
     async update(name: string, tool: string, input: CloudUpdateInput): Promise<Profile> {
@@ -347,12 +404,12 @@ function makeApi(client: HasnaStorageClient): AccountsCloudApi {
       tool: string,
       email: string,
       expectedIncarnationId: string,
-      expectedEmail?: string,
+      expectedEmail: string | null,
     ): Promise<Profile> {
       try {
         const updated = await t.patch<CloudAccount>(
           `/accounts/${encodeURIComponent(tool)}/${encodeURIComponent(name)}/login/update`,
-          { expectedIncarnationId, expectedEmail: expectedEmail ?? null, email },
+          { expectedIncarnationId, expectedEmail, email },
           { idempotencyKey: randomUUID(), ...LOGIN_TRANSACTION_REQUEST },
         );
         return toProfile(updated);

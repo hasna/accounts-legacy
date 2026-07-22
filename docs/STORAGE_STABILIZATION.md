@@ -2,9 +2,17 @@
 
 This change consolidates registry access behind `AccountsStore`:
 
-- `LocalStore` owns the local `accounts.json` registry.
+- `LocalStore` owns the local `accounts.json` registry. Construction and reads
+  never create the registry home, lock, profile directories, or rewritten JSON.
+  Legacy profile incarnations are assigned only after login permission/tool
+  validation, inside the authorized login-preparation transaction. They remain
+  a rollback compatibility fence, not a second long-term profile identity.
 - `ApiStore` owns self-hosted/cloud registry access through `/v1`.
 - Machine-local profile directories, applied pointers, and launch processes stay local.
+- Profile creation and conditional failed-login cleanup share a machine-local
+  directory lease so cleanup cannot purge a same-name recreation. Once exact
+  rollback ownership is proven, managed-directory removal is journaled locally;
+  a later authorized login can finish a purge interrupted after registry commit.
 - Cloud custom tool definitions hydrate a process-only cache. Readiness, health,
   list, and lookup operations do not create or rewrite `accounts.json`.
 
@@ -68,7 +76,10 @@ instead of a parse or compile failure. The retired `remote`, `hybrid`, and
    by response-loss-safe login activation. The ledger records both completed
    activations and rollback-first terminal cancellations, so a delayed
    activation cannot commit after its rollback has already returned. The migrator
-   reapplies and verifies the runtime grant contract after migrations and on a
+   applies migration `0010` for the append-only cleanup-operation ledger used
+   by response-loss-safe conditional removal of a login-created account. New
+   clients use a new-only cleanup route. The migrator reapplies and verifies
+   the runtime grant contract after migrations and on a
    current-schema no-op run. Inspect and retain
    the orphan archive for reconciliation; do not treat it as disposable
    migration scratch state.
@@ -115,8 +126,9 @@ and tables:
 - `USAGE` on the Accounts schema, without `CREATE`.
 - `SELECT, INSERT, UPDATE, DELETE` on `accounts`, `current_selections`, and
   `custom_tools`.
-- `SELECT, INSERT` on the append-only `current_login_operations` idempotency
-  ledger; no `UPDATE` or `DELETE`.
+- `SELECT, INSERT` on the append-only `current_login_operations` and
+  `account_login_cleanup_operations` idempotency ledgers; no `UPDATE` or
+  `DELETE`.
 - `SELECT, INSERT, DELETE` on `custom_tool_tombstones`; no `UPDATE`,
   `TRUNCATE`, `REFERENCES`, or `TRIGGER`.
 - `SELECT` on `schema_migrations` and `api_keys` for readiness and
@@ -140,17 +152,17 @@ manifest are revalidated.
 | Client | Server | Result |
 | --- | --- | --- |
 | Old | Old | Existing account and selection operations are unchanged. |
-| Old | New | Compatible after migrations through 0009. Account creation with a previously local, unseen custom tool id succeeds without a tools-registration call. A durably removed id is rejected; a database trigger advances current-selection generations for legacy conflict updates. |
-| New | Old | Existing non-login operations work. Minimal legacy built-in Tool responses are accepted. Login preflight, rename, custom-tool mutations, and generation-owned failed-login rollback require a server upgrade and fail with an actionable error. Transactional activation and rollback use new-only routes, so old replicas reject rather than partially execute them. |
-| New | New before migrations 0003 through 0009 | `/ready` is unavailable with a pending-migration reason. Do not send traffic. |
-| New | New after migrations 0003 through 0009 | Full AccountsStore routing, durable tool lifecycle state, row/advisory-locked account/tool mutations, incarnation-owned profile-field rollback, target-incarnation-bound response-loss-safe operation-owned login rollback with rollback-first cancellation, rename/remove/current updates, and pointer reconciliation are available. |
+| Old | New | Compatible after migrations through 0010. Account creation with a previously local, unseen custom tool id succeeds without a tools-registration call. A durably removed id is rejected; a database trigger advances current-selection generations for legacy conflict updates. |
+| New | Old | Existing non-login operations work, including Account reads whose legacy response omits `incarnationId` or `email`. Minimal legacy built-in Tool responses are accepted. Login preflight, rename, custom-tool mutations, conditional created-profile cleanup, and generation-owned failed-login rollback require a server upgrade and fail with an actionable error. Transactional activation and rollback use new-only routes, so old replicas reject rather than partially execute them. |
+| New | New before migrations 0003 through 0010 | `/ready` is unavailable with a pending-migration reason. Do not send traffic. |
+| New | New after migrations 0003 through 0010 | Full AccountsStore routing, durable tool lifecycle state, row/advisory-locked account/tool mutations, incarnation-owned profile-field rollback, response-loss-safe conditional cleanup of unchanged login-created profiles, target-incarnation-bound operation-owned login rollback with rollback-first cancellation, rename/remove/current updates, and pointer reconciliation are available. |
 
 ## Rollback And Forward Fix
 
 - Before client rollout, an application image may be rolled back only if it
   retains the new migration manifest/readiness code; an older image that treats
-  migration `0009` as unknown remains unavailable and must be forward-fixed.
-  Leave migrations `0003` through `0009` in place. Database triggers
+  migration `0010` as unknown remains unavailable and must be forward-fixed.
+  Leave migrations `0003` through `0010` in place. Database triggers
   make older account writers observe tombstones and turn older direct
   `custom_tools` deletes into durable removals. An explicit registration is
   the only operation that clears a tombstone.
@@ -158,7 +170,7 @@ manifest are revalidated.
   migration `0005` functions, their locked `search_path`, and the grants
   applied by the new owner-run migrator. Do not switch the server to the owner
   DSN as a rollback shortcut.
-- Never run a pre-`0003`/`0005`/`0006`/`0007`/`0008`/`0009` `accounts-migrate` binary after newer
+- Never run a pre-`0003`/`0005`/`0006`/`0007`/`0008`/`0009`/`0010` `accounts-migrate` binary after newer
   migrations are recorded. The checksum ledger rejects migrations unknown to
   the supplied manifest as a deterministic downgrade guard. An application
   rollback must retain the new migrator binary/job; otherwise forward-fix.
@@ -176,14 +188,17 @@ manifest are revalidated.
 
 ## Verification
 
-- `bun test` covers local/no-cloud behavior, process-only hydration,
-  cold custom-tool lookup/launch, endpoint compatibility, and transaction use.
+- `bun test` covers local/no-cloud behavior, side-effect-free read construction,
+  process-only hydration, cold custom-tool lookup/launch, legacy Account/SDK
+  compatibility, exact local/API login cleanup ownership, ToolDef tombstone and
+  redefinition fencing, endpoint compatibility, and transaction use.
 - `bun run test:postgres` requires
   `HASNA_ACCOUNTS_TEST_DATABASE_URL`. It uses an isolated schema to verify the
   `0003` upgrade, `0004` orphan archival and valid-row preservation, `0005`
   tool tombstones, `0006` database-enforced current-selection generations,
   `0007` operation rollback state, `0008` account incarnations, `0009`
-  target-incarnation-bound operation replay,
+  target-incarnation-bound operation replay, `0010` response-loss-safe
+  login-created account cleanup replay,
   direct-SQL idempotency, unseen legacy ids, durable removal rejection,
   old-server current-update generation advancement, durable operation-token
   replay after an intervening selection, wire-stable activation timestamps,

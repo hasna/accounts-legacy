@@ -22,9 +22,25 @@
 // the only two backends are LocalStore (fs) and ApiStore (@hasna/contracts HTTP
 // transport). The bearer key never appears in output or logs.
 
-import { existsSync, mkdirSync, rmSync } from "node:fs";
-import { randomUUID } from "node:crypto";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  renameSync,
+  readFileSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type { Profile, ToolDef } from "../types.js";
 import { AccountsError } from "../types.js";
 import {
@@ -48,7 +64,7 @@ import {
   clearCustomToolsCache,
   BUILTIN_TOOLS,
 } from "./tools.js";
-import { profileNameSchema, toolDefSchema } from "../types.js";
+import { profileNameSchema, profileSchema, toolDefSchema } from "../types.js";
 import { detectEmail } from "./detect.js";
 import {
   addProfile as localAdd,
@@ -103,6 +119,22 @@ export interface RemoveResult {
   purgeNote?: string;
 }
 
+export interface LoginCreatedProfile {
+  profile: Profile;
+  createdProfileDir: boolean;
+}
+
+export interface CreatedProfileRollbackOwnership {
+  /** Durable cleanup replay token; supplied internally when resuming an interrupted rollback. */
+  cleanupOperationId?: string;
+  toolLockRevision?: string;
+  previousToolLock?: string;
+  previousToolLockRevision?: string;
+  previousToolLockProfileIncarnation?: string;
+  authIdentity?: string;
+  authCommitRevision?: string;
+}
+
 /** The single registry surface. LocalStore and ApiStore both implement it. */
 export interface AccountsStore {
   readonly transport: "local" | "api";
@@ -112,15 +144,21 @@ export interface AccountsStore {
   getProfile(name: string, tool?: string): Promise<Profile>;
   findProfile(name: string, tool?: string): Promise<Profile | undefined>;
   addProfile(opts: AddOptions): Promise<Profile>;
+  /** Create a login profile while atomically recording ownership of its managed directory. */
+  addProfileForLogin?(opts: AddOptions): Promise<LoginCreatedProfile>;
   updateProfile(name: string, opts: UpdateOptions): Promise<Profile>;
   renameProfile(oldName: string, newName: string, tool?: string): Promise<Profile>;
   removeProfile(name: string, opts?: RemoveOptions): Promise<RemoveResult>;
-  /** Remove a newly created local profile only while the caller still owns its exact auth identity. */
+  /** Upgrade a legacy local profile only after login permission/tool validation authorized mutation. */
+  upgradeProfileIncarnationForLogin?(profile: Profile): Promise<Profile>;
+  /** Fail closed before creating an API profile unless exact conditional cleanup is supported. */
+  assertCreatedProfileCleanup?(): Promise<void>;
+  /** Finish directory cleanup journaled by an interrupted, already-authorized login rollback. */
+  reconcileInterruptedLoginCleanup?(name: string, tool: string): Promise<void>;
+  /** Remove a login-created profile only while every recorded ownership generation still matches. */
   removeProfileIncarnation?(
     profile: Profile,
-    expectedAuthIdentity: string,
-    expectedAuthCommitRevision: string,
-    expectedToolLockRevision?: string,
+    ownership: CreatedProfileRollbackOwnership,
     opts?: RemoveOptions,
   ): Promise<RemoveResult | undefined>;
   redetectEmail(name: string, tool?: string, expectedProfile?: Profile): Promise<Profile>;
@@ -163,6 +201,486 @@ export interface AccountsStore {
   removeTool(id: string): Promise<void>;
 }
 
+function profileDirectoryLeasePath(dir: string): string {
+  const uid = typeof process.getuid === "function" ? process.getuid() : "user";
+  const identity = createHash("sha256").update(resolve(dir)).digest("hex").slice(0, 32);
+  const lockRoot = process.platform === "win32" ? tmpdir() : "/tmp";
+  return join(lockRoot, `accounts-profile-directory-${uid}-${identity}.lock`);
+}
+
+function profileDirectoryLeaseTimeout(): number {
+  if (process.env.NODE_ENV !== "test") return 600_000;
+  const configured = Number(process.env.ACCOUNTS_TEST_PROFILE_DIRECTORY_LOCK_TIMEOUT_MS);
+  return Number.isFinite(configured) && configured > 0 ? configured : 600_000;
+}
+
+function profileDirectoryProcessStartId(pid: number): string | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const commandEnd = stat.lastIndexOf(")");
+    if (commandEnd >= 0) {
+      const startTime = stat.slice(commandEnd + 1).trim().split(/\s+/)[19];
+      if (startTime && /^\d+$/.test(startTime)) return `linux-${startTime}`;
+    }
+  } catch {
+    // procfs is unavailable on non-Linux hosts.
+  }
+  if (process.platform !== "darwin") return undefined;
+  try {
+    const result = spawnSync("/bin/ps", ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf8",
+      env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 1_000,
+    });
+    const startedAt = result.status === 0 ? result.stdout.trim().replace(/\s+/g, " ") : "";
+    return startedAt
+      ? `darwin-${createHash("sha256").update(startedAt).digest("hex").slice(0, 24)}`
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isVerifiableDirectoryProcessStartId(value: string | undefined): value is string {
+  return Boolean(value && /^(?:linux|darwin)-/.test(value));
+}
+
+const profileDirectoryProcessIncarnation =
+  profileDirectoryProcessStartId(process.pid) ?? `fallback-${randomUUID()}`;
+const PROFILE_DIRECTORY_RECLAIM_CLAIM_STALE_MS = 1_000;
+
+interface ProfileDirectoryLeaseObservation {
+  text: string;
+  dev: number;
+  ino: number;
+  stale: boolean;
+}
+
+function observeProfileDirectoryLease(path: string): ProfileDirectoryLeaseObservation | undefined {
+  let stat: ReturnType<typeof lstatSync>;
+  let text: string;
+  try {
+    stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new AccountsError("invalid profile directory lease; refusing unsafe reclaim");
+    }
+    text = readFileSync(path, "utf8");
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+    if (code === "ENOENT") return undefined;
+    if (error instanceof AccountsError) throw error;
+    throw new AccountsError(`failed to inspect profile directory lease: ${String(error)}`);
+  }
+  const match = text.trim().match(
+    /^v2:([1-9]\d*):((?:linux|darwin)-[A-Za-z0-9-]+|fallback-[0-9a-f-]+):[0-9a-f-]+$/i,
+  );
+  const owner = match ? Number(match[1]) : Number.NaN;
+  const ownerIncarnation = match?.[2];
+  if (!Number.isSafeInteger(owner)) {
+    return { text, dev: stat.dev, ino: stat.ino, stale: false };
+  }
+  let stale = false;
+  if (owner === process.pid) {
+    stale =
+      isVerifiableDirectoryProcessStartId(ownerIncarnation) &&
+      isVerifiableDirectoryProcessStartId(profileDirectoryProcessIncarnation) &&
+      ownerIncarnation !== profileDirectoryProcessIncarnation;
+  } else {
+    const observedIncarnation = profileDirectoryProcessStartId(owner);
+    if (
+      isVerifiableDirectoryProcessStartId(ownerIncarnation) &&
+      isVerifiableDirectoryProcessStartId(observedIncarnation)
+    ) {
+      stale = ownerIncarnation !== observedIncarnation;
+    } else {
+      try {
+        process.kill(owner, 0);
+      } catch (error) {
+        stale = (error as NodeJS.ErrnoException).code === "ESRCH";
+      }
+    }
+  }
+  return { text, dev: stat.dev, ino: stat.ino, stale };
+}
+
+function removeObservedProfileDirectoryLease(
+  path: string,
+  observed: ProfileDirectoryLeaseObservation,
+): boolean {
+  const claimHash = createHash("sha256")
+    .update(`${observed.dev}:${observed.ino}:`)
+    .update(observed.text)
+    .digest("hex")
+    .slice(0, 24);
+  const claimPath = `${path}.reclaim-${claimHash}`;
+  let claimed = false;
+  try {
+    try {
+      linkSync(path, claimPath);
+      claimed = true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") return false;
+      if (code !== "EEXIST") throw error;
+      let claim: ReturnType<typeof lstatSync>;
+      let current: ReturnType<typeof lstatSync>;
+      try {
+        claim = lstatSync(claimPath);
+        current = lstatSync(path);
+      } catch (claimError) {
+        if ((claimError as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw claimError;
+      }
+      if (
+        !claim.isFile() || claim.isSymbolicLink() ||
+        claim.dev !== observed.dev || claim.ino !== observed.ino ||
+        current.dev !== observed.dev || current.ino !== observed.ino ||
+        Date.now() - claim.ctimeMs < PROFILE_DIRECTORY_RECLAIM_CLAIM_STALE_MS ||
+        readFileSync(path, "utf8") !== observed.text
+      ) {
+        return false;
+      }
+      unlinkSync(claimPath);
+      try {
+        linkSync(path, claimPath);
+        claimed = true;
+      } catch (retryError) {
+        const retryCode = (retryError as NodeJS.ErrnoException).code;
+        if (retryCode === "EEXIST" || retryCode === "ENOENT") return false;
+        throw retryError;
+      }
+    }
+    const claim = lstatSync(claimPath);
+    const current = lstatSync(path);
+    if (
+      claim.dev !== observed.dev || claim.ino !== observed.ino ||
+      !current.isFile() || current.isSymbolicLink() ||
+      current.dev !== observed.dev || current.ino !== observed.ino ||
+      readFileSync(path, "utf8") !== observed.text
+    ) {
+      return false;
+    }
+    unlinkSync(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw new AccountsError(`failed to reclaim profile directory lease: ${String(error)}`);
+  } finally {
+    if (claimed) {
+      try {
+        const claim = lstatSync(claimPath);
+        if (claim.dev === observed.dev && claim.ino === observed.ino) unlinkSync(claimPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+  }
+}
+
+async function acquireProfileDirectoryLease(dir: string): Promise<() => void> {
+  const path = profileDirectoryLeasePath(dir);
+  const token = `v2:${process.pid}:${profileDirectoryProcessIncarnation}:${randomUUID()}`;
+  const deadline = Date.now() + profileDirectoryLeaseTimeout();
+
+  while (true) {
+    const candidate = `${path}.candidate-${process.pid}-${randomUUID()}`;
+    let candidateFd: number | undefined;
+    let published = false;
+    try {
+      candidateFd = openSync(candidate, "wx", 0o600);
+      writeFileSync(candidateFd, token, { encoding: "utf8" });
+      fsyncSync(candidateFd);
+      closeSync(candidateFd);
+      candidateFd = undefined;
+      try {
+        linkSync(candidate, path);
+        published = true;
+      } catch (error) {
+        const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+        if (code !== "EEXIST") throw error;
+      }
+      if (published) {
+        const owned = lstatSync(path);
+        return () => {
+          try {
+            const current = lstatSync(path);
+            if (
+              current.isFile() &&
+              !current.isSymbolicLink() &&
+              current.dev === owned.dev &&
+              current.ino === owned.ino &&
+              readFileSync(path, "utf8") === token
+            ) {
+              unlinkSync(path);
+            }
+          } catch {
+            // A missing or replaced lease belongs to no cleanup in this process.
+          }
+        };
+      }
+    } catch (error) {
+      const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+      if (code !== "EEXIST") {
+        throw new AccountsError(`failed to acquire profile directory lease: ${String(error)}`);
+      }
+    } finally {
+      if (candidateFd !== undefined) closeSync(candidateFd);
+      rmSync(candidate, { force: true });
+    }
+
+    const observed = observeProfileDirectoryLease(path);
+    if (!observed) continue;
+    if (observed.stale && removeObservedProfileDirectoryLease(path, observed)) continue;
+    if (Date.now() >= deadline) throw new AccountsError("timed out waiting for profile directory lease");
+    await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+  }
+}
+
+async function withProfileDirectoryLease<T>(dir: string, operation: () => Promise<T> | T): Promise<T> {
+  const release = await acquireProfileDirectoryLease(dir);
+  try {
+    return await operation();
+  } finally {
+    release();
+  }
+}
+
+const LOGIN_CLEANUP_MARKER = ".accounts-login-cleanup.json";
+
+interface LoginCleanupMarker {
+  version: 1;
+  cleanupOperationId: string;
+  profile: Profile;
+  ownership: CreatedProfileRollbackOwnership;
+}
+
+function managedProfileDirectory(name: string, tool: string): string {
+  return join(profilesDir(), tool, name);
+}
+
+function isExactManagedProfileDirectory(profile: Profile): boolean {
+  return resolve(profile.dir) === resolve(managedProfileDirectory(profile.name, profile.tool));
+}
+
+function loginCleanupMarkerPath(dir: string): string {
+  return join(dir, LOGIN_CLEANUP_MARKER);
+}
+
+function parseLoginCleanupMarker(dir: string): LoginCleanupMarker | undefined {
+  const path = loginCleanupMarkerPath(dir);
+  if (!existsSync(path)) return undefined;
+  assertSafeWritePath(path, { mustStayUnder: profilesDir() });
+  let stat: ReturnType<typeof lstatSync>;
+  let value: unknown;
+  try {
+    stat = lstatSync(path);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new AccountsError("invalid interrupted login cleanup marker");
+    }
+    value = JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    if (error instanceof AccountsError) throw error;
+    throw new AccountsError(`invalid interrupted login cleanup marker: ${String(error)}`);
+  }
+  if (!value || typeof value !== "object") {
+    throw new AccountsError("invalid interrupted login cleanup marker");
+  }
+  const marker = value as Partial<LoginCleanupMarker>;
+  const profile = profileSchema.safeParse(marker.profile);
+  const ownership = marker.ownership;
+  const ownershipKeys = new Set([
+    "cleanupOperationId",
+    "toolLockRevision",
+    "previousToolLock",
+    "previousToolLockRevision",
+    "previousToolLockProfileIncarnation",
+    "authIdentity",
+    "authCommitRevision",
+  ]);
+  if (
+    marker.version !== 1 ||
+    typeof marker.cleanupOperationId !== "string" ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(marker.cleanupOperationId) ||
+    !profile.success ||
+    !profile.data.incarnationId ||
+    !ownership ||
+    typeof ownership !== "object" ||
+    Array.isArray(ownership) ||
+    Reflect.ownKeys(ownership).some(
+      (key) => typeof key !== "string" || !ownershipKeys.has(key),
+    ) ||
+    Object.values(ownership).some((field) => field !== undefined && typeof field !== "string")
+  ) {
+    throw new AccountsError("invalid interrupted login cleanup marker");
+  }
+  return {
+    version: 1,
+    cleanupOperationId: marker.cleanupOperationId,
+    profile: profile.data,
+    ownership: { ...ownership, cleanupOperationId: marker.cleanupOperationId },
+  };
+}
+
+function writeLoginCleanupMarker(
+  profile: Profile,
+  ownership: CreatedProfileRollbackOwnership,
+  cleanupOperationId: string,
+): boolean {
+  if (!profile.incarnationId || !isExactManagedProfileDirectory(profile) || !existsSync(profile.dir)) {
+    return false;
+  }
+  assertManagedDirectory(profile.dir);
+  const path = loginCleanupMarkerPath(profile.dir);
+  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  assertSafeWritePath(path, { mustStayUnder: profilesDir() });
+  assertSafeWritePath(temp, { mustStayUnder: profilesDir() });
+  let fd: number | undefined;
+  try {
+    fd = openSync(temp, "wx", 0o600);
+    writeFileSync(fd, JSON.stringify({
+      version: 1,
+      cleanupOperationId,
+      profile,
+      ownership: { ...ownership, cleanupOperationId },
+    } satisfies LoginCleanupMarker) + "\n", "utf8");
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(temp, path);
+    return true;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+    rmSync(temp, { force: true });
+  }
+}
+
+function clearLoginCleanupMarker(dir: string, cleanupOperationId: string): void {
+  const marker = parseLoginCleanupMarker(dir);
+  if (marker?.cleanupOperationId !== cleanupOperationId) return;
+  rmSync(loginCleanupMarkerPath(dir), { force: true });
+}
+
+function canPurgeInterruptedLoginDirectory(profile: Profile): boolean {
+  const machine = loadMachineStore();
+  return machine.current[profile.tool] !== profile.name && machine.applied[profile.tool] !== profile.name;
+}
+
+function reconcileInterruptedLoginDirectory(
+  dir: string,
+  name: string,
+  tool: string,
+  current: Profile | undefined,
+): void {
+  const marker = parseLoginCleanupMarker(dir);
+  if (!marker) return;
+  if (
+    marker.profile.name !== name ||
+    marker.profile.tool !== tool ||
+    !isExactManagedProfileDirectory(marker.profile)
+  ) {
+    throw new AccountsError("interrupted login cleanup marker does not match its managed directory");
+  }
+  if (current) {
+    throw new AccountsError(
+      "profile changed or survived interrupted login cleanup; refusing to reuse its managed directory",
+    );
+  }
+  if (!canPurgeInterruptedLoginDirectory(marker.profile)) {
+    throw new AccountsError(
+      "interrupted login cleanup no longer owns the machine profile state; refusing directory reuse",
+    );
+  }
+  assertManagedDirectory(dir);
+  rmSync(dir, { recursive: true, force: true });
+}
+
+function reconcileInterruptedLocalLoginCleanup(
+  dir: string,
+  marker: LoginCleanupMarker,
+): void {
+  withStoreLock(() => {
+    const machine = loadMachineStore();
+    const current = machine.profiles.find(
+      (profile) => profile.name === marker.profile.name && profile.tool === marker.profile.tool,
+    );
+    if (current) {
+      throw new AccountsError(
+        "profile changed or survived interrupted login cleanup; refusing to reuse its managed directory",
+      );
+    }
+    if (
+      machine.current[marker.profile.tool] === marker.profile.name ||
+      machine.applied[marker.profile.tool] === marker.profile.name
+    ) {
+      throw new AccountsError(
+        "interrupted login cleanup no longer owns the machine profile state; refusing directory reuse",
+      );
+    }
+
+    const expectedPrevious = marker.ownership.previousToolLock
+      ? machine.profiles.find(
+          (profile) =>
+            profile.name === marker.profile.name &&
+            profile.tool === marker.ownership.previousToolLock &&
+            (!marker.ownership.previousToolLockProfileIncarnation ||
+              profileAuthIncarnation(profile) === marker.ownership.previousToolLockProfileIncarnation),
+        )
+      : undefined;
+    const currentToolLock = machine.toolLocks[marker.profile.name];
+    const currentToolLockRevision = machine.toolLockRevisions[marker.profile.name];
+    const previousLockAlreadyRestored = Boolean(
+      expectedPrevious &&
+      currentToolLock === marker.ownership.previousToolLock &&
+      currentToolLockRevision === marker.ownership.previousToolLockRevision,
+    );
+    if (currentToolLock || currentToolLockRevision) {
+      if (!previousLockAlreadyRestored) {
+        throw new AccountsError(
+          "interrupted login cleanup no longer owns the profile tool lock; refusing directory reuse",
+        );
+      }
+    } else if (expectedPrevious) {
+      machine.toolLocks[marker.profile.name] = expectedPrevious.tool;
+      if (marker.ownership.previousToolLockRevision) {
+        machine.toolLockRevisions[marker.profile.name] = marker.ownership.previousToolLockRevision;
+      }
+      saveStore(machine);
+    }
+
+    assertManagedDirectory(dir);
+    rmSync(dir, { recursive: true, force: true });
+  });
+}
+
+function ownsCreatedProfileMachineState(
+  profile: Profile,
+  ownership: CreatedProfileRollbackOwnership,
+): boolean {
+  const machine = loadMachineStore();
+  if (
+    machine.current[profile.tool] === profile.name ||
+    machine.applied[profile.tool] === profile.name
+  ) {
+    return false;
+  }
+  if (profile.tool !== "claude") return true;
+  const authKey = findProfileAuthRevisionKey(machine, profile);
+  const hasAuthOwnership = Boolean(
+    authKey && (
+      machine.profileAuthRevisions[authKey] ||
+      machine.profileAuthCommitRevisions[authKey]
+    ),
+  );
+  return !hasAuthOwnership || Boolean(
+    authKey &&
+    ownership.authIdentity &&
+    ownership.authCommitRevision &&
+    machine.profileAuthRevisions[authKey] === ownership.authIdentity &&
+    machine.profileAuthCommitRevisions[authKey] === ownership.authCommitRevision,
+  );
+}
+
 /** On-box JSON registry. Delegates to the core profile library. */
 class LocalStore implements AccountsStore {
   readonly transport = "local" as const;
@@ -179,22 +697,6 @@ class LocalStore implements AccountsStore {
     writtenToolLockRevision: string;
   }>();
 
-  constructor() {
-    // Upgrade legacy local records before any transaction captures ownership.
-    // Persisting under the registry lease makes the UUID stable across every
-    // process and prevents timestamp/path ABA collisions during rollback.
-    withStoreLock(() => {
-      const machine = loadMachineStore();
-      let changed = false;
-      for (const profile of machine.profiles) {
-        if (profile.incarnationId) continue;
-        profile.incarnationId = randomUUID();
-        changed = true;
-      }
-      if (changed) saveStore(machine);
-    });
-  }
-
   async listProfiles(tool?: string): Promise<Profile[]> {
     return localList(tool);
   }
@@ -205,7 +707,26 @@ class LocalStore implements AccountsStore {
     return localFind(name, tool);
   }
   async addProfile(opts: AddOptions): Promise<Profile> {
-    return localAdd(opts);
+    return (await this.addProfileForLogin(opts)).profile;
+  }
+  async addProfileForLogin(opts: AddOptions): Promise<LoginCreatedProfile> {
+    const toolId = opts.tool ?? DEFAULT_TOOL;
+    const dir = opts.dir ? expandPath(opts.dir) : join(profilesDir(), toolId, opts.name);
+    return withProfileDirectoryLease(dir, () => {
+      const existed = existsSync(dir);
+      const profileExisted = Boolean(localFind(opts.name, toolId));
+      try {
+        const profile = localAdd(opts);
+        return { profile, createdProfileDir: !existed };
+      } catch (error) {
+        const committed = localFind(opts.name, toolId);
+        if (!profileExisted && committed && resolve(committed.dir) === resolve(dir)) {
+          return { profile: committed, createdProfileDir: !existed };
+        }
+        if (!existed && existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+        throw error;
+      }
+    });
   }
   async updateProfile(name: string, opts: UpdateOptions): Promise<Profile> {
     return localUpdate(name, opts);
@@ -214,41 +735,157 @@ class LocalStore implements AccountsStore {
     return localRename(oldName, newName, tool);
   }
   async removeProfile(name: string, opts: RemoveOptions = {}): Promise<RemoveResult> {
-    return localRemove(name, opts);
+    const expected = localGet(name, opts.tool);
+    return withProfileDirectoryLease(expected.dir, () => withStoreLock(() => {
+      const current = localGet(name, opts.tool);
+      if (!isDeepStrictEqual(current, expected)) {
+        throw new AccountsError("profile changed while directory removal was in progress");
+      }
+      return localRemove(name, opts);
+    }));
+  }
+  async upgradeProfileIncarnationForLogin(profile: Profile): Promise<Profile> {
+    return withStoreLock(() => {
+      const machine = loadMachineStore();
+      const current = machine.profiles.find(
+        (candidate) => candidate.name === profile.name && candidate.tool === profile.tool,
+      );
+      if (!current) throw new AccountsError(`no profile named "${profile.name}" for tool "${profile.tool}"`);
+      if (
+        current.createdAt !== profile.createdAt ||
+        resolve(current.dir) !== resolve(profile.dir)
+      ) {
+        throw new AccountsError("profile changed while login preparation was in progress");
+      }
+      if (!current.incarnationId) {
+        current.incarnationId = randomUUID();
+        saveStore(machine);
+      }
+      return structuredClone(current);
+    });
+  }
+  async reconcileInterruptedLoginCleanup(name: string, tool: string): Promise<void> {
+    const dir = managedProfileDirectory(name, tool);
+    if (!existsSync(loginCleanupMarkerPath(dir))) return;
+    const marker = parseLoginCleanupMarker(dir)!;
+    if (marker.profile.name !== name || marker.profile.tool !== tool) {
+      throw new AccountsError("interrupted login cleanup marker does not match its managed directory");
+    }
+    const resumed = await this.removeProfileIncarnation(
+      marker.profile,
+      marker.ownership,
+      { tool, purge: true },
+    );
+    if (resumed?.purged) return;
+    return withProfileDirectoryLease(dir, () => {
+      reconcileInterruptedLocalLoginCleanup(dir, marker);
+    });
   }
   async removeProfileIncarnation(
     profile: Profile,
-    expectedAuthIdentity: string,
-    expectedAuthCommitRevision: string,
-    expectedToolLockRevision?: string,
+    ownership: CreatedProfileRollbackOwnership,
     opts: RemoveOptions = {},
   ): Promise<RemoveResult | undefined> {
-    return withStoreLock(() => {
-      if (profile.tool !== "claude" || !expectedAuthIdentity || !expectedAuthCommitRevision) return undefined;
+    return withProfileDirectoryLease(profile.dir, () => {
+      let absentMarker: LoginCleanupMarker | undefined;
+      const result = withStoreLock(() => {
+      if (!profile.incarnationId || !ownership.toolLockRevision) return undefined;
       const machine = loadMachineStore();
       const current = machine.profiles.find(
         (candidate) =>
           candidate.name === profile.name &&
-          candidate.tool === profile.tool &&
-          candidate.createdAt === profile.createdAt &&
-          resolve(candidate.dir) === resolve(profile.dir),
+          candidate.tool === profile.tool,
       );
-      if (!current) return undefined;
-      const authKey = findProfileAuthRevisionKey(machine, current);
+      if (!current) {
+        if (
+          opts.purge &&
+          isExactManagedProfileDirectory(profile) &&
+          existsSync(profile.dir) &&
+          ownsCreatedProfileMachineState(profile, ownership)
+        ) {
+          const cleanupOperationId = ownership.cleanupOperationId ?? randomUUID();
+          if (writeLoginCleanupMarker(profile, ownership, cleanupOperationId)) {
+            absentMarker = {
+              version: 1,
+              cleanupOperationId,
+              profile,
+              ownership: { ...ownership, cleanupOperationId },
+            };
+          }
+        }
+        return undefined;
+      }
       if (
-        !authKey ||
-        machine.profileAuthRevisions[authKey] !== expectedAuthIdentity ||
-        machine.profileAuthCommitRevisions[authKey] !== expectedAuthCommitRevision ||
-        !expectedToolLockRevision ||
-        machine.toolLockRevisions[current.name] !== expectedToolLockRevision ||
-        JSON.stringify(current) !== JSON.stringify(profile)
+        current.incarnationId !== profile.incarnationId ||
+        !isDeepStrictEqual(current, profile) ||
+        machine.toolLockRevisions[current.name] !== ownership.toolLockRevision ||
+        machine.current[current.tool] === current.name ||
+        machine.applied[current.tool] === current.name
       ) {
         return undefined;
       }
-      // The outer registry lease spans the identity check, registry removal,
-      // and optional managed-directory purge. A cooperating remove/recreate or
-      // apply cannot interleave between the check and deletion.
-      return localRemove(current.name, { ...opts, tool: current.tool });
+      if (profile.tool === "claude") {
+        const authKey = findProfileAuthRevisionKey(machine, current);
+        const hasAuthOwnership = Boolean(
+          authKey && (
+            machine.profileAuthRevisions[authKey] ||
+            machine.profileAuthCommitRevisions[authKey]
+          ),
+        );
+        if (
+          hasAuthOwnership && (
+            !authKey ||
+            !ownership.authIdentity ||
+            !ownership.authCommitRevision ||
+            machine.profileAuthRevisions[authKey] !== ownership.authIdentity ||
+            machine.profileAuthCommitRevisions[authKey] !== ownership.authCommitRevision
+          )
+        ) {
+          return undefined;
+        }
+      }
+      const cleanupOperationId = ownership.cleanupOperationId ?? randomUUID();
+      const journaled = Boolean(
+        opts.purge && writeLoginCleanupMarker(current, ownership, cleanupOperationId),
+      );
+      const removed = localRemove(current.name, { tool: current.tool });
+      const after = loadMachineStore();
+      if (
+        ownership.previousToolLock &&
+        after.profiles.some(
+          (candidate) =>
+            candidate.name === current.name &&
+            candidate.tool === ownership.previousToolLock &&
+            (!ownership.previousToolLockProfileIncarnation ||
+              profileAuthIncarnation(candidate) === ownership.previousToolLockProfileIncarnation),
+        )
+      ) {
+        after.toolLocks[current.name] = ownership.previousToolLock;
+        if (ownership.previousToolLockRevision) {
+          after.toolLockRevisions[current.name] = ownership.previousToolLockRevision;
+        } else {
+          delete after.toolLockRevisions[current.name];
+        }
+        saveStore(after);
+      }
+      let purged = false;
+      if (
+        opts.purge &&
+        resolve(profile.dir) === resolve(join(profilesDir(), profile.tool, profile.name)) &&
+        existsSync(profile.dir)
+      ) {
+        assertManagedDirectory(profile.dir);
+        rmSync(profile.dir, { recursive: true, force: true });
+        purged = true;
+      }
+      if (journaled && !purged) clearLoginCleanupMarker(profile.dir, cleanupOperationId);
+      return { ...removed, purged };
+      });
+      if (absentMarker) {
+        reconcileInterruptedLocalLoginCleanup(profile.dir, absentMarker);
+        return { profile, purged: !existsSync(profile.dir) };
+      }
+      return result;
     });
   }
   async redetectEmail(name: string, tool?: string, expectedProfile?: Profile): Promise<Profile> {
@@ -485,7 +1122,7 @@ class LocalStore implements AccountsStore {
           if (operation.previousToolLockRevision) {
             machine.toolLockRevisions[expectedName] = operation.previousToolLockRevision;
           } else {
-            machine.toolLockRevisions[expectedName] = randomUUID();
+            delete machine.toolLockRevisions[expectedName];
           }
         } else {
           delete machine.toolLocks[expectedName];
@@ -565,18 +1202,26 @@ class ApiStore implements AccountsStore {
   }
 
   async addProfile(opts: AddOptions): Promise<Profile> {
+    return (await this.createProfile(opts, false)).profile;
+  }
+
+  async addProfileForLogin(opts: AddOptions): Promise<LoginCreatedProfile> {
+    return this.createProfile(opts, true);
+  }
+
+  private async createProfile(opts: AddOptions, forLogin: boolean): Promise<LoginCreatedProfile> {
     assertProfileName(opts.name);
     const toolId = opts.tool ?? DEFAULT_TOOL;
-    const authExpectation = toolId === "claude"
-      ? captureMachineProfileAuthSlotExpectation(toolId, opts.name)
-      : undefined;
     const tool = await this.resolveTool(toolId);
     const managed = opts.dir === undefined;
     const dir = managed ? join(profilesDir(), toolId, opts.name) : validatedDirectoryPath(opts.dir!);
-    const created = prepareProfileDirectory(dir, managed);
-    const email = opts.email ?? detectEmail(dir, tool) ?? undefined;
-    try {
-      const profile = await this.api.create({
+    return withProfileDirectoryLease(dir, async () => {
+      const authExpectation = toolId === "claude"
+        ? captureMachineProfileAuthSlotExpectation(toolId, opts.name)
+        : undefined;
+      const createdProfileDir = prepareProfileDirectory(dir, managed);
+      const email = opts.email ?? detectEmail(dir, tool) ?? undefined;
+      const input = {
         name: opts.name,
         tool: toolId,
         email,
@@ -586,13 +1231,43 @@ class ApiStore implements AccountsStore {
         metadata: opts.metadata,
         dir,
         description: opts.description,
-      });
-      if (authExpectation) reconcileMachineProfileCreate(profile, authExpectation);
-      return profile;
-    } catch (error) {
-      if (created) rmSync(dir, { recursive: true, force: true });
-      throw error;
-    }
+      };
+      const expectedIncarnationId = forLogin ? randomUUID() : undefined;
+      try {
+        if (forLogin && !this.api.createForLogin) {
+          throw new AccountsError(
+            "the configured Accounts API store does not support transactional login profile creation",
+          );
+        }
+        const profile = forLogin
+          ? await this.api.createForLogin!(input, expectedIncarnationId!)
+          : await this.api.create(input);
+        if (forLogin && profile.incarnationId !== expectedIncarnationId) {
+          throw new AccountsError(
+            "the Accounts API returned a different login profile incarnation than the requested rollback fence",
+          );
+        }
+        if (authExpectation) reconcileMachineProfileCreate(profile, authExpectation);
+        return { profile, createdProfileDir };
+      } catch (error) {
+        if (forLogin && expectedIncarnationId) {
+          try {
+            const committed = await this.api.get(opts.name, toolId);
+            if (committed?.incarnationId === expectedIncarnationId) {
+              if (authExpectation) reconcileMachineProfileCreate(committed, authExpectation);
+              return { profile: committed, createdProfileDir };
+            }
+            if (!committed && createdProfileDir) rmSync(dir, { recursive: true, force: true });
+          } catch {
+            // Ambiguous response loss must retain the directory: a committed
+            // server profile may already own it.
+          }
+        } else if (createdProfileDir) {
+          rmSync(dir, { recursive: true, force: true });
+        }
+        throw error;
+      }
+    });
   }
 
   async updateProfile(name: string, opts: UpdateOptions): Promise<Profile> {
@@ -640,6 +1315,110 @@ class ApiStore implements AccountsStore {
     return { profile, purged: false, ...(purgeNote ? { purgeNote } : {}) };
   }
 
+  async assertCreatedProfileCleanup(): Promise<void> {
+    if (!this.api.assertLoginProfileCleanup || !this.api.createForLogin) {
+      throw new AccountsError(
+        "the configured Accounts API store does not support conditional login-created profile cleanup; " +
+        "upgrade accounts-serve before running accounts login",
+      );
+    }
+    await this.api.assertLoginProfileCleanup();
+  }
+
+  async reconcileInterruptedLoginCleanup(name: string, tool: string): Promise<void> {
+    const dir = managedProfileDirectory(name, tool);
+    if (!existsSync(loginCleanupMarkerPath(dir))) return;
+    const marker = parseLoginCleanupMarker(dir)!;
+    if (marker.profile.name !== name || marker.profile.tool !== tool) {
+      throw new AccountsError("interrupted login cleanup marker does not match its managed directory");
+    }
+    const resumed = await this.removeProfileIncarnation(
+      marker.profile,
+      marker.ownership,
+      { tool, purge: true },
+    );
+    if (resumed?.purged) return;
+    return withProfileDirectoryLease(dir, async () => {
+      const current = await this.api.get(name, tool);
+      reconcileInterruptedLoginDirectory(dir, name, tool, current);
+    });
+  }
+
+  async removeProfileIncarnation(
+    profile: Profile,
+    ownership: CreatedProfileRollbackOwnership,
+    opts: RemoveOptions = {},
+  ): Promise<RemoveResult | undefined> {
+    if (!profile.incarnationId || !this.api.removeCreatedProfile) return undefined;
+    return withProfileDirectoryLease(profile.dir, async () => {
+      const expectation = withStoreLock(() => {
+        if (!ownsCreatedProfileMachineState(profile, ownership)) return undefined;
+        return captureMachineProfileReconcileExpectation(profile);
+      });
+      if (!expectation) return undefined;
+      const cleanupOperationId = ownership.cleanupOperationId ?? randomUUID();
+      const journaled = Boolean(
+        opts.purge && writeLoginCleanupMarker(profile, ownership, cleanupOperationId),
+      );
+      let removed: boolean;
+      try {
+        removed = await this.api.removeCreatedProfile!(profile, cleanupOperationId);
+      } catch (error) {
+        try {
+          const current = await this.api.get(profile.name, profile.tool);
+          if (
+            current &&
+            (!current.incarnationId || current.incarnationId === profile.incarnationId)
+          ) {
+            throw error;
+          }
+          removed = true;
+        } catch (reconcileError) {
+          if (reconcileError === error) throw error;
+          throw error;
+        }
+      }
+      if (!removed) {
+        const current = await this.api.get(profile.name, profile.tool);
+        if (current) {
+          if (journaled) clearLoginCleanupMarker(profile.dir, cleanupOperationId);
+          return undefined;
+        }
+        // A concurrent exact deletion already removed the registry row. The
+        // operation still owns its local managed directory unless machine
+        // state changed while the conditional request was in flight.
+        removed = true;
+      }
+      return withStoreLock(() => {
+        const currentExpectation = captureMachineProfileReconcileExpectation(profile);
+        if (
+          !ownsCreatedProfileMachineState(profile, ownership) ||
+          !isDeepStrictEqual(currentExpectation, expectation)
+        ) {
+          return { profile, purged: false };
+        }
+        reconcileMachineProfileRemove(
+          profile.tool,
+          profile.name,
+          profileAuthIncarnation(profile),
+          expectation,
+        );
+        let purged = false;
+        if (
+          opts.purge &&
+          resolve(profile.dir) === resolve(join(profilesDir(), profile.tool, profile.name)) &&
+          existsSync(profile.dir)
+        ) {
+          assertManagedDirectory(profile.dir);
+          rmSync(profile.dir, { recursive: true, force: true });
+          purged = true;
+        }
+        if (journaled && !purged) clearLoginCleanupMarker(profile.dir, cleanupOperationId);
+        return { profile, purged };
+      });
+    });
+  }
+
   async redetectEmail(name: string, tool?: string, expectedProfile?: Profile): Promise<Profile> {
     const profile = await this.resolve(name, tool);
     if (expectedProfile?.incarnationId && profile.incarnationId !== expectedProfile.incarnationId) {
@@ -659,7 +1438,7 @@ class ApiStore implements AccountsStore {
         profile.tool,
         email,
         expectedProfile.incarnationId,
-        expectedProfile.email,
+        expectedProfile.email ?? null,
       );
     }
     return this.api.update(name, profile.tool, { email });

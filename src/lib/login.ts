@@ -2,6 +2,7 @@ import { accessSync, constants, existsSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { delimiter, isAbsolute, join, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { createInterface, type Interface } from "node:readline";
 import type { Profile } from "../types.js";
 import { AccountsError } from "../types.js";
@@ -32,7 +33,7 @@ import {
   type CurrentEntry,
   type ProfileRollbackFields,
 } from "./store.js";
-import { getTool, mergeToolArgs } from "./tools.js";
+import { mergeToolArgs } from "./tools.js";
 import type { ToolDef } from "../types.js";
 import {
   accountsHome,
@@ -121,6 +122,8 @@ export interface LoginPreparationReady {
   created: boolean;
   createdProfileDir: boolean;
   previousToolLock?: string;
+  previousToolLockRevision?: string;
+  previousToolLockProfileIncarnation?: string;
   toolLockRevision?: string;
 }
 
@@ -132,6 +135,8 @@ export interface LoginPreparationStopped {
   created: boolean;
   createdProfileDir: boolean;
   previousToolLock?: string;
+  previousToolLockRevision?: string;
+  previousToolLockProfileIncarnation?: string;
   toolLockRevision?: string;
 }
 
@@ -374,14 +379,31 @@ interface PreparedProfile {
   created: boolean;
   createdProfileDir: boolean;
   previousToolLock?: string;
+  previousToolLockRevision?: string;
+  previousToolLockProfileIncarnation?: string;
   toolLockRevision?: string;
 }
 
 async function existingOrCreateProfile(name: string, tool: ToolDef, store: AccountsStore): Promise<PreparedProfile> {
-  const existing = await store.findProfile(name, tool.id);
+  await store.reconcileInterruptedLoginCleanup?.(name, tool.id);
+  let existing = await store.findProfile(name, tool.id);
+  if (existing && store.upgradeProfileIncarnationForLogin) {
+    existing = await store.upgradeProfileIncarnationForLogin(existing);
+  } else if (!existing) {
+    await store.assertCreatedProfileCleanup?.();
+  }
   const managedDir = managedProfileDir(name, tool.id);
-  const createdProfileDir = !existing && !existsSync(managedDir);
-  const profile = existing ?? (await store.addProfile({ name, tool: tool.id, description: "created for login" }));
+  const fallbackCreatedProfileDir = !existing && !existsSync(managedDir);
+  const createdProfile = existing
+    ? undefined
+    : store.addProfileForLogin
+      ? await store.addProfileForLogin({ name, tool: tool.id, description: "created for login" })
+      : {
+          profile: await store.addProfile({ name, tool: tool.id, description: "created for login" }),
+          createdProfileDir: fallbackCreatedProfileDir,
+        };
+  const profile = existing ?? createdProfile!.profile;
+  const createdProfileDir = createdProfile?.createdProfileDir ?? false;
   // The tool lock is a machine-local disambiguation for bare commands; only the
   // LocalStore keeps it. In api mode the shared registry (+ explicit --tool)
   // resolves the profile, so there is no local lock to write.
@@ -393,6 +415,12 @@ async function existingOrCreateProfile(name: string, tool: ToolDef, store: Accou
     created: !existing,
     createdProfileDir,
     ...(toolLockClaim?.previousTool ? { previousToolLock: toolLockClaim.previousTool } : {}),
+    ...(toolLockClaim?.previousRevision
+      ? { previousToolLockRevision: toolLockClaim.previousRevision }
+      : {}),
+    ...(toolLockClaim?.previousProfileIncarnation
+      ? { previousToolLockProfileIncarnation: toolLockClaim.previousProfileIncarnation }
+      : {}),
     ...(toolLockClaim ? { toolLockRevision: toolLockClaim.revision } : {}),
   };
 }
@@ -473,27 +501,43 @@ export async function rollbackLoginPreparation(
   expectedProfileAuthIdentity?: string,
   expectedProfileAuthCommitRevision?: string,
 ): Promise<void> {
+  let removed = false;
   try {
     if (
       preparation.created &&
-      expectedProfileAuthIdentity &&
-      expectedProfileAuthCommitRevision &&
       store.removeProfileIncarnation
     ) {
-      await store.removeProfileIncarnation(
+      removed = Boolean(await store.removeProfileIncarnation(
         preparation.profile,
-        expectedProfileAuthIdentity,
-        expectedProfileAuthCommitRevision,
-        preparation.toolLockRevision,
+        {
+          ...(preparation.toolLockRevision
+            ? { toolLockRevision: preparation.toolLockRevision }
+            : {}),
+          ...(preparation.previousToolLock
+            ? { previousToolLock: preparation.previousToolLock }
+            : {}),
+          ...(preparation.previousToolLockRevision
+            ? { previousToolLockRevision: preparation.previousToolLockRevision }
+            : {}),
+          ...(preparation.previousToolLockProfileIncarnation
+            ? { previousToolLockProfileIncarnation: preparation.previousToolLockProfileIncarnation }
+            : {}),
+          ...(expectedProfileAuthIdentity
+            ? { authIdentity: expectedProfileAuthIdentity }
+            : {}),
+          ...(expectedProfileAuthCommitRevision
+            ? { authCommitRevision: expectedProfileAuthCommitRevision }
+            : {}),
+        },
         { tool: preparation.tool.id, purge: preparation.createdProfileDir },
-      );
+      ));
     }
   } finally {
-    if (store.transport === "local") {
+    if (store.transport === "local" && !removed) {
       const currentIncarnation = (await store.listProfiles(preparation.tool.id)).find(
         (profile) =>
-          profile.createdAt === preparation.profile.createdAt &&
-          resolve(profile.dir) === resolve(preparation.profile.dir),
+          profile.name === preparation.profile.name &&
+          profile.incarnationId === preparation.profile.incarnationId,
       );
       if (currentIncarnation) {
         if (preparation.toolLockRevision) {
@@ -501,11 +545,32 @@ export async function rollbackLoginPreparation(
             currentIncarnation.name,
             preparation.toolLockRevision,
             preparation.previousToolLock,
+            preparation.previousToolLockRevision ?? null,
+            preparation.previousToolLockProfileIncarnation,
           );
         }
       }
     }
   }
+}
+
+async function resolveUnchangedLoginTool(
+  captured: ToolDef,
+  store: AccountsStore,
+  required: boolean,
+): Promise<ToolDef | undefined> {
+  try {
+    const current = await store.resolveTool(captured.id);
+    if (isDeepStrictEqual(current, captured)) return current;
+  } catch {
+    // Removal and API tombstones are handled identically to redefinition.
+  }
+  if (required) {
+    throw new AccountsError(
+      `tool definition changed or was removed during login for "${captured.id}"; refusing stale finalization`,
+    );
+  }
+  return undefined;
 }
 
 /** Capture state that Claude finalization may mutate after the login child exits. */
@@ -696,6 +761,8 @@ export async function rollbackLoginFinalization(
   state: LoginFinalizationState,
   store: AccountsStore = resolveStore(),
 ): Promise<void> {
+  const currentTool = await resolveUnchangedLoginTool(state.tool, store, false);
+  const toolSpecificRollbackAllowed = Boolean(currentTool);
   let firstError: unknown;
   const attempt = async (operation: () => void | Promise<void>) => {
     try {
@@ -751,7 +818,7 @@ export async function rollbackLoginFinalization(
     ...(state.profileClaude ? [state.profileClaude] : []),
   ];
   let currentAuthProfile: Profile | undefined;
-  if (state.tool.id === "claude") {
+  if (toolSpecificRollbackAllowed && state.tool.id === "claude") {
     try {
       currentAuthProfile = (await store.listProfiles(state.tool.id)).find(
         (profile) =>
@@ -762,7 +829,7 @@ export async function rollbackLoginFinalization(
       firstError ??= error;
     }
   }
-  if (state.writes.applyStarted) {
+  if (toolSpecificRollbackAllowed && state.writes.applyStarted) {
     await attempt(() => withApplyLockWait(() => withStoreLock(() => {
       const machine = loadMachineStore();
       const appliedNow = machine.applied[state.tool.id];
@@ -793,7 +860,7 @@ export async function rollbackLoginFinalization(
       }
       saveStore(machine);
     })));
-  } else if (profileAuthSnapshots.length > 0) {
+  } else if (toolSpecificRollbackAllowed && profileAuthSnapshots.length > 0) {
     await attempt(() => withApplyLockWait(() => withStoreLock(() => {
       const machine = loadMachineStore();
       // A removed/recreated or relocated profile is a different incarnation;
@@ -886,7 +953,9 @@ export async function finalizeLogin(
   ) {
     throw new AccountsError("profile changed while login finalization was in progress");
   }
-  const tool = getTool(profile.tool);
+  const tool = state
+    ? await resolveUnchangedLoginTool(state.tool, store, true) as ToolDef
+    : await store.resolveTool(profile.tool);
 
   if (tool.id === "claude") {
     ensureProfileAuthSnapshot(profile.dir, tool, { overwrite: true });

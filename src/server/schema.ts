@@ -57,6 +57,11 @@ export const createAccountSchema = z.object({
 });
 export type CreateAccountInput = z.infer<typeof createAccountSchema>;
 
+export const createLoginAccountSchema = createAccountSchema.extend({
+  expectedIncarnationId: z.string().uuid(),
+}).strict();
+export type CreateLoginAccountInput = z.infer<typeof createLoginAccountSchema>;
+
 export const updateAccountSchema = z
   .object({
     email: z.string().email().nullable().optional(),
@@ -92,6 +97,26 @@ export const loginUpdateAccountSchema = z.object({
   email: z.string().email(),
 }).strict();
 export type LoginUpdateAccountInput = z.infer<typeof loginUpdateAccountSchema>;
+
+const removeCreatedAccountFields = {
+  expectedIncarnationId: z.string().uuid(),
+  expectedCreatedAt: z.string().datetime(),
+  expectedEmail: z.string().email().nullable(),
+  expectedDisplayName: z.string().nullable(),
+  expectedIdentity: z.string().nullable(),
+  expectedCardLast4: z.string().regex(/^\d{4}$/).nullable(),
+  expectedMetadata: metadataSchema,
+  expectedDir: profileDirSchema.nullable(),
+  expectedDescription: z.string().nullable(),
+  expectedLastUsedAt: z.string().datetime().nullable(),
+};
+
+/** Response-loss-safe cleanup request used only on the new-only operation route. */
+export const removeCreatedAccountSchema = z.object({
+  cleanupOperationId: z.string().uuid(),
+  ...removeCreatedAccountFields,
+}).strict();
+export type RemoveCreatedAccountInput = z.infer<typeof removeCreatedAccountSchema>;
 
 export const setCurrentSchema = z.object({ name: profileNameSchema });
 export const setLoginCurrentSchema = z.object({

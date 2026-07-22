@@ -51,4 +51,23 @@ describe("accounts SDK", () => {
     expect(code).toContain('"expectedRevision": string');
     expect(code).toContain('"expectedOperationId": string');
   });
+
+  test("legacy Account responses keep incarnationId additive for old-server/new-client reads", () => {
+    const schemas = buildOpenApiDoc("1.2.3").components.schemas;
+    expect(schemas.Account.required).toEqual(["tool", "name", "metadata", "createdAt"]);
+    expect(schemas.Account.properties.incarnationId).toMatchObject({ type: "string", format: "uuid" });
+    const { code } = renderSdk();
+    expect(code).toContain('"incarnationId"?: string');
+  });
+
+  test("generated login update accepts a no-email account with expectedEmail null", () => {
+    const schemas = buildOpenApiDoc("1.2.3").components.schemas;
+    expect(schemas.LoginUpdateAccountInput.properties.expectedEmail).toEqual({
+      type: "string",
+      format: "email",
+      nullable: true,
+    });
+    const { code } = renderSdk();
+    expect(code).toContain('"expectedEmail": string | null');
+  });
 });

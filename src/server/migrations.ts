@@ -28,6 +28,7 @@ export const APP_MIGRATION_FILES = [
   "0007_login_operation_rollback_state.sql",
   "0008_account_incarnations.sql",
   "0009_login_operation_target_incarnation.sql",
+  "0010_login_cleanup_operations.sql",
 ] as const;
 
 function moduleDir(): string {

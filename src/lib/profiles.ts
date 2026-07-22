@@ -142,6 +142,7 @@ export interface ProfileToolLockClaim {
   revision: string;
   previousTool?: string;
   previousRevision?: string;
+  previousProfileIncarnation?: string;
 }
 
 /** Claim a profile-name tool lock and capture the displaced lock atomically. */
@@ -156,6 +157,9 @@ export function claimProfileToolLock(name: string, toolId: string): ProfileToolL
     }
     const previousTool = store.toolLocks[name];
     const previousRevision = store.toolLockRevisions[name];
+    const previousProfile = previousTool
+      ? store.profiles.find((profile) => profile.name === name && profile.tool === previousTool)
+      : undefined;
     const revision = randomUUID();
     store.toolLocks[name] = toolId;
     store.toolLockRevisions[name] = revision;
@@ -164,6 +168,9 @@ export function claimProfileToolLock(name: string, toolId: string): ProfileToolL
       revision,
       ...(previousTool ? { previousTool } : {}),
       ...(previousRevision ? { previousRevision } : {}),
+      ...(previousProfile
+        ? { previousProfileIncarnation: profileAuthIncarnation(previousProfile) }
+        : {}),
     };
   });
 }
@@ -173,7 +180,13 @@ export function lockProfileTool(name: string, toolId: string): string {
 }
 
 /** Restore a profile-name tool lock only while the failed preparation owns it. */
-export function restoreProfileToolLock(name: string, expectedRevision: string, toolId?: string): boolean {
+export function restoreProfileToolLock(
+  name: string,
+  expectedRevision: string,
+  toolId?: string,
+  restoreRevision?: string | null,
+  expectedProfileIncarnation?: string,
+): boolean {
   const nameCheck = profileNameSchema.safeParse(name);
   if (!nameCheck.success) throw new AccountsError(nameCheck.error.issues[0]?.message ?? "invalid profile name");
   return withStoreLock(() => {
@@ -181,11 +194,20 @@ export function restoreProfileToolLock(name: string, expectedRevision: string, t
     if (store.toolLockRevisions[name] !== expectedRevision) return false;
     if (toolId) {
       getTool(toolId);
-      if (!store.profiles.some((profile) => profile.name === name && profile.tool === toolId)) {
+      const profile = store.profiles.find((candidate) => candidate.name === name && candidate.tool === toolId);
+      if (!profile) {
         throw new AccountsError(`no profile named "${name}" for tool "${toolId}"`);
       }
+      if (
+        expectedProfileIncarnation &&
+        profileAuthIncarnation(profile) !== expectedProfileIncarnation
+      ) {
+        return false;
+      }
       store.toolLocks[name] = toolId;
-      store.toolLockRevisions[name] = randomUUID();
+      if (restoreRevision === undefined) store.toolLockRevisions[name] = randomUUID();
+      else if (restoreRevision === null) delete store.toolLockRevisions[name];
+      else store.toolLockRevisions[name] = restoreRevision;
     } else {
       delete store.toolLocks[name];
       delete store.toolLockRevisions[name];

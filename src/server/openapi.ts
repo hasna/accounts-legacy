@@ -75,7 +75,7 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
         },
         Account: {
           type: "object",
-          required: ["tool", "name", "metadata", "createdAt", "incarnationId"],
+          required: ["tool", "name", "metadata", "createdAt"],
           properties: {
             tool: { type: "string" },
             name: { type: "string" },
@@ -113,6 +113,23 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
             description: { type: "string" },
           },
         },
+        CreateLoginAccountInput: {
+          type: "object",
+          required: ["name", "tool", "expectedIncarnationId"],
+          properties: {
+            name: { type: "string" },
+            tool: { type: "string" },
+            email: { type: "string" },
+            displayName: { type: "string" },
+            identity: { type: "string" },
+            cardLast4: { type: "string" },
+            metadata: { type: "object", additionalProperties: true },
+            dir: { type: "string" },
+            description: { type: "string" },
+            expectedIncarnationId: { type: "string", format: "uuid" },
+          },
+          additionalProperties: false,
+        },
         UpdateAccountInput: {
           type: "object",
           properties: {
@@ -148,10 +165,45 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
           required: ["expectedIncarnationId", "expectedEmail", "email"],
           properties: {
             expectedIncarnationId: { type: "string", format: "uuid" },
-            expectedEmail: { type: ["string", "null"], format: "email" },
+            expectedEmail: { type: "string", format: "email", nullable: true },
             email: { type: "string", format: "email" },
           },
           additionalProperties: false,
+        },
+        RemoveCreatedAccountInput: {
+          type: "object",
+          required: [
+            "cleanupOperationId",
+            "expectedIncarnationId",
+            "expectedCreatedAt",
+            "expectedEmail",
+            "expectedDisplayName",
+            "expectedIdentity",
+            "expectedCardLast4",
+            "expectedMetadata",
+            "expectedDir",
+            "expectedDescription",
+            "expectedLastUsedAt",
+          ],
+          properties: {
+            cleanupOperationId: { type: "string", format: "uuid" },
+            expectedIncarnationId: { type: "string", format: "uuid" },
+            expectedCreatedAt: { type: "string", format: "date-time" },
+            expectedEmail: { type: "string", format: "email", nullable: true },
+            expectedDisplayName: { type: "string", nullable: true },
+            expectedIdentity: { type: "string", nullable: true },
+            expectedCardLast4: { type: "string", nullable: true },
+            expectedMetadata: { type: "object", additionalProperties: true },
+            expectedDir: { type: "string", nullable: true },
+            expectedDescription: { type: "string", nullable: true },
+            expectedLastUsedAt: { type: "string", format: "date-time", nullable: true },
+          },
+          additionalProperties: false,
+        },
+        RemoveCreatedAccountResult: {
+          type: "object",
+          required: ["removed"],
+          properties: { removed: { type: "boolean" } },
         },
         CurrentSelection: {
           type: "object",
@@ -172,6 +224,7 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
           properties: {
             current: { type: "array", items: ref("CurrentSelection") },
             transactionalLoginRollback: { type: "boolean", enum: [true] },
+            transactionalLoginProfileCleanup: { type: "boolean", enum: [true] },
           },
         },
         SetCurrentInput: {
@@ -344,6 +397,19 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
           },
         },
       },
+      "/v1/accounts/login/create": {
+        post: {
+          operationId: "createLoginAccount",
+          summary: "Idempotently create an account for transactional login",
+          security: [{ apiKey: [] }],
+          requestBody: jsonBody(ref("CreateLoginAccountInput")),
+          responses: {
+            "201": jsonResponse("Created or replayed login account", ref("Account")),
+            "409": jsonResponse("Already exists with different ownership", ref("ErrorResponse")),
+            ...errorResponses,
+          },
+        },
+      },
       "/v1/accounts/{tool}/{name}": {
         get: {
           operationId: "getAccount",
@@ -438,6 +504,22 @@ export function buildOpenApiDoc(version: string): OpenApiDoc {
             "200": jsonResponse("Updated exact account incarnation", ref("Account")),
             "404": jsonResponse("Not found", ref("ErrorResponse")),
             "409": jsonResponse("Account incarnation changed", ref("ErrorResponse")),
+            ...errorResponses,
+          },
+        },
+      },
+      "/v1/accounts/{tool}/{name}/login/remove-created-operation": {
+        post: {
+          operationId: "removeLoginCreatedAccount",
+          summary: "Idempotently remove an unchanged account created for a failed login",
+          security: [{ apiKey: [] }],
+          parameters: [
+            { name: "tool", in: "path", required: true, schema: { type: "string" } },
+            { name: "name", in: "path", required: true, schema: { type: "string" } },
+          ],
+          requestBody: jsonBody(ref("RemoveCreatedAccountInput")),
+          responses: {
+            "200": jsonResponse("Conditional cleanup result", ref("RemoveCreatedAccountResult")),
             ...errorResponses,
           },
         },

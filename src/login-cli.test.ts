@@ -1434,10 +1434,9 @@ test("failed login restores a pre-existing tool lock for the same profile name",
     profileAuthRevisions: before.profileAuthRevisions,
     profileAuthCommitRevisions: before.profileAuthCommitRevisions,
     profileAuthIncarnations: before.profileAuthIncarnations,
-    toolLockRevisions: before.toolLockRevisions,
   }).toEqual(before);
   expect(after.toolLocks?.shared).toBe("codex");
-  expect(after.toolLockRevisions?.shared).not.toBe(before.toolLockRevisions?.shared);
+  expect(after.toolLockRevisions?.shared).toBe(before.toolLockRevisions?.shared);
   expect(after.current?.codex).toBe("shared");
   expect(after.current?.claude).toBeUndefined();
 });

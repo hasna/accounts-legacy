@@ -18,7 +18,9 @@ import { AccountsRepo, type AccountsStore } from "./repo.js";
 import { accountsMigrations, readMigrationStatus } from "./migrations.js";
 import {
   createAccountSchema,
+  createLoginAccountSchema,
   loginUpdateAccountSchema,
+  removeCreatedAccountSchema,
   restoreAccountSchema,
   setLoginCurrentSchema,
   updateAccountSchema,
@@ -206,6 +208,19 @@ export function createHandler(ctx: ServiceContext): (req: Request) => Promise<Re
         return json(created, 201);
       }
 
+      // New-only route: mixed-rollout old replicas 404 before creating an
+      // account that lacks the client-owned rollback incarnation fence.
+      if (pathname === "/v1/accounts/login/create" && method === "POST") {
+        const denied = await authorize(req, url, SCOPES.write);
+        if (denied) return denied;
+        const parsedBody = await parseJson(req);
+        if (!parsedBody.ok) return parsedBody.res;
+        const input = createLoginAccountSchema.safeParse(parsedBody.value);
+        if (!input.success) return json(errorBody(zodMessage(input.error)), 400);
+        const created = await ctx.repo.createForLogin(input.data);
+        return json(created, 201);
+      }
+
       const renameMatch = pathname.match(/^\/v1\/accounts\/([^/]+)\/([^/]+)\/rename$/);
       if (renameMatch && method === "POST") {
         const denied = await authorize(req, url, SCOPES.write);
@@ -251,6 +266,22 @@ export function createHandler(ctx: ServiceContext): (req: Request) => Promise<Re
         return json(updated, 200);
       }
 
+      const removeCreatedOperationMatch = pathname.match(
+        /^\/v1\/accounts\/([^/]+)\/([^/]+)\/login\/remove-created-operation$/,
+      );
+      if (removeCreatedOperationMatch && method === "POST") {
+        const denied = await authorize(req, url, SCOPES.write);
+        if (denied) return denied;
+        const parsedBody = await parseJson(req);
+        if (!parsedBody.ok) return parsedBody.res;
+        const input = removeCreatedAccountSchema.safeParse(parsedBody.value);
+        if (!input.success) return json(errorBody(zodMessage(input.error)), 400);
+        const tool = decodeURIComponent(removeCreatedOperationMatch[1]!);
+        const name = decodeURIComponent(removeCreatedOperationMatch[2]!);
+        const removed = await ctx.repo.removeCreated(tool, name, input.data);
+        return json({ removed }, 200);
+      }
+
       const accountMatch = pathname.match(/^\/v1\/accounts\/([^/]+)\/([^/]+)$/);
       if (accountMatch) {
         const tool = decodeURIComponent(accountMatch[1]!);
@@ -285,7 +316,11 @@ export function createHandler(ctx: ServiceContext): (req: Request) => Promise<Re
         const denied = await authorize(req, url, SCOPES.read);
         if (denied) return denied;
         const current = await ctx.repo.listCurrent();
-        return json({ current, transactionalLoginRollback: true }, 200);
+        return json({
+          current,
+          transactionalLoginRollback: true,
+          transactionalLoginProfileCleanup: true,
+        }, 200);
       }
 
       const currentRestoreMatch = pathname.match(/^\/v1\/current\/([^/]+)\/restore$/);

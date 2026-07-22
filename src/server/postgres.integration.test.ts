@@ -178,7 +178,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
     await adminPool?.end();
   });
 
-  test("migrations 0003 through 0009 upgrade existing data and are restart-idempotent", async () => {
+  test("migrations 0003 through 0010 upgrade existing data and are restart-idempotent", async () => {
     const appMigrations = accountsMigrations().filter((migration) =>
       migration.id.startsWith("accounts_"),
     );
@@ -262,6 +262,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       "accounts_0007_login_operation_rollback_state",
       "accounts_0008_account_incarnations",
       "accounts_0009_login_operation_target_incarnation",
+      "accounts_0010_login_cleanup_operations",
     ]);
     expect(pendingRollbackState.checksumMismatches).toEqual([]);
     const upgraded = await new MigrationLedger(client, appMigrations).migrate();
@@ -277,11 +278,21 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       )?.state,
     ).toBe("pending");
     expect(
+      upgraded.plan.find(
+        (item) => item.migration.id === "accounts_0010_login_cleanup_operations",
+      )?.state,
+    ).toBe("pending");
+    expect(
       await client.get<{ present: boolean }>(
         "SELECT incarnation_id IS NOT NULL AS present FROM accounts WHERE tool = $1 AND name = $2",
         ["migration-probe", "valid"],
       ),
     ).toEqual({ present: true });
+    expect(
+      await client.get<{ table_name: string | null }>(
+        "SELECT to_regclass('account_login_cleanup_operations')::text AS table_name",
+      ),
+    ).toEqual({ table_name: "account_login_cleanup_operations" });
     expect(
       await client.get<{ present: boolean }>(
         `SELECT EXISTS (
@@ -340,6 +351,10 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       login_operation_insert: boolean;
       login_operation_update: boolean;
       login_operation_delete: boolean;
+      cleanup_operation_select: boolean;
+      cleanup_operation_insert: boolean;
+      cleanup_operation_update: boolean;
+      cleanup_operation_delete: boolean;
       tombstone_select: boolean;
       tombstone_insert: boolean;
       tombstone_delete: boolean;
@@ -356,6 +371,10 @@ describePostgres("PostgreSQL migration and repository integration", () => {
               has_table_privilege(current_user, 'current_login_operations', 'INSERT') AS login_operation_insert,
               has_table_privilege(current_user, 'current_login_operations', 'UPDATE') AS login_operation_update,
               has_table_privilege(current_user, 'current_login_operations', 'DELETE') AS login_operation_delete,
+              has_table_privilege(current_user, 'account_login_cleanup_operations', 'SELECT') AS cleanup_operation_select,
+              has_table_privilege(current_user, 'account_login_cleanup_operations', 'INSERT') AS cleanup_operation_insert,
+              has_table_privilege(current_user, 'account_login_cleanup_operations', 'UPDATE') AS cleanup_operation_update,
+              has_table_privilege(current_user, 'account_login_cleanup_operations', 'DELETE') AS cleanup_operation_delete,
               has_table_privilege(current_user, 'custom_tool_tombstones', 'SELECT') AS tombstone_select,
               has_table_privilege(current_user, 'custom_tool_tombstones', 'INSERT') AS tombstone_insert,
               has_table_privilege(current_user, 'custom_tool_tombstones', 'DELETE') AS tombstone_delete,
@@ -373,6 +392,10 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       login_operation_insert: true,
       login_operation_update: false,
       login_operation_delete: false,
+      cleanup_operation_select: true,
+      cleanup_operation_insert: true,
+      cleanup_operation_update: false,
+      cleanup_operation_delete: false,
       tombstone_select: true,
       tombstone_insert: true,
       tombstone_delete: true,
@@ -453,12 +476,22 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       defaultDir: "/tmp/runtime-role",
       bin: "runtime-role",
     });
-    await repo.create({ tool: "runtime-role-tool", name: "profile" });
+    const profile = await repo.create({ tool: "runtime-role-tool", name: "profile" });
     await appClient.execute("CREATE TEMP SEQUENCE current_selection_revision_seq START 777777777");
     const operationId = "11111111-1111-4111-8111-111111111111";
-    const activated = await repo.setCurrentForLogin("runtime-role-tool", "profile", operationId);
+    const activated = await repo.setCurrentForLogin(
+      "runtime-role-tool",
+      "profile",
+      operationId,
+      profile.incarnationId,
+    );
     expect(activated.revision).not.toBe("777777777");
-    expect(await repo.setCurrentForLogin("runtime-role-tool", "profile", operationId)).toEqual(activated);
+    expect(await repo.setCurrentForLogin(
+      "runtime-role-tool",
+      "profile",
+      operationId,
+      profile.incarnationId,
+    )).toEqual(activated);
     expect((await repo.getCurrent("runtime-role-tool"))?.name).toBe("profile");
     expect(await repo.restoreCurrentOperation(
       "runtime-role-tool",
@@ -479,6 +512,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       "runtime-role-tool",
       "profile",
       cancelledOperationId,
+      profile.incarnationId,
     )).rejects.toThrow(/cancelled before activation/);
     expect(await repo.getCurrent("runtime-role-tool")).toBeNull();
     await repo.create({ tool: "runtime-role-tool", name: "newer" });
@@ -487,12 +521,14 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       "runtime-role-tool",
       "profile",
       responseLossOperationId,
+      profile.incarnationId,
     );
     await repo.setCurrent("runtime-role-tool", "newer");
     expect(await repo.setCurrentForLogin(
       "runtime-role-tool",
       "profile",
       responseLossOperationId,
+      profile.incarnationId,
     )).toEqual(responseLossActivation);
     expect((await repo.getCurrent("runtime-role-tool"))?.name).toBe("newer");
     expect(await repo.restoreCurrentOperation(
@@ -541,6 +577,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
       "accounts_0007_login_operation_rollback_state",
       "accounts_0008_account_incarnations",
       "accounts_0009_login_operation_target_incarnation",
+      "accounts_0010_login_cleanup_operations",
     ]);
     expect(() => assertMigrationStatusCompatible(legacyStatus)).toThrow(
       /not recognized by this build \(downgrade\?\)/,
@@ -678,7 +715,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
     const operationId = "44444444-4444-4444-8444-444444444444";
     await repo.create({ tool, name: prior });
     await repo.create({ tool, name: concurrent });
-    await repo.create({ tool, name: target });
+    const targetAccount = await repo.create({ tool, name: target });
     await repo.setCurrent(tool, prior);
 
     // These writes commit after the client captured `prior`, while its login
@@ -688,7 +725,7 @@ describePostgres("PostgreSQL migration and repository integration", () => {
     await repo.setCurrent(tool, concurrent);
     const targetBeforeActivation = (await repo.get(tool, target))?.lastUsedAt;
     expect(targetBeforeActivation).toBeDefined();
-    await repo.setCurrentForLogin(tool, target, operationId);
+    await repo.setCurrentForLogin(tool, target, operationId, targetAccount.incarnationId);
 
     expect(await repo.restoreCurrentOperation(tool, target, operationId, prior, null)).toBe(true);
     expect((await repo.getCurrent(tool))?.name).toBe(concurrent);

@@ -7,10 +7,13 @@
 // requires the account to exist and stamps last_used_at.
 
 import { AccountsError, type ToolDef, toolDefSchema } from "../types.js";
+import { isDeepStrictEqual } from "node:util";
 import type { PoolQueryClient, TypedQueryClient } from "../generated/storage-kit/index.js";
 import type {
   CreateAccountInput,
+  CreateLoginAccountInput,
   LoginUpdateAccountInput,
+  RemoveCreatedAccountInput,
   RestoreAccountInput,
   UpdateAccountInput,
 } from "./schema.js";
@@ -48,9 +51,11 @@ export interface AccountsStore {
   list(tool?: string): Promise<Account[]>;
   get(tool: string, name: string): Promise<Account | null>;
   create(input: CreateAccountInput): Promise<Account>;
+  createForLogin(input: CreateLoginAccountInput): Promise<Account>;
   update(tool: string, name: string, input: UpdateAccountInput): Promise<Account>;
   updateForLogin(tool: string, name: string, input: LoginUpdateAccountInput): Promise<Account>;
   restoreProfile(tool: string, name: string, input: RestoreAccountInput): Promise<Account>;
+  removeCreated(tool: string, name: string, input: RemoveCreatedAccountInput): Promise<boolean>;
   rename(tool: string, oldName: string, newName: string): Promise<Account>;
   remove(tool: string, name: string): Promise<boolean>;
   listCurrent(): Promise<CurrentSelection[]>;
@@ -60,7 +65,7 @@ export interface AccountsStore {
     tool: string,
     name: string,
     operationId: string,
-    expectedIncarnationId?: string,
+    expectedIncarnationId: string,
   ): Promise<LoginCurrentSelection>;
   restoreCurrent(
     tool: string,
@@ -231,6 +236,54 @@ export class AccountsRepo implements AccountsStore {
     });
   }
 
+  async createForLogin(input: CreateLoginAccountInput): Promise<Account> {
+    return this.client.transaction(async (client) => {
+      await this.lockToolRegistry(client, input.tool);
+      const removed = await client.get<{ id: string }>(
+        "SELECT id FROM custom_tool_tombstones WHERE id = $1",
+        [input.tool],
+      );
+      if (removed) {
+        throw new AccountsError(`custom tool "${input.tool}" was explicitly removed`);
+      }
+      const row = await client.get<AccountRow>(
+        `INSERT INTO accounts
+           (tool, name, email, display_name, identity, card_last4, metadata, dir, description, incarnation_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10::uuid)
+         ON CONFLICT (tool, name) DO NOTHING
+         RETURNING *`,
+        [
+          input.tool,
+          input.name,
+          input.email ?? null,
+          input.displayName ?? null,
+          input.identity ?? null,
+          input.cardLast4 ?? null,
+          JSON.stringify(input.metadata ?? {}),
+          input.dir ?? null,
+          input.description ?? null,
+          input.expectedIncarnationId,
+        ],
+      );
+      if (row) return rowToAccount(row);
+      const existing = await this.getWith(client, input.tool, input.name, { forUpdate: true });
+      if (
+        existing &&
+        existing.incarnationId === input.expectedIncarnationId &&
+        (existing.email ?? null) === (input.email ?? null) &&
+        (existing.displayName ?? null) === (input.displayName ?? null) &&
+        (existing.identity ?? null) === (input.identity ?? null) &&
+        (existing.cardLast4 ?? null) === (input.cardLast4 ?? null) &&
+        isDeepStrictEqual(existing.metadata, input.metadata ?? {}) &&
+        (existing.dir ?? null) === (input.dir ?? null) &&
+        (existing.description ?? null) === (input.description ?? null)
+      ) {
+        return existing;
+      }
+      throw new AccountsError(`a ${input.tool} profile named "${input.name}" already exists`);
+    });
+  }
+
   async update(tool: string, name: string, input: UpdateAccountInput): Promise<Account> {
     const current = await this.get(tool, name);
     if (!current) throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
@@ -333,6 +386,99 @@ export class AccountsRepo implements AccountsStore {
     return current;
   }
 
+  async removeCreated(
+    tool: string,
+    name: string,
+    input: RemoveCreatedAccountInput,
+  ): Promise<boolean> {
+    return this.client.transaction(async (client) => {
+      await this.lockLoginOperation(client, input.cleanupOperationId);
+      const completed = await client.get<{
+        tool: string;
+        name: string;
+        target_incarnation_id: string;
+        removed: boolean;
+      }>(
+        `SELECT tool, name, target_incarnation_id, removed
+           FROM account_login_cleanup_operations
+          WHERE operation_id = $1`,
+        [input.cleanupOperationId],
+      );
+      if (completed) {
+        if (
+          completed.tool !== tool ||
+          completed.name !== name ||
+          completed.target_incarnation_id !== input.expectedIncarnationId
+        ) {
+          throw new AccountsError("login cleanup operation id is already bound to another profile");
+        }
+        return completed.removed;
+      }
+      const finish = async (removed: boolean): Promise<boolean> => {
+        await client.execute(
+          `INSERT INTO account_login_cleanup_operations
+             (operation_id, tool, name, target_incarnation_id, removed)
+           VALUES ($1::uuid, $2, $3, $4::uuid, $5)`,
+          [input.cleanupOperationId, tool, name, input.expectedIncarnationId, removed],
+        );
+        return removed;
+      };
+      const current = await this.getWith(client, tool, name, { forUpdate: true });
+      if (!current) return finish(false);
+      const unchanged =
+        current.incarnationId === input.expectedIncarnationId &&
+        current.createdAt === new Date(input.expectedCreatedAt).toISOString() &&
+        (current.email ?? null) === input.expectedEmail &&
+        (current.displayName ?? null) === input.expectedDisplayName &&
+        (current.identity ?? null) === input.expectedIdentity &&
+        (current.cardLast4 ?? null) === input.expectedCardLast4 &&
+        isDeepStrictEqual(current.metadata, input.expectedMetadata) &&
+        (current.dir ?? null) === input.expectedDir &&
+        (current.description ?? null) === input.expectedDescription &&
+        (current.lastUsedAt ?? null) === input.expectedLastUsedAt;
+      if (!unchanged) return finish(false);
+
+      const selected = await client.get<{ name: string }>(
+        `SELECT name
+           FROM current_selections
+          WHERE tool = $1
+          FOR UPDATE`,
+        [tool],
+      );
+      if (selected?.name === name) return finish(false);
+
+      const result = await client.query<AccountRow>(
+        `DELETE FROM accounts
+          WHERE tool = $1 AND name = $2 AND incarnation_id = $3::uuid
+            AND created_at IS NOT DISTINCT FROM $4::timestamptz
+            AND email IS NOT DISTINCT FROM $5
+            AND display_name IS NOT DISTINCT FROM $6
+            AND identity IS NOT DISTINCT FROM $7
+            AND card_last4 IS NOT DISTINCT FROM $8
+            AND metadata IS NOT DISTINCT FROM $9::jsonb
+            AND dir IS NOT DISTINCT FROM $10
+            AND description IS NOT DISTINCT FROM $11
+            AND last_used_at IS NOT DISTINCT FROM $12::timestamptz
+        RETURNING *`,
+        [
+          tool,
+          name,
+          input.expectedIncarnationId,
+          input.expectedCreatedAt,
+          input.expectedEmail,
+          input.expectedDisplayName,
+          input.expectedIdentity,
+          input.expectedCardLast4,
+          JSON.stringify(input.expectedMetadata),
+          input.expectedDir,
+          input.expectedDescription,
+          input.expectedLastUsedAt,
+        ],
+      );
+      return finish(result.rowCount === 1);
+    });
+  }
+
   async remove(tool: string, name: string): Promise<boolean> {
     return this.client.transaction(async (client) => {
       const existing = await this.getWith(client, tool, name, { forUpdate: true });
@@ -403,7 +549,7 @@ export class AccountsRepo implements AccountsStore {
     tool: string,
     name: string,
     operationId: string,
-    expectedIncarnationId?: string,
+    expectedIncarnationId: string,
   ): Promise<LoginCurrentSelection> {
     return this.client.transaction(async (client) => {
       // Serialize duplicate operation IDs independently of the mutable current
@@ -442,10 +588,7 @@ export class AccountsRepo implements AccountsStore {
         if (!completed.target_incarnation_id) {
           throw new AccountsError("completed login operation is missing its target incarnation");
         }
-        if (
-          expectedIncarnationId &&
-          completed.target_incarnation_id !== expectedIncarnationId
-        ) {
+        if (completed.target_incarnation_id !== expectedIncarnationId) {
           throw new AccountsError("login operation id is already bound to another profile incarnation");
         }
         const account = await this.getWith(client, tool, name, { forUpdate: true });
@@ -466,7 +609,7 @@ export class AccountsRepo implements AccountsStore {
       }
       const account = await this.getWith(client, tool, name, { forUpdate: true });
       if (!account) throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
-      if (expectedIncarnationId && account.incarnationId !== expectedIncarnationId) {
+      if (account.incarnationId !== expectedIncarnationId) {
         throw new AccountsError("profile changed while login activation was in progress");
       }
       const displaced = await client.get<{ name: string; incarnation_id: string }>(

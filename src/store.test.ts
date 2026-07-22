@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
+import { createHash } from "node:crypto";
 import { resolveStore, type AccountsStore } from "./lib/store.js";
 import { resolveSupervisorLaunch } from "./lib/supervisor.js";
 import { clearCustomToolsCache, getTool } from "./lib/tools.js";
@@ -170,6 +171,25 @@ describe("ApiStore routes registry ops to /v1", () => {
     await expect(store.getProfile("ghost", "claude")).rejects.toThrow(/no profile named "ghost"/);
   });
 
+  test("new client reads a legacy Account response without incarnation or email", async () => {
+    const { fetchImpl } = mockFetch(() => ({
+      status: 200,
+      body: {
+        tool: "claude",
+        name: "legacy",
+        metadata: {},
+        createdAt: "2020-01-01T00:00:00Z",
+      },
+    }));
+    const store = resolveStore(cloudEnv, { fetchImpl });
+
+    const profile = await store.getProfile("legacy", "claude");
+
+    expect(profile.name).toBe("legacy");
+    expect(profile.email).toBeUndefined();
+    expect(profile.incarnationId).toBeUndefined();
+  });
+
   test("currentProfile follows getCurrent then get", async () => {
     const { calls, fetchImpl } = mockFetch((c) => {
       if (c.url.endsWith("/current/claude")) {
@@ -329,7 +349,11 @@ describe("ApiStore routes registry ops to /v1", () => {
         if (c.method === "GET" && c.url.endsWith("/accounts/acme/work")) {
           return { status: 404, body: { error: "not found" } };
         }
-        if (c.method === "POST" && c.url.endsWith("/accounts")) {
+        if (c.method === "GET" && c.url.endsWith("/current")) {
+          return { status: 200, body: { current: [], transactionalLoginProfileCleanup: true } };
+        }
+        if (c.method === "POST" && c.url.endsWith("/accounts/login/create")) {
+          const incarnationId = String((c.body as { expectedIncarnationId?: string }).expectedIncarnationId);
           return {
             status: 201,
             body: {
@@ -337,6 +361,7 @@ describe("ApiStore routes registry ops to /v1", () => {
               name: "work",
               dir: join(home, "profiles", "acme", "work"),
               createdAt: "2020-01-01T00:00:00Z",
+              incarnationId,
             },
           };
         }
@@ -349,13 +374,99 @@ describe("ApiStore routes registry ops to /v1", () => {
       expect(calls[0]!.url).toBe(`${BASE}/v1/tools`);
     });
 
-    test("failed cloud login rollback leaves a created profile when the API cannot prove deletion ownership", async () => {
+    test("lost transactional create response recovers only the exact server incarnation", async () => {
+      const executableTool = { ...acme, bin: process.execPath };
+      let committed: Record<string, unknown> | undefined;
+      const { calls, fetchImpl } = mockFetch((call) => {
+        if (call.url.endsWith("/tools")) {
+          return { status: 200, body: { tools: [{ ...executableTool, builtin: false }] } };
+        }
+        if (call.method === "GET" && call.url.endsWith("/accounts/acme/response-loss")) {
+          return committed
+            ? { status: 200, body: committed }
+            : { status: 404, body: { error: "not found" } };
+        }
+        if (call.method === "GET" && call.url.endsWith("/current")) {
+          return { status: 200, body: { current: [], transactionalLoginProfileCleanup: true } };
+        }
+        if (call.method === "POST" && call.url.endsWith("/accounts/login/create")) {
+          const expectedIncarnationId = String(
+            (call.body as { expectedIncarnationId?: string }).expectedIncarnationId,
+          );
+          committed ??= {
+            tool: "acme",
+            name: "response-loss",
+            dir: join(home, "profiles", "acme", "response-loss"),
+            createdAt: "2020-01-01T00:00:00Z",
+            incarnationId: expectedIncarnationId,
+          };
+          throw new TypeError("simulated lost create response");
+        }
+        if (call.method === "POST" && call.url.endsWith("/accounts/acme/response-loss/login/remove-created-operation")) {
+          committed = undefined;
+          return { status: 200, body: { removed: true } };
+        }
+        return { status: 500, body: { error: "unexpected request" } };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+
+      const preparation = await prepareLogin("response-loss", {
+        toolId: "acme",
+        env: process.env,
+        store,
+      });
+      if (preparation.status !== "ready") throw new Error("expected ready login preparation");
+
+      expect(preparation.created).toBe(true);
+      expect(preparation.profile.incarnationId).toBe(committed?.incarnationId);
+      expect(calls.some((call) =>
+        call.method === "POST" && new URL(call.url).pathname === "/v1/accounts",
+      )).toBe(false);
+      await rollbackLoginPreparation(preparation, store);
+      expect(committed).toBeUndefined();
+      expect(existsSync(preparation.profile.dir)).toBe(false);
+    });
+
+    test("mixed-rollout login create fails closed without calling the legacy create route", async () => {
+      const executableTool = { ...acme, bin: process.execPath };
+      const managedDir = join(home, "profiles", "acme", "old-replica");
+      const { calls, fetchImpl } = mockFetch((call) => {
+        if (call.url.endsWith("/tools")) {
+          return { status: 200, body: { tools: [{ ...executableTool, builtin: false }] } };
+        }
+        if (call.method === "GET" && call.url.endsWith("/accounts/acme/old-replica")) {
+          return { status: 404, body: { error: "not found" } };
+        }
+        if (call.method === "GET" && call.url.endsWith("/current")) {
+          return { status: 200, body: { current: [], transactionalLoginProfileCleanup: true } };
+        }
+        if (call.method === "POST" && call.url.endsWith("/accounts/login/create")) {
+          return { status: 404, body: { error: "not found" } };
+        }
+        return { status: 500, body: { error: "unexpected request" } };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+
+      await expect(prepareLogin("old-replica", {
+        toolId: "acme",
+        env: process.env,
+        store,
+      })).rejects.toThrow(/transactional login profile creation/);
+
+      expect(calls.some((call) =>
+        call.method === "POST" && new URL(call.url).pathname === "/v1/accounts",
+      )).toBe(false);
+      expect(existsSync(managedDir)).toBe(false);
+    });
+
+    test("failed cloud login rollback conditionally removes the exact created profile and managed directory", async () => {
       const executableTool = { ...acme, bin: process.execPath };
       const profile = {
         tool: "acme",
         name: "failed",
         dir: join(home, "profiles", "acme", "failed"),
         createdAt: "2020-01-01T00:00:00Z",
+        incarnationId: "11111111-1111-4111-8111-111111111111",
       };
       let created = false;
       const { calls, fetchImpl } = mockFetch((call) => {
@@ -368,13 +479,19 @@ describe("ApiStore routes registry ops to /v1", () => {
         if (call.method === "GET" && call.url.endsWith("/accounts?tool=acme")) {
           return { status: 200, body: { accounts: created ? [profile] : [] } };
         }
-        if (call.method === "POST" && call.url.endsWith("/accounts")) {
+        if (call.method === "GET" && call.url.endsWith("/current")) {
+          return { status: 200, body: { current: [], transactionalLoginProfileCleanup: true } };
+        }
+        if (call.method === "POST" && call.url.endsWith("/accounts/login/create")) {
+          profile.incarnationId = String(
+            (call.body as { expectedIncarnationId?: string }).expectedIncarnationId,
+          );
           created = true;
           return { status: 201, body: profile };
         }
-        if (call.method === "DELETE" && call.url.endsWith("/accounts/acme/failed")) {
+        if (call.method === "POST" && call.url.endsWith("/accounts/acme/failed/login/remove-created-operation")) {
           created = false;
-          return { status: 204, body: {} };
+          return { status: 200, body: { removed: true } };
         }
         return { status: 500, body: { error: "unexpected request" } };
       });
@@ -386,9 +503,392 @@ describe("ApiStore routes registry ops to /v1", () => {
       expect(existsSync(profile.dir)).toBe(true);
       await rollbackLoginPreparation(prepared, store);
 
+      expect(created).toBe(false);
+      expect(existsSync(profile.dir)).toBe(false);
+      expect(calls.some((call) =>
+        call.method === "POST" && call.url.endsWith("/accounts/acme/failed/login/remove-created-operation"),
+      )).toBe(true);
+    });
+
+    test("failed cloud login cleans its directory after a concurrent exact profile deletion", async () => {
+      const executableTool = { ...acme, bin: process.execPath };
+      const profile = {
+        tool: "acme",
+        name: "deleted-before-cleanup",
+        dir: join(home, "profiles", "acme", "deleted-before-cleanup"),
+        createdAt: "2020-01-01T00:00:00Z",
+        incarnationId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      };
+      let created = false;
+      const { fetchImpl } = mockFetch((call) => {
+        if (call.url.endsWith("/tools")) {
+          return { status: 200, body: { tools: [{ ...executableTool, builtin: false }] } };
+        }
+        if (call.method === "GET" && call.url.endsWith("/accounts/acme/deleted-before-cleanup")) {
+          return created
+            ? { status: 200, body: profile }
+            : { status: 404, body: { error: "not found" } };
+        }
+        if (call.method === "GET" && call.url.endsWith("/current")) {
+          return { status: 200, body: { current: [], transactionalLoginProfileCleanup: true } };
+        }
+        if (call.method === "POST" && call.url.endsWith("/accounts/login/create")) {
+          profile.incarnationId = String(
+            (call.body as { expectedIncarnationId?: string }).expectedIncarnationId,
+          );
+          created = true;
+          return { status: 201, body: profile };
+        }
+        if (call.method === "POST" && call.url.endsWith("/accounts/acme/deleted-before-cleanup/login/remove-created-operation")) {
+          created = false;
+          return { status: 200, body: { removed: false } };
+        }
+        return { status: 500, body: { error: "unexpected request" } };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      const preparation = await prepareLogin("deleted-before-cleanup", {
+        toolId: "acme",
+        env: process.env,
+        store,
+      });
+      if (preparation.status !== "ready") throw new Error("expected ready login preparation");
+
+      await rollbackLoginPreparation(preparation, store);
+
+      expect(created).toBe(false);
+      expect(existsSync(profile.dir)).toBe(false);
+    });
+
+    test("terminal cleanup response loss reconciles the committed delete and removes the directory", async () => {
+      const executableTool = { ...acme, bin: process.execPath };
+      const profile = {
+        tool: "acme",
+        name: "cleanup-response-loss",
+        dir: join(home, "profiles", "acme", "cleanup-response-loss"),
+        createdAt: "2020-01-01T00:00:00Z",
+        incarnationId: "66666666-6666-4666-8666-666666666666",
+      };
+      let created = false;
+      let cleanupAttempts = 0;
+      const cleanupBodies: unknown[] = [];
+      const { fetchImpl } = mockFetch((call) => {
+        if (call.url.endsWith("/tools")) {
+          return { status: 200, body: { tools: [{ ...executableTool, builtin: false }] } };
+        }
+        if (call.method === "GET" && call.url.endsWith("/accounts/acme/cleanup-response-loss")) {
+          return created ? { status: 200, body: profile } : { status: 404, body: { error: "not found" } };
+        }
+        if (call.method === "GET" && call.url.endsWith("/current")) {
+          return { status: 200, body: { current: [], transactionalLoginProfileCleanup: true } };
+        }
+        if (call.method === "POST" && call.url.endsWith("/accounts/login/create")) {
+          profile.incarnationId = String(
+            (call.body as { expectedIncarnationId?: string }).expectedIncarnationId,
+          );
+          created = true;
+          return { status: 201, body: profile };
+        }
+        if (call.method === "POST" && call.url.endsWith("/accounts/acme/cleanup-response-loss/login/remove-created-operation")) {
+          cleanupAttempts += 1;
+          cleanupBodies.push(call.body);
+          created = false;
+          throw new TypeError("simulated lost cleanup response");
+        }
+        return { status: 500, body: { error: "unexpected request" } };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      const preparation = await prepareLogin("cleanup-response-loss", {
+        toolId: "acme",
+        env: process.env,
+        store,
+      });
+      if (preparation.status !== "ready") throw new Error("expected ready login preparation");
+
+      await rollbackLoginPreparation(preparation, store);
+
+      expect(cleanupAttempts).toBeGreaterThan(1);
+      expect(cleanupBodies.every((body) => JSON.stringify(body) === JSON.stringify(cleanupBodies[0]))).toBe(true);
+      expect(existsSync(profile.dir)).toBe(false);
+    });
+
+    test("cleanup response loss fails closed on a legacy replica response missing the rollback fence", async () => {
+      const executableTool = { ...acme, bin: process.execPath };
+      const profile = {
+        tool: "acme",
+        name: "cleanup-legacy-replica",
+        dir: join(home, "profiles", "acme", "cleanup-legacy-replica"),
+        createdAt: "2020-01-01T00:00:00Z",
+        incarnationId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      };
+      let created = false;
+      let cleanupStarted = false;
+      const { fetchImpl } = mockFetch((call) => {
+        if (call.url.endsWith("/tools")) {
+          return { status: 200, body: { tools: [{ ...executableTool, builtin: false }] } };
+        }
+        if (call.method === "GET" && call.url.endsWith("/accounts/acme/cleanup-legacy-replica")) {
+          if (!created) return { status: 404, body: { error: "not found" } };
+          return {
+            status: 200,
+            body: cleanupStarted
+              ? { ...profile, incarnationId: undefined }
+              : profile,
+          };
+        }
+        if (call.method === "GET" && call.url.endsWith("/current")) {
+          return { status: 200, body: { current: [], transactionalLoginProfileCleanup: true } };
+        }
+        if (call.method === "POST" && call.url.endsWith("/accounts/login/create")) {
+          profile.incarnationId = String(
+            (call.body as { expectedIncarnationId?: string }).expectedIncarnationId,
+          );
+          created = true;
+          return { status: 201, body: profile };
+        }
+        if (call.method === "POST" && call.url.endsWith("/accounts/acme/cleanup-legacy-replica/login/remove-created-operation")) {
+          cleanupStarted = true;
+          throw new TypeError("simulated lost cleanup response");
+        }
+        return { status: 500, body: { error: "unexpected request" } };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      const preparation = await prepareLogin("cleanup-legacy-replica", {
+        toolId: "acme",
+        env: process.env,
+        store,
+      });
+      if (preparation.status !== "ready") throw new Error("expected ready login preparation");
+
+      await expect(rollbackLoginPreparation(preparation, store)).rejects.toThrow(
+        /simulated lost cleanup response/,
+      );
+
       expect(created).toBe(true);
       expect(existsSync(profile.dir)).toBe(true);
-      expect(calls.some((call) => call.method === "DELETE" && call.url.endsWith("/accounts/acme/failed"))).toBe(false);
+    });
+
+    test("cloud login reconciles a journaled delete before recreating the same managed directory", async () => {
+      const executableTool = { ...acme, bin: process.execPath };
+      const dir = join(home, "profiles", "acme", "journal-recovery");
+      let profile: Record<string, unknown> | undefined;
+      let createCount = 0;
+      const { fetchImpl } = mockFetch((call) => {
+        if (call.url.endsWith("/tools")) {
+          return { status: 200, body: { tools: [{ ...executableTool, builtin: false }] } };
+        }
+        if (call.method === "GET" && call.url.endsWith("/accounts/acme/journal-recovery")) {
+          return profile
+            ? { status: 200, body: profile }
+            : { status: 404, body: { error: "not found" } };
+        }
+        if (call.method === "GET" && call.url.endsWith("/current")) {
+          return { status: 200, body: { current: [], transactionalLoginProfileCleanup: true } };
+        }
+        if (call.method === "POST" && call.url.endsWith("/accounts/login/create")) {
+          createCount += 1;
+          profile = {
+            tool: "acme",
+            name: "journal-recovery",
+            dir,
+            createdAt: `2020-01-0${createCount}T00:00:00Z`,
+            incarnationId: String(
+              (call.body as { expectedIncarnationId?: string }).expectedIncarnationId,
+            ),
+          };
+          return { status: 201, body: profile };
+        }
+        return { status: 500, body: { error: "unexpected request" } };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      const first = await prepareLogin("journal-recovery", {
+        toolId: "acme",
+        env: process.env,
+        store,
+      });
+      if (first.status !== "ready") throw new Error("expected ready login preparation");
+      writeFileSync(join(dir, "stale-auth.json"), "{}\n", { mode: 0o600 });
+      writeFileSync(join(dir, ".accounts-login-cleanup.json"), JSON.stringify({
+        version: 1,
+        cleanupOperationId: "77777777-7777-4777-8777-777777777777",
+        profile: first.profile,
+        ownership: {},
+      }) + "\n", { mode: 0o600 });
+      profile = undefined;
+
+      const second = await prepareLogin("journal-recovery", {
+        toolId: "acme",
+        env: process.env,
+        store,
+      });
+      if (second.status !== "ready") throw new Error("expected ready login preparation");
+
+      expect(createCount).toBe(2);
+      expect(second.profile.incarnationId).not.toBe(first.profile.incarnationId);
+      expect(existsSync(join(dir, "stale-auth.json"))).toBe(false);
+      expect(existsSync(join(dir, ".accounts-login-cleanup.json"))).toBe(false);
+    });
+
+    test("failed cloud login cleanup preserves a concurrently changed incarnation and its directory", async () => {
+      const executableTool = { ...acme, bin: process.execPath };
+      const profile = {
+        tool: "acme",
+        name: "changed",
+        dir: join(home, "profiles", "acme", "changed"),
+        createdAt: "2020-01-01T00:00:00Z",
+        incarnationId: "22222222-2222-4222-8222-222222222222",
+      };
+      let created = false;
+      const { calls, fetchImpl } = mockFetch((call) => {
+        if (call.url.endsWith("/tools")) {
+          return { status: 200, body: { tools: [{ ...executableTool, builtin: false }] } };
+        }
+        if (call.method === "GET" && call.url.endsWith("/accounts/acme/changed")) {
+          return created ? { status: 200, body: { ...profile, description: "concurrent" } } : { status: 404, body: { error: "not found" } };
+        }
+        if (call.method === "GET" && call.url.endsWith("/current")) {
+          return { status: 200, body: { current: [], transactionalLoginProfileCleanup: true } };
+        }
+        if (call.method === "POST" && call.url.endsWith("/accounts/login/create")) {
+          profile.incarnationId = String(
+            (call.body as { expectedIncarnationId?: string }).expectedIncarnationId,
+          );
+          created = true;
+          return { status: 201, body: profile };
+        }
+        if (call.method === "POST" && call.url.endsWith("/accounts/acme/changed/login/remove-created-operation")) {
+          return { status: 200, body: { removed: false } };
+        }
+        return { status: 500, body: { error: "unexpected request" } };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      const preparation = await prepareLogin("changed", { toolId: "acme", env: process.env, store });
+      if (preparation.status !== "ready") throw new Error("expected ready login preparation");
+      writeFileSync(join(profile.dir, "concurrent.json"), "{}\n", { mode: 0o600 });
+
+      await rollbackLoginPreparation(preparation, store);
+
+      expect(created).toBe(true);
+      expect(existsSync(join(profile.dir, "concurrent.json"))).toBe(true);
+      expect(calls.some((call) => call.url.endsWith("/login/remove-created-operation"))).toBe(true);
+    });
+
+    test("cloud cleanup finishes owned directory removal before a same-name recreation can adopt it", async () => {
+      const executableTool = { ...acme, bin: process.execPath };
+      const original = {
+        tool: "acme",
+        name: "directory-race",
+        dir: join(home, "profiles", "acme", "directory-race"),
+        createdAt: "2020-01-01T00:00:00Z",
+        incarnationId: "33333333-3333-4333-8333-333333333333",
+      };
+      const replacement = {
+        ...original,
+        createdAt: "2020-01-02T00:00:00Z",
+        incarnationId: "44444444-4444-4444-8444-444444444444",
+      };
+      let generation = 0;
+      let createCount = 0;
+      let cleanupStarted!: () => void;
+      let releaseCleanup!: () => void;
+      const cleanupStartedPromise = new Promise<void>((resolveStarted) => { cleanupStarted = resolveStarted; });
+      const cleanupReleasePromise = new Promise<void>((resolveRelease) => { releaseCleanup = resolveRelease; });
+      const { calls, fetchImpl } = mockFetch(async (call) => {
+        if (call.url.endsWith("/tools")) {
+          return { status: 200, body: { tools: [{ ...executableTool, builtin: false }] } };
+        }
+        if (call.method === "GET" && call.url.endsWith("/accounts/acme/directory-race")) {
+          return generation === 0
+            ? { status: 404, body: { error: "not found" } }
+            : { status: 200, body: generation === 1 ? original : replacement };
+        }
+        if (call.method === "GET" && call.url.endsWith("/current")) {
+          return { status: 200, body: { current: [], transactionalLoginProfileCleanup: true } };
+        }
+        if (call.method === "POST" && call.url.endsWith("/accounts/login/create")) {
+          createCount += 1;
+          generation = 1;
+          original.incarnationId = String(
+            (call.body as { expectedIncarnationId?: string }).expectedIncarnationId,
+          );
+          return { status: 201, body: original };
+        }
+        if (call.method === "POST" && call.url.endsWith("/accounts")) {
+          generation = 2;
+          return { status: 201, body: replacement };
+        }
+        if (call.method === "POST" && call.url.endsWith("/accounts/acme/directory-race/login/remove-created-operation")) {
+          cleanupStarted();
+          await cleanupReleasePromise;
+          generation = 0;
+          return { status: 200, body: { removed: true } };
+        }
+        return { status: 500, body: { error: "unexpected request" } };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+      const preparation = await prepareLogin("directory-race", {
+        toolId: "acme",
+        env: process.env,
+        store,
+      });
+      if (preparation.status !== "ready") throw new Error("expected ready login preparation");
+      writeFileSync(join(original.dir, "old-operation.json"), "{}\n", { mode: 0o600 });
+
+      const rollback = rollbackLoginPreparation(preparation, store);
+      await cleanupStartedPromise;
+      const recreate = store.addProfile({ name: original.name, tool: original.tool });
+      await nextEventLoopTurn();
+      await Bun.sleep(50);
+      expect(calls.filter((call) => call.method === "POST" && call.url.endsWith("/accounts/login/create"))).toHaveLength(1);
+
+      releaseCleanup();
+      await rollback;
+      const recreated = await recreate;
+
+      expect(recreated.incarnationId).toBe(replacement.incarnationId);
+      expect(existsSync(recreated.dir)).toBe(true);
+      expect(existsSync(join(recreated.dir, "old-operation.json"))).toBe(false);
+    });
+
+    test("cloud Claude cleanup preserves auth and directory adopted during the conditional request", async () => {
+      const profile = {
+        tool: "claude",
+        name: "claude-auth-race",
+        dir: join(home, "profiles", "claude", "claude-auth-race"),
+        createdAt: "2020-01-01T00:00:00Z",
+        incarnationId: "55555555-5555-4555-8555-555555555555",
+      };
+      mkdirSync(profile.dir, { recursive: true });
+      writeFileSync(join(profile.dir, "adopted.json"), "{}\n", { mode: 0o600 });
+      const authKey = profileAuthRevisionKey(profile.tool, profile.name);
+      const before = loadMachineStore();
+      before.profileAuthRevisions[authKey] = "owned-auth";
+      before.profileAuthCommitRevisions[authKey] = "owned-commit";
+      before.profileAuthIncarnations[authKey] = profileAuthIncarnation(profile);
+      saveStore(before);
+      const { fetchImpl } = mockFetch((call) => {
+        if (call.url.endsWith("/accounts/claude/claude-auth-race/login/remove-created-operation")) {
+          const concurrent = loadMachineStore();
+          concurrent.profileAuthRevisions[authKey] = "concurrent-auth";
+          concurrent.profileAuthCommitRevisions[authKey] = "concurrent-commit";
+          saveStore(concurrent);
+          return { status: 200, body: { removed: true } };
+        }
+        return { status: 500, body: { error: "unexpected request" } };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+
+      const removed = await store.removeProfileIncarnation!(
+        profile,
+        { authIdentity: "owned-auth", authCommitRevision: "owned-commit" },
+        { tool: profile.tool, purge: true },
+      );
+
+      expect(removed).toMatchObject({ purged: false });
+      expect(existsSync(join(profile.dir, "adopted.json"))).toBe(true);
+      expect(loadMachineStore()).toMatchObject({
+        profileAuthRevisions: { [authKey]: "concurrent-auth" },
+        profileAuthCommitRevisions: { [authKey]: "concurrent-commit" },
+      });
     });
 
     test("login validation rejects a cloud custom tool before profile creation", async () => {
@@ -909,6 +1409,148 @@ describe("LocalStore reads/writes the on-box registry", () => {
     expect(list.map((p) => p.name)).toContain("work");
   });
 
+  test("profile directory mutation reclaims an exact dead-owner lease", async () => {
+    const dir = join(home, "profiles", "codex", "stale-directory-lease");
+    const uid = typeof process.getuid === "function" ? process.getuid() : "user";
+    const identity = createHash("sha256").update(dir).digest("hex").slice(0, 32);
+    const lockRoot = process.platform === "win32" ? tmpdir() : "/tmp";
+    const leasePath = join(lockRoot, `accounts-profile-directory-${uid}-${identity}.lock`);
+    writeFileSync(
+      leasePath,
+      "v2:2147483647:linux-1:11111111-1111-4111-8111-111111111111",
+      { mode: 0o600 },
+    );
+    try {
+      const store = resolveStore({ ACCOUNTS_HOME: home } as NodeJS.ProcessEnv);
+      const profile = await store.addProfile({ name: "stale-directory-lease", tool: "codex" });
+      expect(profile.dir).toBe(dir);
+      expect(existsSync(leasePath)).toBe(false);
+    } finally {
+      rmSync(leasePath, { force: true });
+    }
+  });
+
+  test("failed local profile creation removes only its newly-created directory", async () => {
+    const store = resolveStore({ ACCOUNTS_HOME: home } as NodeJS.ProcessEnv);
+    const dir = join(home, "profiles", "codex", "invalid-created-profile");
+
+    await expect(store.addProfile({
+      name: "invalid-created-profile",
+      tool: "codex",
+      cardLast4: "12" as never,
+    })).rejects.toThrow(/4 digits/);
+
+    expect(existsSync(dir)).toBe(false);
+    expect(await store.findProfile("invalid-created-profile", "codex")).toBeUndefined();
+
+    const existingDir = join(home, "profiles", "codex", "invalid-existing-profile");
+    mkdirSync(existingDir, { recursive: true });
+    writeFileSync(join(existingDir, "keep.json"), "{}\n", { mode: 0o600 });
+    await expect(store.addProfile({
+      name: "invalid-existing-profile",
+      tool: "codex",
+      cardLast4: "12" as never,
+    })).rejects.toThrow(/4 digits/);
+    expect(existsSync(join(existingDir, "keep.json"))).toBe(true);
+  });
+
+  test("local login reconciles a journaled delete before recreating the same managed directory", async () => {
+    const store = resolveStore({
+      ACCOUNTS_HOME: home,
+      HASNA_ACCOUNTS_STORAGE_MODE: "local",
+    } as NodeJS.ProcessEnv);
+    const tool = {
+      id: "journal-tool",
+      label: "Journal Tool",
+      envVar: "JOURNAL_TOOL_HOME",
+      defaultDir: join(home, "journal-default"),
+      bin: process.execPath,
+    };
+    await store.addTool(tool);
+    await store.addProfile({ name: "journal-recovery", tool: "codex" });
+    await store.useProfile("journal-recovery", "codex");
+    const displaced = loadMachineStore();
+    const displacedToolLockRevision = displaced.toolLockRevisions["journal-recovery"];
+    const first = await prepareLogin("journal-recovery", {
+      toolId: tool.id,
+      env: process.env,
+      store,
+    });
+    if (first.status !== "ready") throw new Error("expected ready login preparation");
+    writeFileSync(join(first.profile.dir, "stale-auth.json"), "{}\n", { mode: 0o600 });
+    writeFileSync(join(first.profile.dir, ".accounts-login-cleanup.json"), JSON.stringify({
+      version: 1,
+      cleanupOperationId: "88888888-8888-4888-8888-888888888888",
+      profile: first.profile,
+      ownership: {
+        toolLockRevision: first.toolLockRevision,
+        previousToolLock: first.previousToolLock,
+        previousToolLockRevision: first.previousToolLockRevision,
+        previousToolLockProfileIncarnation: first.previousToolLockProfileIncarnation,
+      },
+    }) + "\n", { mode: 0o600 });
+    await store.removeProfile(first.profile.name, { tool: first.profile.tool });
+    await store.reconcileInterruptedLoginCleanup!(first.profile.name, first.profile.tool);
+    const recovered = loadMachineStore();
+    expect(recovered.toolLocks["journal-recovery"]).toBe("codex");
+    expect(recovered.toolLockRevisions["journal-recovery"]).toBe(displacedToolLockRevision);
+
+    const second = await prepareLogin("journal-recovery", {
+      toolId: tool.id,
+      env: process.env,
+      store,
+    });
+    if (second.status !== "ready") throw new Error("expected ready login preparation");
+
+    expect(second.profile.incarnationId).not.toBe(first.profile.incarnationId);
+    expect(existsSync(join(second.profile.dir, "stale-auth.json"))).toBe(false);
+    expect(existsSync(join(second.profile.dir, ".accounts-login-cleanup.json"))).toBe(false);
+  });
+
+  test("local login replays an exact cleanup journal interrupted before profile deletion", async () => {
+    const store = resolveStore({
+      ACCOUNTS_HOME: home,
+      HASNA_ACCOUNTS_STORAGE_MODE: "local",
+    } as NodeJS.ProcessEnv);
+    const tool = {
+      id: "journal-replay-tool",
+      label: "Journal Replay Tool",
+      envVar: "JOURNAL_REPLAY_TOOL_HOME",
+      defaultDir: join(home, "journal-replay-default"),
+      bin: process.execPath,
+    };
+    await store.addTool(tool);
+    const first = await prepareLogin("journal-replay", {
+      toolId: tool.id,
+      env: process.env,
+      store,
+    });
+    if (first.status !== "ready") throw new Error("expected ready login preparation");
+    writeFileSync(join(first.profile.dir, "stale-auth.json"), "{}\n", { mode: 0o600 });
+    writeFileSync(join(first.profile.dir, ".accounts-login-cleanup.json"), JSON.stringify({
+      version: 1,
+      cleanupOperationId: "99999999-9999-4999-8999-999999999999",
+      profile: first.profile,
+      ownership: {
+        toolLockRevision: first.toolLockRevision,
+        previousToolLock: first.previousToolLock,
+        previousToolLockRevision: first.previousToolLockRevision,
+        previousToolLockProfileIncarnation: first.previousToolLockProfileIncarnation,
+      },
+    }) + "\n", { mode: 0o600 });
+
+    const second = await prepareLogin("journal-replay", {
+      toolId: tool.id,
+      env: process.env,
+      store,
+    });
+    if (second.status !== "ready") throw new Error("expected ready login preparation");
+
+    expect(second.profile.incarnationId).not.toBe(first.profile.incarnationId);
+    expect(existsSync(join(second.profile.dir, "stale-auth.json"))).toBe(false);
+    expect(existsSync(join(second.profile.dir, ".accounts-login-cleanup.json"))).toBe(false);
+  });
+
   test("legacy three-argument restoreCurrent still restores the named prior profile", async () => {
     const store = resolveStore({ ACCOUNTS_HOME: home } as NodeJS.ProcessEnv);
     await store.addProfile({ name: "prior", tool: "claude" });
@@ -1000,6 +1642,111 @@ describe("LocalStore reads/writes the on-box registry", () => {
     expect(existsSync(join(replacement.dir, "replacement.json"))).toBe(true);
   });
 
+  test("failed non-Claude login removes only its created profile and restores the exact prior tool lock", async () => {
+    const store = resolveStore({
+      ACCOUNTS_HOME: home,
+      HASNA_ACCOUNTS_STORAGE_MODE: "local",
+    } as NodeJS.ProcessEnv);
+    await store.addProfile({ name: "cleanup", tool: "codex" });
+    await store.useProfile("cleanup", "codex");
+    const before = loadMachineStore();
+    const previousToolLock = before.toolLocks.cleanup;
+    const previousToolLockRevision = before.toolLockRevisions.cleanup;
+    const customTool = {
+      id: "cleanup-tool",
+      label: "Cleanup Tool",
+      envVar: "CLEANUP_HOME",
+      defaultDir: join(home, "cleanup-default"),
+      bin: process.execPath,
+    };
+    await store.addTool(customTool);
+
+    const preparation = await prepareLogin("cleanup", {
+      toolId: customTool.id,
+      env: process.env,
+      store,
+    });
+    if (preparation.status !== "ready") throw new Error("expected ready login preparation");
+    expect(preparation.created).toBe(true);
+    expect(loadMachineStore().toolLocks.cleanup).toBe(customTool.id);
+
+    await rollbackLoginPreparation(preparation, store);
+
+    expect(await store.findProfile("cleanup", customTool.id)).toBeUndefined();
+    expect(existsSync(preparation.profile.dir)).toBe(false);
+    const after = loadMachineStore();
+    expect(after.toolLocks.cleanup).toBe(previousToolLock);
+    expect(after.toolLockRevisions.cleanup).toBe(previousToolLockRevision);
+    expect(after.current.codex).toBe("cleanup");
+  });
+
+  test("failed local login cleans its directory after a concurrent exact profile deletion", async () => {
+    const store = resolveStore({
+      ACCOUNTS_HOME: home,
+      HASNA_ACCOUNTS_STORAGE_MODE: "local",
+    } as NodeJS.ProcessEnv);
+    await store.addProfile({ name: "deleted-before-rollback", tool: "codex" });
+    await store.useProfile("deleted-before-rollback", "codex");
+    const displaced = loadMachineStore();
+    const displacedRevision = displaced.toolLockRevisions["deleted-before-rollback"];
+    const customTool = {
+      id: "deleted-cleanup-tool",
+      label: "Deleted Cleanup Tool",
+      envVar: "DELETED_CLEANUP_HOME",
+      defaultDir: join(home, "deleted-cleanup-default"),
+      bin: process.execPath,
+    };
+    await store.addTool(customTool);
+    const preparation = await prepareLogin("deleted-before-rollback", {
+      toolId: customTool.id,
+      env: process.env,
+      store,
+    });
+    if (preparation.status !== "ready") throw new Error("expected ready login preparation");
+    writeFileSync(join(preparation.profile.dir, "failed-auth.json"), "{}\n", { mode: 0o600 });
+    await store.removeProfile(preparation.profile.name, { tool: preparation.profile.tool });
+
+    await rollbackLoginPreparation(preparation, store);
+
+    expect(existsSync(preparation.profile.dir)).toBe(false);
+    const after = loadMachineStore();
+    expect(after.toolLocks[preparation.profile.name]).toBe("codex");
+    expect(after.toolLockRevisions[preparation.profile.name]).toBe(displacedRevision);
+  });
+
+  test("failed login never restores a displaced tool lock onto a recreated profile", async () => {
+    const store = resolveStore({
+      ACCOUNTS_HOME: home,
+      HASNA_ACCOUNTS_STORAGE_MODE: "local",
+    } as NodeJS.ProcessEnv);
+    const displaced = await store.addProfile({ name: "recreated-lock", tool: "codex" });
+    await store.useProfile(displaced.name, displaced.tool);
+    const customTool = {
+      id: "recreated-lock-tool",
+      label: "Recreated Lock Tool",
+      envVar: "RECREATED_LOCK_HOME",
+      defaultDir: join(home, "recreated-lock-default"),
+      bin: process.execPath,
+    };
+    await store.addTool(customTool);
+    const preparation = await prepareLogin(displaced.name, {
+      toolId: customTool.id,
+      env: process.env,
+      store,
+    });
+    if (preparation.status !== "ready") throw new Error("expected ready login preparation");
+
+    await store.removeProfile(displaced.name, { tool: displaced.tool });
+    const replacement = await store.addProfile({ name: displaced.name, tool: displaced.tool });
+    expect(replacement.incarnationId).not.toBe(displaced.incarnationId);
+    await rollbackLoginPreparation(preparation, store);
+
+    expect(await store.findProfile(preparation.profile.name, customTool.id)).toBeUndefined();
+    expect((await store.getProfile(replacement.name, replacement.tool)).incarnationId)
+      .toBe(replacement.incarnationId);
+    expect(loadMachineStore().toolLocks[replacement.name]).toBeUndefined();
+  });
+
   test("failed-login email rollback does not mutate a recreated Claude profile", async () => {
     const store = resolveStore({
       ACCOUNTS_HOME: home,
@@ -1038,7 +1785,26 @@ describe("LocalStore reads/writes the on-box registry", () => {
     expect((await store.getProfile(replacement.name, replacement.tool)).email).toBe("failed@example.test");
   });
 
-  test("LocalStore persistently upgrades legacy profile incarnations before transactional reads", async () => {
+  test("LocalStore resolution plus list/show reads create no lock, store, or directory", async () => {
+    const absentHome = join(home, "read-only-absent");
+    process.env.ACCOUNTS_HOME = absentHome;
+    const store = resolveStore({
+      ACCOUNTS_HOME: absentHome,
+      HASNA_ACCOUNTS_STORAGE_MODE: "local",
+    } as NodeJS.ProcessEnv);
+
+    expect(await store.listProfiles()).toEqual([]);
+    await expect(store.getProfile("missing", "codex")).rejects.toThrow(/no profile named/);
+    expect(await store.listTools()).toEqual(expect.arrayContaining([expect.objectContaining({ id: "codex" })]));
+
+    expect(existsSync(absentHome)).toBe(false);
+    expect(existsSync(join(absentHome, ".store.lock"))).toBe(false);
+    expect(existsSync(join(absentHome, "accounts.json"))).toBe(false);
+    expect(existsSync(join(absentHome, "profiles"))).toBe(false);
+    process.env.ACCOUNTS_HOME = home;
+  });
+
+  test("LocalStore read-only resolution and list/show do not rewrite legacy JSON", async () => {
     const initial = resolveStore({ ACCOUNTS_HOME: home } as NodeJS.ProcessEnv);
     const profile = await initial.addProfile({ name: "legacy-upgrade", tool: "codex" });
     const legacy = loadMachineStore();
@@ -1048,16 +1814,49 @@ describe("LocalStore reads/writes the on-box registry", () => {
     if (!record) throw new Error("missing legacy upgrade fixture");
     delete record.incarnationId;
     saveStore(legacy);
+    const registryPath = join(home, "accounts.json");
+    const before = readFileSync(registryPath, "utf8");
 
-    const upgraded = resolveStore({ ACCOUNTS_HOME: home } as NodeJS.ProcessEnv);
-    const first = await upgraded.getProfile(profile.name, profile.tool);
-    const second = await resolveStore({ ACCOUNTS_HOME: home } as NodeJS.ProcessEnv).getProfile(
-      profile.name,
-      profile.tool,
+    const readOnly = resolveStore({ ACCOUNTS_HOME: home } as NodeJS.ProcessEnv);
+    expect((await readOnly.listProfiles(profile.tool))[0]?.incarnationId).toBeUndefined();
+    expect((await readOnly.getProfile(profile.name, profile.tool)).incarnationId).toBeUndefined();
+
+    expect(readFileSync(registryPath, "utf8")).toBe(before);
+    expect(existsSync(join(home, ".store.lock"))).toBe(false);
+  });
+
+  test("validated login preparation assigns a legacy incarnation inside its mutating transaction", async () => {
+    const initial = resolveStore({ ACCOUNTS_HOME: home } as NodeJS.ProcessEnv);
+    const customTool = {
+      id: "legacy-login-tool",
+      label: "Legacy Login Tool",
+      envVar: "LEGACY_LOGIN_HOME",
+      defaultDir: join(home, "legacy-login-default"),
+      bin: process.execPath,
+    };
+    await initial.addTool(customTool);
+    const profile = await initial.addProfile({ name: "legacy-login", tool: customTool.id });
+    const legacy = loadMachineStore();
+    const record = legacy.profiles.find(
+      (candidate) => candidate.name === profile.name && candidate.tool === profile.tool,
     );
+    if (!record) throw new Error("missing legacy login fixture");
+    delete record.incarnationId;
+    saveStore(legacy);
+    let validated = false;
 
-    expect(first.incarnationId).toMatch(/^[0-9a-f-]{36}$/i);
-    expect(second.incarnationId).toBe(first.incarnationId);
+    const preparation = await prepareLogin(profile.name, {
+      toolId: profile.tool,
+      env: process.env,
+      store: resolveStore({ ACCOUNTS_HOME: home } as NodeJS.ProcessEnv),
+      validateTool: () => {
+        validated = true;
+      },
+    });
+
+    expect(validated).toBe(true);
+    expect(preparation.profile.incarnationId).toMatch(/^[0-9a-f-]{36}$/i);
+    expect((await initial.getProfile(profile.name, profile.tool)).incarnationId).toBe(preparation.profile.incarnationId);
   });
 
   test("local non-Claude profile-field rollback fails closed without an incarnation token", async () => {
