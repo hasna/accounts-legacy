@@ -76,11 +76,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/hasna/accounts-legacy.git"
+    "url": "git+https://github.com/hasna/accounts.git"
   },
-  "homepage": "https://github.com/hasna/accounts-legacy",
+  "homepage": "https://github.com/hasna/accounts",
   "bugs": {
-    "url": "https://github.com/hasna/accounts-legacy/issues"
+    "url": "https://github.com/hasna/accounts/issues"
   },
   "engines": {
     "node": ">=18",
