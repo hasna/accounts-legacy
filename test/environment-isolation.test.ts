@@ -6,6 +6,7 @@ import { accountsHome, storePath } from "../src/storage.js";
 import { liveClaudeBase } from "../src/lib/claude-layout.js";
 import { keychainSupported, readClaudeKeychain, securityExecutable } from "../src/lib/keychain.js";
 import { resolveStore } from "../src/lib/store.js";
+import { controlledTestsRoot } from "./support/isolation-paths.js";
 
 test("test preload replaces inherited machine and cloud state before app resolution", async () => {
   const sentinelRoot = process.env.ACCOUNTS_TEST_EXPECTED_SENTINEL_ROOT;
@@ -76,6 +77,9 @@ test("test preload replaces inherited machine and cloud state before app resolut
     expect(accountsHome().startsWith(sentinelRoot)).toBe(false);
   }
   const testRoot = dirname(accountsHome());
+  const controlledRoot = controlledTestsRoot(process.cwd());
+  const controlledRelative = relative(controlledRoot, testRoot);
+  expect(controlledRelative.startsWith("..") || isAbsolute(controlledRelative)).toBe(false);
 
   if (platform() === "darwin") {
     expect(keychainSupported()).toBe(true);

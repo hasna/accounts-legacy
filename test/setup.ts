@@ -1,7 +1,11 @@
 import { afterAll, beforeEach } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { platform, tmpdir } from "node:os";
-import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { copyFileSync, linkSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { platform } from "node:os";
+import { delimiter, isAbsolute, join, resolve } from "node:path";
+import {
+  executableFilename,
+  resolveControlledTestParent,
+} from "./support/isolation-paths.js";
 
 const postgresIntegrationFile = resolve(process.cwd(), "src/server/postgres.integration.ts");
 const normalizedPostgresIntegrationFile = normalizePath(postgresIntegrationFile);
@@ -15,17 +19,60 @@ const postgresTestDatabaseUrl = postgresOptIn
   ? process.env.HASNA_ACCOUNTS_TEST_DATABASE_URL
   : undefined;
 
-// Do not let an inherited temp override choose a machine-owned test root.
-for (const key of ["TMPDIR", "TMP", "TEMP"]) delete process.env[key];
-
-const workerRoot = mkdtempSync(join(tmpdir(), "accounts-bun-test-"));
-const fakeSecurityExecutable = join(workerRoot, "security-not-found");
+// Never let inherited temp variables or an OS fallback select the test root.
+// The postgres launcher may provide a unique child only under this controlled,
+// ignored worktree-local directory so it can clean the entire launch in finally.
+const testRootParent = resolveControlledTestParent(
+  process.cwd(),
+  postgresOptIn ? process.env.ACCOUNTS_TEST_ROOT_PARENT : undefined,
+);
+mkdirSync(testRootParent, { recursive: true });
+const workerRoot = mkdtempSync(join(testRootParent, "worker-"));
 const safeBin = join(workerRoot, "safe-bin");
 let testIndex = 0;
 let cleaned = false;
+process.once("exit", cleanupWorkerRoot);
 
 mkdirSync(safeBin, { recursive: true });
-writeFileSync(fakeSecurityExecutable, "#!/bin/sh\nexit 44\n", { mode: 0o700 });
+const blockedProcessSource = join(workerRoot, "blocked-process.ts");
+const blockedProcessExecutable = join(workerRoot, executableFilename("blocked-process"));
+writeFileSync(blockedProcessSource, "process.exit(86);\n");
+const compilerEnvironment: Record<string, string> = {
+  HOME: workerRoot,
+  USERPROFILE: workerRoot,
+  TMPDIR: workerRoot,
+  TMP: workerRoot,
+  TEMP: workerRoot,
+};
+for (const key of ["SystemRoot", "WINDIR"] as const) {
+  if (process.env[key]) compilerEnvironment[key] = process.env[key]!;
+}
+const blockedProcessBuild = Bun.spawnSync({
+  cmd: [
+    process.execPath,
+    "build",
+    "--compile",
+    blockedProcessSource,
+    "--outfile",
+    blockedProcessExecutable,
+  ],
+  cwd: process.cwd(),
+  env: compilerEnvironment,
+  stdout: "pipe",
+  stderr: "pipe",
+});
+if (blockedProcessBuild.exitCode !== 0) {
+  throw new Error(`failed to compile isolated process blocker (exit ${blockedProcessBuild.exitCode})`);
+}
+
+function linkOrCopy(source: string, target: string): void {
+  try {
+    linkSync(source, target);
+  } catch {
+    copyFileSync(source, target);
+  }
+}
+
 for (const executable of [
   "claude",
   "codex",
@@ -39,12 +86,11 @@ for (const executable of [
   "pi",
   "takumi",
 ]) {
-  const path = join(safeBin, platform() === "win32" ? `${executable}.cmd` : executable);
-  const source = platform() === "win32"
-    ? "@echo off\r\nexit /b 86\r\n"
-    : "#!/bin/sh\nexit 86\n";
-  writeFileSync(path, source, { mode: 0o700 });
+  linkOrCopy(blockedProcessExecutable, join(safeBin, executableFilename(executable)));
 }
+
+const safeBunExecutable = join(safeBin, executableFilename("bun"));
+linkOrCopy(process.execPath, safeBunExecutable);
 
 const remoteConfigurationKeys = [
   "HASNA_ACCOUNTS_API_URL",
@@ -108,6 +154,8 @@ const inheritedProcessHookKeys = [
   "ACCOUNTS_TEST_KEYCHAIN_LOCK_TIMEOUT_MS",
   "ACCOUNTS_TEST_CHILD_KILL_TIMEOUT_MS",
   "ACCOUNTS_POSTGRES_TEST_TARGET",
+  "ACCOUNTS_TEST_ROOT_PARENT",
+  "ACCOUNTS_TEST_LAUNCH_ID",
   "CMD_RELAY_ENV",
   "CLAUDE_CODE_API_KEY_HELPER",
   "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
@@ -190,7 +238,7 @@ function resetTestEnvironment(): void {
   process.env.TMP = isolatedTemp;
   process.env.TEMP = isolatedTemp;
 
-  const pathDirectories = [safeBin, dirname(process.execPath)];
+  const pathDirectories = [safeBin];
   if (platform() === "win32") {
     const systemRoot = process.env.SystemRoot ?? process.env.WINDIR;
     if (systemRoot) pathDirectories.push(join(systemRoot, "System32"));
@@ -205,7 +253,7 @@ function resetTestEnvironment(): void {
   process.env.PATH = [...new Set(pathDirectories)].join(delimiter);
 
   process.env.ACCOUNTS_TEST_KEYCHAIN = platform() === "darwin" ? "1" : "0";
-  if (platform() === "darwin") process.env.ACCOUNTS_TEST_SECURITY_BIN = fakeSecurityExecutable;
+  if (platform() === "darwin") process.env.ACCOUNTS_TEST_SECURITY_BIN = blockedProcessExecutable;
   process.env.ACCOUNTS_TEST_LIVE_DIR = liveHome;
   process.env.ACCOUNTS_TEST_KEYCHAIN_LOCK_PATH = join(testRoot, "keychain.lock");
 
@@ -219,8 +267,13 @@ function resetTestEnvironment(): void {
 
 function cleanupWorkerRoot(): void {
   if (cleaned) return;
+  rmSync(workerRoot, {
+    recursive: true,
+    force: true,
+    maxRetries: 3,
+    retryDelay: 25,
+  });
   cleaned = true;
-  rmSync(workerRoot, { recursive: true, force: true });
 }
 
 // Run once before application test modules load, then again before each test so
@@ -228,4 +281,3 @@ function cleanupWorkerRoot(): void {
 resetTestEnvironment();
 beforeEach(resetTestEnvironment);
 afterAll(cleanupWorkerRoot);
-process.once("exit", cleanupWorkerRoot);

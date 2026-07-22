@@ -4,14 +4,28 @@ import { AccountsError } from "../types.js";
 import { CLAUDE_KEYCHAIN_SERVICE } from "./claude-layout.js";
 
 export function keychainSupported(): boolean {
-  return process.env.ACCOUNTS_TEST_KEYCHAIN === "1" || platform() === "darwin";
+  return keychainSupportedFor(platform(), process.env);
 }
 
 export function securityExecutable(): string {
-  if (process.env["NODE_ENV"] === "test" && process.env.ACCOUNTS_TEST_SECURITY_BIN) {
-    return process.env.ACCOUNTS_TEST_SECURITY_BIN;
+  return securityExecutableFor(platform(), process.env);
+}
+
+export function keychainSupportedFor(
+  targetPlatform: NodeJS.Platform,
+  env: NodeJS.ProcessEnv,
+): boolean {
+  return env.ACCOUNTS_TEST_KEYCHAIN === "1" || targetPlatform === "darwin";
+}
+
+export function securityExecutableFor(
+  targetPlatform: NodeJS.Platform,
+  env: NodeJS.ProcessEnv,
+): string {
+  if (env.NODE_ENV === "test" && env.ACCOUNTS_TEST_SECURITY_BIN) {
+    return env.ACCOUNTS_TEST_SECURITY_BIN;
   }
-  return keychainSupported() ? "/usr/bin/security" : "security";
+  return keychainSupportedFor(targetPlatform, env) ? "/usr/bin/security" : "security";
 }
 
 export interface KeychainCredential {

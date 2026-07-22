@@ -7,8 +7,10 @@ import { assertSafeWritePath } from "./lib/safe-path.js";
 import {
   assertAllowedKeychainCredential,
   keychainWriteFailureMessage,
+  keychainSupportedFor,
   readClaudeKeychain,
   securityExecutable,
+  securityExecutableFor,
   writeClaudeKeychain,
 } from "./lib/keychain.js";
 import { CLAUDE_KEYCHAIN_SERVICE } from "./lib/claude-layout.js";
@@ -171,19 +173,18 @@ test("keychain write failure messages do not include command arguments", () => {
   expect(message).not.toContain("secret-token");
 });
 
-test.skipIf(platform() !== "darwin")("keychain commands use the macOS security executable", () => {
-  const originalNodeEnv = process.env.NODE_ENV;
-  const originalSecurityBin = process.env.ACCOUNTS_TEST_SECURITY_BIN;
-  try {
-    delete process.env.NODE_ENV;
-    delete process.env.ACCOUNTS_TEST_SECURITY_BIN;
-    expect(securityExecutable()).toBe("/usr/bin/security");
-  } finally {
-    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
-    else process.env.NODE_ENV = originalNodeEnv;
-    if (originalSecurityBin === undefined) delete process.env.ACCOUNTS_TEST_SECURITY_BIN;
-    else process.env.ACCOUNTS_TEST_SECURITY_BIN = originalSecurityBin;
-  }
+test("platform-injected keychain resolution is independent of PATH", () => {
+  const hostilePath = "/sentinel/bin";
+
+  expect(keychainSupportedFor("darwin", { PATH: hostilePath })).toBe(true);
+  expect(securityExecutableFor("darwin", { PATH: hostilePath })).toBe("/usr/bin/security");
+  expect(keychainSupportedFor("win32", { PATH: hostilePath })).toBe(false);
+  expect(securityExecutableFor("win32", { PATH: hostilePath })).toBe("security");
+  expect(securityExecutableFor("win32", {
+    NODE_ENV: "test",
+    PATH: hostilePath,
+    ACCOUNTS_TEST_SECURITY_BIN: "C:\\isolated\\security.exe",
+  })).toBe("C:\\isolated\\security.exe");
 });
 
 test("test security executable override is gated by NODE_ENV=test", () => {
@@ -209,30 +210,20 @@ test("test security executable override is gated by NODE_ENV=test", () => {
   }
 });
 
-test("keychain test seam ignores PATH shadowing and executes only the configured runner", () => {
-  const fakeBinDir = mkdtempSync(join(tmpdir(), "fake-security-bin-"));
-  const pathSecurity = join(fakeBinDir, platform() === "win32" ? "security.cmd" : "security");
-  const pathLog = join(fakeBinDir, "path-called.log");
-  const configuredSecurity = join(
-    fakeBinDir,
-    platform() === "win32" ? "configured-security.cmd" : "configured-security",
-  );
-  const configuredLog = join(fakeBinDir, "configured-called.log");
-  const pathSecuritySource = platform() === "win32"
-    ? ["@echo off", `echo path security called>> ${JSON.stringify(pathLog)}`, "exit /b 1"].join("\r\n")
-    : ["#!/bin/sh", `printf 'path security called\\n' >> ${JSON.stringify(pathLog)}`, "exit 1"].join("\n");
-  const configuredSecuritySource = platform() === "win32"
-    ? [
-      "@echo off",
-      `echo %*>> ${JSON.stringify(configuredLog)}`,
-      "echo %* | findstr /C:\" -w\" >nul",
-      "if %errorlevel% equ 0 (",
-      "  echo fixture-oauth-payload",
-      ") else (",
-      "  echo \"acct\"^<blob^>=\"fixture-account\"",
-      ")",
-    ].join("\r\n")
-    : [
+test.skipIf(platform() === "win32")(
+  "POSIX keychain test seam ignores PATH shadowing and executes only the configured runner",
+  () => {
+    const fakeBinDir = mkdtempSync(join(tmpdir(), "fake-security-bin-"));
+    const pathSecurity = join(fakeBinDir, "security");
+    const pathLog = join(fakeBinDir, "path-called.log");
+    const configuredSecurity = join(fakeBinDir, "configured-security");
+    const configuredLog = join(fakeBinDir, "configured-called.log");
+    const pathSecuritySource = [
+      "#!/bin/sh",
+      `printf 'path security called\\n' >> ${JSON.stringify(pathLog)}`,
+      "exit 1",
+    ].join("\n");
+    const configuredSecuritySource = [
       "#!/bin/sh",
       `printf '%s\\n' \"$*\" >> ${JSON.stringify(configuredLog)}`,
       "case \"$*\" in",
@@ -240,46 +231,39 @@ test("keychain test seam ignores PATH shadowing and executes only the configured
       "  *) printf '\"acct\"<blob>=\"fixture-account\"\\n' ;;",
       "esac",
     ].join("\n");
-  writeFileSync(
-    pathSecurity,
-    pathSecuritySource,
-    { mode: 0o700 },
-  );
-  writeFileSync(
-    configuredSecurity,
-    configuredSecuritySource,
-    { mode: 0o700 },
-  );
+    writeFileSync(pathSecurity, pathSecuritySource, { mode: 0o700 });
+    writeFileSync(configuredSecurity, configuredSecuritySource, { mode: 0o700 });
 
-  const originalPath = process.env.PATH;
-  const originalNodeEnv = process.env.NODE_ENV;
-  const originalTestKeychain = process.env.ACCOUNTS_TEST_KEYCHAIN;
-  const originalSecurityBin = process.env.ACCOUNTS_TEST_SECURITY_BIN;
-  process.env.PATH = `${fakeBinDir}:${originalPath ?? ""}`;
-  try {
-    process.env.NODE_ENV = "test";
-    process.env.ACCOUNTS_TEST_KEYCHAIN = "1";
-    process.env.ACCOUNTS_TEST_SECURITY_BIN = configuredSecurity;
+    const originalPath = process.env.PATH;
+    const originalNodeEnv = process.env.NODE_ENV;
+    const originalTestKeychain = process.env.ACCOUNTS_TEST_KEYCHAIN;
+    const originalSecurityBin = process.env.ACCOUNTS_TEST_SECURITY_BIN;
+    process.env.PATH = `${fakeBinDir}:${originalPath ?? ""}`;
+    try {
+      process.env.NODE_ENV = "test";
+      process.env.ACCOUNTS_TEST_KEYCHAIN = "1";
+      process.env.ACCOUNTS_TEST_SECURITY_BIN = configuredSecurity;
 
-    expect(readClaudeKeychain()).toEqual({
-      service: CLAUDE_KEYCHAIN_SERVICE,
-      account: "fixture-account",
-      secret: "fixture-oauth-payload",
-    });
-    expect(readFileSync(configuredLog, "utf8").trim().split("\n")).toHaveLength(2);
-    expect(existsSync(pathLog)).toBe(false);
-  } finally {
-    if (originalPath === undefined) delete process.env.PATH;
-    else process.env.PATH = originalPath;
-    if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
-    else process.env.NODE_ENV = originalNodeEnv;
-    if (originalTestKeychain === undefined) delete process.env.ACCOUNTS_TEST_KEYCHAIN;
-    else process.env.ACCOUNTS_TEST_KEYCHAIN = originalTestKeychain;
-    if (originalSecurityBin === undefined) delete process.env.ACCOUNTS_TEST_SECURITY_BIN;
-    else process.env.ACCOUNTS_TEST_SECURITY_BIN = originalSecurityBin;
-    rmSync(fakeBinDir, { recursive: true, force: true });
-  }
-});
+      expect(readClaudeKeychain()).toEqual({
+        service: CLAUDE_KEYCHAIN_SERVICE,
+        account: "fixture-account",
+        secret: "fixture-oauth-payload",
+      });
+      expect(readFileSync(configuredLog, "utf8").trim().split("\n")).toHaveLength(2);
+      expect(existsSync(pathLog)).toBe(false);
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      if (originalNodeEnv === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = originalNodeEnv;
+      if (originalTestKeychain === undefined) delete process.env.ACCOUNTS_TEST_KEYCHAIN;
+      else process.env.ACCOUNTS_TEST_KEYCHAIN = originalTestKeychain;
+      if (originalSecurityBin === undefined) delete process.env.ACCOUNTS_TEST_SECURITY_BIN;
+      else process.env.ACCOUNTS_TEST_SECURITY_BIN = originalSecurityBin;
+      rmSync(fakeBinDir, { recursive: true, force: true });
+    }
+  },
+);
 
 test.skipIf(!existsSync("/var/folders"))("saveStore works when ACCOUNTS_HOME is under /var/folders temp", () => {
   const varHome = execSync("mktemp -d", { encoding: "utf8" }).trim();

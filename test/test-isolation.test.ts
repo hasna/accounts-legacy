@@ -1,7 +1,19 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { platform, tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { basename, delimiter, dirname, join } from "node:path";
+import { controlledTestsRoot, executableFilename } from "./support/isolation-paths.js";
 
 const nestedProbe = process.env.ACCOUNTS_TEST_NESTED_PROBE === "1";
 
@@ -49,13 +61,50 @@ const toolExecutables = [
   "takumi",
 ] as const;
 
-function writeMarkerExecutable(path: string, marker: string): string {
-  const executablePath = platform() === "win32" ? `${path}.cmd` : path;
-  const source = platform() === "win32"
-    ? `@echo off\r\ntype nul > ${JSON.stringify(marker)}\r\nexit /b 87\r\n`
-    : `#!/bin/sh\n: > ${JSON.stringify(marker)}\nexit 87\n`;
-  writeFileSync(executablePath, source, { mode: 0o700 });
-  return executablePath;
+function compileMarkerExecutable(root: string): string {
+  const sourcePath = join(root, "marker-executable.ts");
+  const outputPath = join(root, executableFilename("marker-executable"));
+  writeFileSync(sourcePath, [
+    'import { writeFileSync } from "node:fs";',
+    'import { basename, dirname, join } from "node:path";',
+    "const executable = process.execPath;",
+    "const markerRoot = dirname(dirname(executable));",
+    'writeFileSync(join(markerRoot, `${basename(executable)}.called`), "called\\n");',
+    "process.exit(87);",
+  ].join("\n"));
+  const build = Bun.spawnSync({
+    cmd: [process.execPath, "build", "--compile", sourcePath, "--outfile", outputPath],
+    cwd: process.cwd(),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (build.exitCode !== 0) {
+    throw new Error(`failed to compile marker executable (exit ${build.exitCode})`);
+  }
+  return outputPath;
+}
+
+function installMarkerExecutable(source: string, binDirectory: string, name: string): {
+  executable: string;
+  marker: string;
+} {
+  const executable = join(binDirectory, executableFilename(name));
+  try {
+    linkSync(source, executable);
+  } catch {
+    copyFileSync(source, executable);
+  }
+  if (platform() !== "win32") chmodSync(executable, 0o700);
+  return {
+    executable,
+    marker: join(dirname(binDirectory), `${basename(executable)}.called`),
+  };
+}
+
+function postgresLaunchResidue(launchId: string): string[] {
+  const root = controlledTestsRoot(process.cwd());
+  if (!existsSync(root)) return [];
+  return readdirSync(root).filter((entry) => entry.startsWith(`postgres-launch-${launchId}-`));
 }
 
 test("bare Bun tests make zero inherited network, database, keychain, or tool side effects", async () => {
@@ -66,18 +115,20 @@ test("bare Bun tests make zero inherited network, database, keychain, or tool si
 
   const sentinelRoot = mkdtempSync(join(tmpdir(), "accounts-inherited-sentinel-"));
   const sentinelBin = join(sentinelRoot, "bin");
-  const keychainMarker = join(sentinelRoot, "keychain-called");
-  const toolMarker = join(sentinelRoot, "tool-called");
-  const shellMarker = join(sentinelRoot, "shell-called");
   let httpRequests = 0;
   let postgresConnections = 0;
 
   mkdirSync(sentinelBin, { recursive: true });
-  const inheritedSecurity = writeMarkerExecutable(join(sentinelBin, "security"), keychainMarker);
-  const inheritedShell = writeMarkerExecutable(join(sentinelBin, "shell"), shellMarker);
+  const markerExecutable = compileMarkerExecutable(sentinelRoot);
+  const installedMarkers = [
+    installMarkerExecutable(markerExecutable, sentinelBin, "security"),
+    installMarkerExecutable(markerExecutable, sentinelBin, "shell"),
+  ];
   for (const executable of toolExecutables) {
-    writeMarkerExecutable(join(sentinelBin, executable), toolMarker);
+    installedMarkers.push(installMarkerExecutable(markerExecutable, sentinelBin, executable));
   }
+  const inheritedSecurity = installedMarkers[0]!.executable;
+  const inheritedShell = installedMarkers[1]!.executable;
 
   const apiServer = Bun.serve({
     hostname: "127.0.0.1",
@@ -108,6 +159,7 @@ test("bare Bun tests make zero inherited network, database, keychain, or tool si
     ACCOUNTS_TEST_NESTED_PROBE: "1",
     ACCOUNTS_TEST_BOOTSTRAP_PROBE: "1",
     ACCOUNTS_TEST_EXPECTED_SENTINEL_ROOT: sentinelRoot,
+    ACCOUNTS_TEST_ROOT_PARENT: sentinelRoot,
     HASNA_ACCOUNTS_API_URL: apiUrl,
     HASNA_ACCOUNTS_API_KEY: "sentinel-hasna-key",
     ACCOUNTS_API_URL: apiUrl,
@@ -159,6 +211,9 @@ test("bare Bun tests make zero inherited network, database, keychain, or tool si
     CLAUDE_CODE_USE_VERTEX: "1",
     SHELL: inheritedShell,
     COMSPEC: inheritedShell,
+    TMPDIR: sentinelRoot,
+    TMP: sentinelRoot,
+    TEMP: sentinelRoot,
     PATH: `${sentinelBin}${delimiter}${process.env.PATH ?? ""}`,
   };
   for (const key of inheritedToolHomeKeys) inheritedEnv[key] = join(sentinelRoot, key.toLowerCase());
@@ -181,9 +236,7 @@ test("bare Bun tests make zero inherited network, database, keychain, or tool si
     expect(exitCode, `${stdout}\n${stderr}`).toBe(0);
     expect(httpRequests).toBe(0);
     expect(postgresConnections).toBe(0);
-    expect(existsSync(keychainMarker)).toBe(false);
-    expect(existsSync(toolMarker)).toBe(false);
-    expect(existsSync(shellMarker)).toBe(false);
+    for (const { marker } of installedMarkers) expect(existsSync(marker)).toBe(false);
     expect(existsSync(join(sentinelRoot, "accounts.json"))).toBe(false);
     expect(existsSync(join(sentinelRoot, "keychain.lock"))).toBe(false);
   } finally {
@@ -214,6 +267,7 @@ test("PostgreSQL variables survive only the exact integration target plus explic
   });
   const sentinelUrl =
     `postgresql://sentinel:sentinel@127.0.0.1:${postgresServer.port}/accounts?connect_timeout=1`;
+  const successLaunchId = randomUUID();
 
   try {
     const explicitChild = Bun.spawn({
@@ -223,6 +277,7 @@ test("PostgreSQL variables survive only the exact integration target plus explic
         ...process.env,
         ACCOUNTS_TEST_POSTGRES_PROBE: "1",
         ACCOUNTS_TEST_EXPECTED_POSTGRES_URL: sentinelUrl,
+        ACCOUNTS_TEST_LAUNCH_ID: successLaunchId,
         ACCOUNTS_REQUIRE_POSTGRES: "1",
         HASNA_ACCOUNTS_TEST_DATABASE_URL: sentinelUrl,
         HASNA_ACCOUNTS_DATABASE_URL: sentinelUrl,
@@ -242,6 +297,7 @@ test("PostgreSQL variables survive only the exact integration target plus explic
     ]);
     expect(explicitExit, `${explicitStdout}\n${explicitStderr}`).toBe(0);
     expect(postgresConnections).toBe(0);
+    expect(postgresLaunchResidue(successLaunchId)).toEqual([]);
 
     const closedChild = Bun.spawn({
       cmd: [process.execPath, "test", "./src/server/postgres.integration.ts"],
@@ -285,6 +341,58 @@ test("PostgreSQL variables survive only the exact integration target plus explic
     });
     expect(await optionValueChild.exited).not.toBe(0);
     expect(postgresConnections).toBe(0);
+  } finally {
+    postgresServer.stop(true);
+  }
+}, 30_000);
+
+test("PostgreSQL launcher removes its unique root after a deliberate bail", async () => {
+  if (nestedProbe) {
+    expect(process.env.ACCOUNTS_TEST_NESTED_PROBE).toBe("1");
+    return;
+  }
+
+  let postgresConnections = 0;
+  const postgresServer = Bun.listen({
+    hostname: "127.0.0.1",
+    port: 0,
+    socket: {
+      open(socket) {
+        postgresConnections += 1;
+        socket.end();
+      },
+      data() {},
+      error() {},
+    },
+  });
+  const sentinelUrl =
+    `postgresql://sentinel:sentinel@127.0.0.1:${postgresServer.port}/accounts?connect_timeout=1`;
+  const launchId = randomUUID();
+
+  try {
+    const child = Bun.spawn({
+      cmd: [process.execPath, "run", "./test/run-postgres.ts", "--bail=1"],
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        ACCOUNTS_TEST_POSTGRES_PROBE: "1",
+        ACCOUNTS_TEST_EXPECTED_POSTGRES_URL: `${sentinelUrl}-expected-mismatch`,
+        ACCOUNTS_TEST_LAUNCH_ID: launchId,
+        ACCOUNTS_REQUIRE_POSTGRES: "1",
+        HASNA_ACCOUNTS_TEST_DATABASE_URL: sentinelUrl,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [exitCode, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+
+    expect(exitCode, `${stdout}\n${stderr}`).not.toBe(0);
+    expect(postgresConnections).toBe(0);
+    expect(postgresLaunchResidue(launchId)).toEqual([]);
   } finally {
     postgresServer.stop(true);
   }
