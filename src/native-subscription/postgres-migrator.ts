@@ -16,6 +16,12 @@ import {
   validatePostgresRuntimeRoleBoundary,
   type PostgresRuntimeRoleBoundary,
 } from "./postgres-runtime.js";
+import {
+  POSTGRES_SCHEMA_MANIFEST,
+  type PostgresColumnManifestEntry,
+  type PostgresConstraintManifestEntry,
+  type PostgresIndexManifestEntry,
+} from "./postgres-schema-manifest.js";
 import type { PostgresSqlClient, PostgresTransaction } from "./postgres-sql.js";
 
 interface MigrationRow {
@@ -50,6 +56,40 @@ interface TableCatalogRow {
   readonly runtime_references: boolean;
   readonly runtime_trigger: boolean;
   readonly public_any: boolean;
+}
+
+interface ColumnCatalogRow {
+  readonly table_name: string;
+  readonly ordinal_position: number;
+  readonly column_name: string;
+  readonly data_type: string;
+  readonly not_null: boolean;
+  readonly default_expression: string | null;
+  readonly identity_kind: string;
+  readonly generated_kind: string;
+  readonly collation_name: string | null;
+}
+
+interface ConstraintCatalogRow {
+  readonly table_name: string;
+  readonly constraint_name: string;
+  readonly constraint_type: "p" | "u" | "c" | "f";
+  readonly definition: string;
+  readonly deferrable: boolean;
+  readonly initially_deferred: boolean;
+  readonly validated: boolean;
+}
+
+interface IndexCatalogRow {
+  readonly table_name: string;
+  readonly index_name: string;
+  readonly access_method: string;
+  readonly unique_index: boolean;
+  readonly valid: boolean;
+  readonly ready: boolean;
+  readonly live: boolean;
+  readonly definition: string;
+  readonly predicate: string | null;
 }
 
 interface FunctionCatalogRow {
@@ -467,6 +507,7 @@ async function attestCatalog(
   }
 
   await attestTables(transaction, runtimeRole);
+  await attestSchemaManifest(transaction);
   await attestFunctions(transaction, runtimeRole);
   await attestTriggers(transaction);
   await attestPolicies(transaction);
@@ -527,6 +568,149 @@ async function attestTables(
     ) {
       throw catalogMismatch("table_contract", row.relname);
     }
+  }
+}
+
+async function attestSchemaManifest(transaction: PostgresTransaction): Promise<void> {
+  const columnRows = await transaction<ColumnCatalogRow[]>`
+    SELECT
+      relation.relname AS table_name,
+      attribute.attnum AS ordinal_position,
+      attribute.attname AS column_name,
+      pg_catalog.format_type(attribute.atttypid, attribute.atttypmod) AS data_type,
+      attribute.attnotnull AS not_null,
+      pg_catalog.pg_get_expr(
+        default_value.adbin,
+        default_value.adrelid,
+        true
+      ) AS default_expression,
+      attribute.attidentity AS identity_kind,
+      attribute.attgenerated AS generated_kind,
+      CASE
+        WHEN attribute.attcollation = 0 THEN NULL
+        ELSE collation_namespace.nspname || '.' || collation_catalog.collname
+      END AS collation_name
+    FROM pg_catalog.pg_attribute AS attribute
+    JOIN pg_catalog.pg_class AS relation ON relation.oid = attribute.attrelid
+    JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+    LEFT JOIN pg_catalog.pg_attrdef AS default_value
+      ON default_value.adrelid = attribute.attrelid
+      AND default_value.adnum = attribute.attnum
+    LEFT JOIN pg_catalog.pg_collation AS collation_catalog
+      ON collation_catalog.oid = attribute.attcollation
+    LEFT JOIN pg_catalog.pg_namespace AS collation_namespace
+      ON collation_namespace.oid = collation_catalog.collnamespace
+    WHERE namespace.nspname = 'accounts'
+      AND relation.relkind = 'r'
+      AND attribute.attnum > 0
+      AND NOT attribute.attisdropped
+    ORDER BY relation.relname, attribute.attnum
+  `;
+  const columns: PostgresColumnManifestEntry[] = columnRows.map((row) => [
+    row.table_name,
+    row.ordinal_position,
+    row.column_name,
+    row.data_type,
+    row.not_null,
+    row.default_expression,
+    row.identity_kind,
+    row.generated_kind,
+    row.collation_name,
+  ]);
+  assertManifestEntries("columns", columns, POSTGRES_SCHEMA_MANIFEST.columns);
+
+  const constraintRows = await transaction<ConstraintCatalogRow[]>`
+    SELECT
+      relation.relname AS table_name,
+      constraint_entry.conname AS constraint_name,
+      constraint_entry.contype AS constraint_type,
+      pg_catalog.pg_get_constraintdef(constraint_entry.oid, true) AS definition,
+      constraint_entry.condeferrable AS deferrable,
+      constraint_entry.condeferred AS initially_deferred,
+      constraint_entry.convalidated AS validated
+    FROM pg_catalog.pg_constraint AS constraint_entry
+    JOIN pg_catalog.pg_class AS relation ON relation.oid = constraint_entry.conrelid
+    JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+    WHERE namespace.nspname = 'accounts'
+      AND constraint_entry.contype IN ('p', 'u', 'c', 'f')
+    ORDER BY relation.relname, constraint_entry.conname
+  `;
+  const constraints: PostgresConstraintManifestEntry[] = constraintRows.map((row) => [
+    row.table_name,
+    row.constraint_name,
+    row.constraint_type,
+    row.definition,
+    row.deferrable,
+    row.initially_deferred,
+    row.validated,
+  ]);
+  assertManifestEntries(
+    "constraints",
+    constraints,
+    POSTGRES_SCHEMA_MANIFEST.constraints,
+  );
+
+  const indexRows = await transaction<IndexCatalogRow[]>`
+    SELECT
+      table_relation.relname AS table_name,
+      index_relation.relname AS index_name,
+      access_method.amname AS access_method,
+      index_entry.indisunique AS unique_index,
+      index_entry.indisvalid AS valid,
+      index_entry.indisready AS ready,
+      index_entry.indislive AS live,
+      pg_catalog.pg_get_indexdef(index_relation.oid, 0, true) AS definition,
+      pg_catalog.pg_get_expr(
+        index_entry.indpred,
+        index_entry.indrelid,
+        true
+      ) AS predicate
+    FROM pg_catalog.pg_index AS index_entry
+    JOIN pg_catalog.pg_class AS index_relation
+      ON index_relation.oid = index_entry.indexrelid
+    JOIN pg_catalog.pg_class AS table_relation
+      ON table_relation.oid = index_entry.indrelid
+    JOIN pg_catalog.pg_namespace AS namespace
+      ON namespace.oid = table_relation.relnamespace
+    JOIN pg_catalog.pg_am AS access_method
+      ON access_method.oid = index_relation.relam
+    LEFT JOIN pg_catalog.pg_constraint AS constraint_entry
+      ON constraint_entry.conindid = index_entry.indexrelid
+    WHERE namespace.nspname = 'accounts'
+      AND constraint_entry.oid IS NULL
+    ORDER BY table_relation.relname, index_relation.relname
+  `;
+  const indexes: PostgresIndexManifestEntry[] = indexRows.map((row) => [
+    row.table_name,
+    row.index_name,
+    row.access_method,
+    row.unique_index,
+    row.valid,
+    row.ready,
+    row.live,
+    row.definition,
+    row.predicate,
+  ]);
+  assertManifestEntries("indexes", indexes, POSTGRES_SCHEMA_MANIFEST.indexes);
+}
+
+function assertManifestEntries<T extends readonly unknown[]>(
+  component: "columns" | "constraints" | "indexes",
+  actual: readonly T[],
+  expected: readonly T[],
+): void {
+  const mismatchIndex = actual.findIndex(
+    (entry, index) => JSON.stringify(entry) !== JSON.stringify(expected[index]),
+  );
+  if (actual.length !== expected.length || mismatchIndex !== -1) {
+    const index = mismatchIndex === -1
+      ? Math.min(actual.length, expected.length)
+      : mismatchIndex;
+    const entry = actual[index] ?? expected[index];
+    const object = entry === undefined
+      ? undefined
+      : entry.slice(0, Math.min(3, entry.length)).map(String).join(".");
+    throw catalogMismatch(component, object);
   }
 }
 

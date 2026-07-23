@@ -11,6 +11,7 @@ import {
   POSTGRES_RUNTIME_MUTABLE_TABLES,
 } from "./postgres-migrations.js";
 import { runPostgresMigrations } from "./postgres-migrator.js";
+import { POSTGRES_SCHEMA_MANIFEST } from "./postgres-schema-manifest.js";
 import type { PostgresSqlClient, PostgresTransaction } from "./postgres-sql.js";
 
 const RUNTIME_ROLE = {
@@ -131,6 +132,43 @@ function fakeClient(state: FakeMigrationState): PostgresSqlClient {
         runtime_references: false,
         runtime_trigger: false,
         public_any: false,
+      }));
+    }
+    if (query.includes("attribute.attnum AS ordinal_position")) {
+      return POSTGRES_SCHEMA_MANIFEST.columns.map((entry) => ({
+        table_name: entry[0],
+        ordinal_position: entry[1],
+        column_name: entry[2],
+        data_type: entry[3],
+        not_null: entry[4],
+        default_expression: entry[5],
+        identity_kind: entry[6],
+        generated_kind: entry[7],
+        collation_name: entry[8],
+      }));
+    }
+    if (query.includes("constraint_entry.conname AS constraint_name")) {
+      return POSTGRES_SCHEMA_MANIFEST.constraints.map((entry) => ({
+        table_name: entry[0],
+        constraint_name: entry[1],
+        constraint_type: entry[2],
+        definition: entry[3],
+        deferrable: entry[4],
+        initially_deferred: entry[5],
+        validated: entry[6],
+      }));
+    }
+    if (query.includes("index_relation.relname AS index_name")) {
+      return POSTGRES_SCHEMA_MANIFEST.indexes.map((entry) => ({
+        table_name: entry[0],
+        index_name: entry[1],
+        access_method: entry[2],
+        unique_index: entry[3],
+        valid: entry[4],
+        ready: entry[5],
+        live: entry[6],
+        definition: entry[7],
+        predicate: entry[8],
       }));
     }
     if (query.includes("pg_get_function_identity_arguments")) {

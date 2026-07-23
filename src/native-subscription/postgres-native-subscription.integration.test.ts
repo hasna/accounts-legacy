@@ -13,6 +13,7 @@ import {
   POSTGRES_SCHEMA_VERSION,
 } from "./postgres-migrations.js";
 import { runPostgresMigrations } from "./postgres-migrator.js";
+import { POSTGRES_SCHEMA_MANIFEST } from "./postgres-schema-manifest.js";
 import {
   installPostgresRuntimeContext,
   type PostgresRuntimeRoleBoundary,
@@ -86,6 +87,31 @@ describePostgres("native-subscription PostgreSQL catalog and concurrency", () =>
       consumeReceiptBytes: Uint8Array.from(Buffer.from('{"receipt":"live-concurrency"}')),
       committedAt: "2030-07-18T12:01:00.000Z",
     };
+  }
+
+  function identifier(value: string): string {
+    return `"${value.replaceAll('"', '""')}"`;
+  }
+
+  async function expectSchemaDrift(
+    mutations: readonly string[],
+    restorations: readonly string[],
+  ): Promise<void> {
+    for (const mutation of mutations) await ownerSql.unsafe(mutation).simple();
+    try {
+      await expect(runPostgresMigrations(
+        ownerSql as unknown as PostgresSqlClient,
+        { runtimeRole: roleBoundary },
+      )).rejects.toMatchObject({ code: "SCHEMA_CHECKSUM_MISMATCH" });
+    } finally {
+      for (const restoration of restorations) {
+        await ownerSql.unsafe(restoration).simple();
+      }
+    }
+    expect((await runPostgresMigrations(
+      ownerSql as unknown as PostgresSqlClient,
+      { runtimeRole: roleBoundary },
+    )).appliedVersions).toEqual([]);
   }
 
   beforeAll(async () => {
@@ -244,6 +270,201 @@ describePostgres("native-subscription PostgreSQL catalog and concurrency", () =>
       ownerSql as unknown as PostgresSqlClient,
       { runtimeRole: roleBoundary },
     )).appliedVersions).toEqual([]);
+  });
+
+  test("rejects every dropped CAS and maintenance PK/UNIQUE/CHECK/FK invariant", async () => {
+    const tables = new Set([
+      "capability_use_consumptions",
+      "capsule_maintenance_grants",
+      "capsule_maintenance_uses",
+    ]);
+    const referencedUnique =
+      "capsule_maintenance_grants_grant_id_owner_ref_key";
+    const dependentForeignKey =
+      "capsule_maintenance_uses_grant_id_owner_ref_fkey";
+    const constraints = POSTGRES_SCHEMA_MANIFEST.constraints.filter(
+      (entry) => tables.has(entry[0]),
+    );
+
+    for (const [tableName, constraintName, , definition] of constraints) {
+      if (constraintName === referencedUnique) continue;
+      await expectSchemaDrift(
+        [
+          `ALTER TABLE accounts.${identifier(tableName)} ` +
+          `DROP CONSTRAINT ${identifier(constraintName)}`,
+        ],
+        [
+          `ALTER TABLE accounts.${identifier(tableName)} ` +
+          `ADD CONSTRAINT ${identifier(constraintName)} ${definition}`,
+        ],
+      );
+    }
+
+    const uniqueDefinition = constraints.find(
+      (entry) => entry[1] === referencedUnique,
+    )?.[3];
+    const foreignKeyDefinition = constraints.find(
+      (entry) => entry[1] === dependentForeignKey,
+    )?.[3];
+    expect(uniqueDefinition).toBeDefined();
+    expect(foreignKeyDefinition).toBeDefined();
+    await expectSchemaDrift(
+      [
+        `ALTER TABLE accounts.capsule_maintenance_uses ` +
+        `DROP CONSTRAINT ${identifier(dependentForeignKey)}`,
+        `ALTER TABLE accounts.capsule_maintenance_grants ` +
+        `DROP CONSTRAINT ${identifier(referencedUnique)}`,
+      ],
+      [
+        `ALTER TABLE accounts.capsule_maintenance_grants ` +
+        `ADD CONSTRAINT ${identifier(referencedUnique)} ${uniqueDefinition}`,
+        `ALTER TABLE accounts.capsule_maintenance_uses ` +
+        `ADD CONSTRAINT ${identifier(dependentForeignKey)} ${foreignKeyDefinition}`,
+      ],
+    );
+    expect(constraints).toHaveLength(27);
+  });
+
+  test("rejects altered column, collation, ordered-key, FK-action, check, and partial-index contracts", async () => {
+    await expectSchemaDrift(
+      [
+        `ALTER TABLE accounts.capability_use_consumptions
+         ALTER COLUMN committed_at DROP NOT NULL`,
+      ],
+      [
+        `ALTER TABLE accounts.capability_use_consumptions
+         ALTER COLUMN committed_at SET NOT NULL`,
+      ],
+    );
+    await expectSchemaDrift(
+      [
+        `ALTER TABLE accounts.capsule_maintenance_grants
+         ALTER COLUMN expires_at DROP NOT NULL`,
+      ],
+      [
+        `ALTER TABLE accounts.capsule_maintenance_grants
+         ALTER COLUMN expires_at SET NOT NULL`,
+      ],
+    );
+    await expectSchemaDrift(
+      [
+        `ALTER TABLE accounts.capsule_maintenance_uses
+         ALTER COLUMN committed_at DROP NOT NULL`,
+      ],
+      [
+        `ALTER TABLE accounts.capsule_maintenance_uses
+         ALTER COLUMN committed_at SET NOT NULL`,
+      ],
+    );
+    await expectSchemaDrift(
+      [
+        `ALTER TABLE accounts.capability_use_consumptions
+         ALTER COLUMN receipt_jcs_base64url TYPE text COLLATE "C"`,
+      ],
+      [
+        `ALTER TABLE accounts.capability_use_consumptions
+         ALTER COLUMN receipt_jcs_base64url TYPE text COLLATE "default"`,
+      ],
+    );
+
+    const capabilityOrdinalConstraint =
+      "capability_use_consumptions_owner_ref_capability_id_key";
+    await expectSchemaDrift(
+      [
+        `ALTER TABLE accounts.capability_use_consumptions
+         DROP CONSTRAINT ${identifier(capabilityOrdinalConstraint)}`,
+        `ALTER TABLE accounts.capability_use_consumptions
+         ADD CONSTRAINT ${identifier(capabilityOrdinalConstraint)}
+         UNIQUE (capability_id, owner_ref)`,
+      ],
+      [
+        `ALTER TABLE accounts.capability_use_consumptions
+         DROP CONSTRAINT ${identifier(capabilityOrdinalConstraint)}`,
+        `ALTER TABLE accounts.capability_use_consumptions
+         ADD CONSTRAINT ${identifier(capabilityOrdinalConstraint)}
+         UNIQUE (owner_ref, capability_id)`,
+      ],
+    );
+
+    const capabilityDigestCheck =
+      "capability_use_consumptions_request_digest_check";
+    await expectSchemaDrift(
+      [
+        `ALTER TABLE accounts.capability_use_consumptions
+         DROP CONSTRAINT ${identifier(capabilityDigestCheck)}`,
+        `ALTER TABLE accounts.capability_use_consumptions
+         ADD CONSTRAINT ${identifier(capabilityDigestCheck)}
+         CHECK (request_digest LIKE 'sha256:%')`,
+      ],
+      [
+        `ALTER TABLE accounts.capability_use_consumptions
+         DROP CONSTRAINT ${identifier(capabilityDigestCheck)}`,
+        `ALTER TABLE accounts.capability_use_consumptions
+         ADD CONSTRAINT ${identifier(capabilityDigestCheck)}
+         CHECK (request_digest ~ '^sha256:[0-9a-f]{64}$')`,
+      ],
+    );
+
+    const maintenanceUseForeignKey =
+      "capsule_maintenance_uses_grant_id_owner_ref_fkey";
+    await expectSchemaDrift(
+      [
+        `ALTER TABLE accounts.capsule_maintenance_uses
+         DROP CONSTRAINT ${identifier(maintenanceUseForeignKey)}`,
+        `ALTER TABLE accounts.capsule_maintenance_uses
+         ADD CONSTRAINT ${identifier(maintenanceUseForeignKey)}
+         FOREIGN KEY (grant_id, owner_ref)
+         REFERENCES accounts.capsule_maintenance_grants(grant_id, owner_ref)
+         ON DELETE CASCADE`,
+      ],
+      [
+        `ALTER TABLE accounts.capsule_maintenance_uses
+         DROP CONSTRAINT ${identifier(maintenanceUseForeignKey)}`,
+        `ALTER TABLE accounts.capsule_maintenance_uses
+         ADD CONSTRAINT ${identifier(maintenanceUseForeignKey)}
+         FOREIGN KEY (grant_id, owner_ref)
+         REFERENCES accounts.capsule_maintenance_grants(grant_id, owner_ref)
+         ON DELETE RESTRICT`,
+      ],
+    );
+
+    const reservationIndex = "capsule_maintenance_one_live_reservation";
+    await expectSchemaDrift(
+      [`DROP INDEX accounts.${identifier(reservationIndex)}`],
+      [
+        `CREATE UNIQUE INDEX ${identifier(reservationIndex)}
+         ON accounts.capsule_maintenance_grants(owner_ref, reservation_key_digest)
+         WHERE state = 'live'`,
+      ],
+    );
+    await expectSchemaDrift(
+      [
+        `DROP INDEX accounts.${identifier(reservationIndex)}`,
+        `CREATE UNIQUE INDEX ${identifier(reservationIndex)}
+         ON accounts.capsule_maintenance_grants(reservation_key_digest, owner_ref)
+         WHERE state = 'live'`,
+      ],
+      [
+        `DROP INDEX accounts.${identifier(reservationIndex)}`,
+        `CREATE UNIQUE INDEX ${identifier(reservationIndex)}
+         ON accounts.capsule_maintenance_grants(owner_ref, reservation_key_digest)
+         WHERE state = 'live'`,
+      ],
+    );
+    await expectSchemaDrift(
+      [
+        `DROP INDEX accounts.${identifier(reservationIndex)}`,
+        `CREATE UNIQUE INDEX ${identifier(reservationIndex)}
+         ON accounts.capsule_maintenance_grants(owner_ref, reservation_key_digest)
+         WHERE state IN ('live', 'expired')`,
+      ],
+      [
+        `DROP INDEX accounts.${identifier(reservationIndex)}`,
+        `CREATE UNIQUE INDEX ${identifier(reservationIndex)}
+         ON accounts.capsule_maintenance_grants(owner_ref, reservation_key_digest)
+         WHERE state = 'live'`,
+      ],
+    );
   });
 
   test("rolls back package SQL when runtime-role attestation fails", async () => {

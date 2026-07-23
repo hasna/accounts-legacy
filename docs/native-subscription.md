@@ -61,9 +61,12 @@ await runPostgresMigrations(accountsCapacityMigrationSql, { runtimeRole });
 The migrator reapplies the exact package-owned ACL and then catalog-attests the
 runtime/login role attributes and membership, schema and object ownership,
 public and runtime grants, RLS plus `FORCE ROW LEVEL SECURITY`, every policy,
-function security/search-path/execute contract, and every trigger. A matching
-checksum ledger is necessary but not sufficient; drift fails closed with
-`SCHEMA_CHECKSUM_MISMATCH`.
+function security/search-path/execute contract, and every trigger. It also
+compares the live PostgreSQL 17 catalog to the canonical package manifest for
+every ordered column definition, PK/UNIQUE/CHECK/FK constraint, and
+package-owned index definition including ordered keys and partial predicates.
+A matching checksum ledger is necessary but not sufficient; drift fails closed
+with `SCHEMA_CHECKSUM_MISMATCH`.
 
 ```ts
 import {
