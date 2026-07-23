@@ -92,6 +92,9 @@ export interface ApplyTransactionTracker {
   profileAuthSnapshots?: ClaudeProfileAuthSnapshot[];
   applyRollback?: ApplyRollbackState;
   keychainLeaseHeld?: boolean;
+  /** Exact cross-process lock tokens persisted before acquisition. */
+  keychainLockToken?: string;
+  applyLockToken?: string;
   /** Persist the current rollback ownership before crossing a hard-death boundary. */
   persist?: () => void;
 }
@@ -167,7 +170,10 @@ export async function applyProfile(
   const toolProfiles = await store.listProfiles(tool.id);
   let releaseKeychainLease: (() => void) | undefined;
   if (keychainSupported() && !tracker?.keychainLeaseHeld) {
-    releaseKeychainLease = await acquireClaudeKeychainLock();
+    releaseKeychainLease = await acquireClaudeKeychainLock(
+      undefined,
+      tracker?.keychainLockToken,
+    );
   }
   let keychainBefore: KeychainCredential | undefined;
   try {
@@ -241,7 +247,7 @@ export async function applyProfile(
         );
       }
       return { ...result, profile: active.profile, currentRevision: active.currentRevision };
-    });
+    }, tracker?.applyLockToken);
   } finally {
     releaseKeychainLease?.();
   }

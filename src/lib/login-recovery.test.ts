@@ -1,9 +1,18 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { serialize } from "node:v8";
 import {
+  recoverAbandonedLoginLeaseIntents,
   releaseAbandonedLoginJournalLocks,
   type LoginRecoveryJournal,
 } from "./login-recovery.js";
@@ -26,16 +35,19 @@ afterEach(() => {
 });
 
 test.skipIf(process.platform !== "linux")(
-  "reclaims exact stale-incarnation locks when the owner PID was reused",
+  "does not reclaim a newer exact-token lock when the owner PID was reused",
   () => {
     const profileDir = join(home, "profiles", "claude", "acct");
     const uid = typeof process.getuid === "function" ? process.getuid() : "user";
     const identity = createHash("sha256").update(profileDir).digest("hex").slice(0, 32);
     profileLock = join("/tmp", `accounts-claude-login-${uid}-${identity}.lock`);
     const keychainLock = process.env.ACCOUNTS_TEST_KEYCHAIN_LOCK_PATH!;
-    const exactOwnerToken = `${process.pid}:${randomUUID()}\n`;
-    writeFileSync(profileLock, exactOwnerToken, { mode: 0o600 });
-    writeFileSync(keychainLock, exactOwnerToken, { mode: 0o600 });
+    const newerProfileToken = `${process.pid}:${randomUUID()}`;
+    const newerKeychainToken = `${process.pid}:${randomUUID()}`;
+    const newerApplyToken = `${process.pid}:${randomUUID()}`;
+    writeFileSync(profileLock, newerProfileToken, { mode: 0o600 });
+    writeFileSync(keychainLock, newerKeychainToken, { mode: 0o600 });
+    writeFileSync(join(home, ".apply.lock"), `${newerApplyToken}\n`, { mode: 0o600 });
 
     releaseAbandonedLoginJournalLocks({
       ownerPid: process.pid,
@@ -44,9 +56,130 @@ test.skipIf(process.platform !== "linux")(
         tool: { id: "claude" },
         profile: { dir: profileDir },
       },
+      finalizationState: {
+        writes: {
+          keychainLockToken: `${process.pid}:${randomUUID()}`,
+          applyLockToken: `${process.pid}:${randomUUID()}`,
+        },
+      },
     } as unknown as LoginRecoveryJournal);
 
-    expect(existsSync(profileLock)).toBe(false);
+    expect(readFileSync(profileLock, "utf8")).toBe(newerProfileToken);
+    expect(readFileSync(keychainLock, "utf8")).toBe(newerKeychainToken);
+    expect(readFileSync(join(home, ".apply.lock"), "utf8")).toBe(`${newerApplyToken}\n`);
+  },
+);
+
+test.skipIf(process.platform !== "linux")(
+  "reclaims only the matching exact tokens recorded by a dead finalization",
+  () => {
+    const profileDir = join(home, "profiles", "claude", "acct");
+    const uid = typeof process.getuid === "function" ? process.getuid() : "user";
+    const identity = createHash("sha256").update(profileDir).digest("hex").slice(0, 32);
+    profileLock = join("/tmp", `accounts-claude-login-${uid}-${identity}.lock`);
+    const keychainLock = process.env.ACCOUNTS_TEST_KEYCHAIN_LOCK_PATH!;
+    const keychainToken = `${process.pid}:${randomUUID()}`;
+    const applyToken = `${process.pid}:${randomUUID()}`;
+    writeFileSync(keychainLock, keychainToken, { mode: 0o600 });
+    writeFileSync(join(home, ".apply.lock"), `${applyToken}\n`, { mode: 0o600 });
+
+    releaseAbandonedLoginJournalLocks({
+      ownerPid: process.pid,
+      ownerProcessStartId: "linux-0",
+      preparation: {
+        tool: { id: "claude" },
+        profile: { dir: profileDir },
+      },
+      finalizationState: {
+        writes: {
+          keychainLockToken: keychainToken,
+          applyLockToken: applyToken,
+        },
+      },
+    } as unknown as LoginRecoveryJournal);
+
     expect(existsSync(keychainLock)).toBe(false);
+    expect(existsSync(join(home, ".apply.lock"))).toBe(false);
+  },
+);
+
+test.skipIf(process.platform !== "linux")(
+  "reclaims later dead finalization tokens after earlier mismatched contenders are skipped",
+  () => {
+    const profileDir = join(home, "profiles", "claude", "acct");
+    const keychainLock = process.env.ACCOUNTS_TEST_KEYCHAIN_LOCK_PATH!;
+    const firstKeychainToken = `${process.pid}:${randomUUID()}`;
+    const firstApplyToken = `${process.pid}:${randomUUID()}`;
+    const secondKeychainToken = `${process.pid}:${randomUUID()}`;
+    const secondApplyToken = `${process.pid}:${randomUUID()}`;
+    writeFileSync(keychainLock, secondKeychainToken, { mode: 0o600 });
+    writeFileSync(join(home, ".apply.lock"), `${secondApplyToken}\n`, { mode: 0o600 });
+
+    for (const [keychainLockToken, applyLockToken] of [
+      [firstKeychainToken, firstApplyToken],
+      [secondKeychainToken, secondApplyToken],
+    ] as const) {
+      releaseAbandonedLoginJournalLocks({
+        ownerPid: process.pid,
+        ownerProcessStartId: "linux-0",
+        preparation: {
+          tool: { id: "claude" },
+          profile: { dir: profileDir },
+        },
+        finalizationState: {
+          writes: { keychainLockToken, applyLockToken },
+        },
+      } as unknown as LoginRecoveryJournal);
+    }
+
+    expect(existsSync(keychainLock)).toBe(false);
+    expect(existsSync(join(home, ".apply.lock"))).toBe(false);
+  },
+);
+
+test.skipIf(process.platform !== "linux")(
+  "processes multiple dead profile contenders independently without touching unrelated leases",
+  () => {
+    const profileDir = join(home, "profiles", "claude", "acct");
+    const uid = typeof process.getuid === "function" ? process.getuid() : "user";
+    const identity = createHash("sha256").update(profileDir).digest("hex").slice(0, 32);
+    profileLock = join("/tmp", `accounts-claude-login-${uid}-${identity}.lock`);
+    const firstId = "00000000-0000-4000-8000-000000000001";
+    const secondId = "00000000-0000-4000-8000-000000000002";
+    const firstToken = `${process.pid}:${randomUUID()}`;
+    const secondToken = `${process.pid}:${randomUUID()}`;
+    const keychainToken = `${process.pid}:${randomUUID()}`;
+    const applyToken = `${process.pid}:${randomUUID()}`;
+    const directory = join(home, "login-finalization-journals");
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    for (const [id, profileLockToken] of [
+      [firstId, firstToken],
+      [secondId, secondToken],
+    ] as const) {
+      writeFileSync(
+        join(directory, `${id}.lease`),
+        serialize({
+          version: 1,
+          id,
+          ownerPid: process.pid,
+          ownerProcessStartId: "linux-0",
+          profileDir,
+          profileLockToken,
+        }),
+        { mode: 0o600 },
+      );
+    }
+    writeFileSync(profileLock, secondToken, { mode: 0o600 });
+    writeFileSync(process.env.ACCOUNTS_TEST_KEYCHAIN_LOCK_PATH!, keychainToken, { mode: 0o600 });
+    writeFileSync(join(home, ".apply.lock"), `${applyToken}\n`, { mode: 0o600 });
+
+    recoverAbandonedLoginLeaseIntents();
+
+    expect(existsSync(profileLock)).toBe(false);
+    expect(existsSync(join(directory, `${firstId}.lease`))).toBe(false);
+    expect(existsSync(join(directory, `${secondId}.lease`))).toBe(false);
+    expect(readFileSync(process.env.ACCOUNTS_TEST_KEYCHAIN_LOCK_PATH!, "utf8"))
+      .toBe(keychainToken);
+    expect(readFileSync(join(home, ".apply.lock"), "utf8")).toBe(`${applyToken}\n`);
   },
 );

@@ -244,12 +244,30 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export async function acquireClaudeKeychainLock(signal?: AbortSignal): Promise<() => void> {
+const PROCESS_LOCK_TOKEN_RE = /^[1-9]\d*:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/** Pre-generate the byte-exact ownership token that a durable caller records before acquisition. */
+export function createClaudeProcessLockToken(): string {
+  return `${process.pid}:${randomUUID()}`;
+}
+
+function requireClaudeProcessLockToken(token: string): string {
+  if (!PROCESS_LOCK_TOKEN_RE.test(token) || !token.startsWith(`${process.pid}:`)) {
+    throw new AccountsError("invalid Claude process lock ownership token");
+  }
+  return token;
+}
+
+export async function acquireClaudeKeychainLock(
+  signal?: AbortSignal,
+  exactToken: string = createClaudeProcessLockToken(),
+): Promise<() => void> {
   return acquireClaudeProcessLock(
     keychainLockPath(),
     "Claude keychain",
     "ACCOUNTS_TEST_KEYCHAIN_LOCK_TIMEOUT_MS",
     signal,
+    exactToken,
   );
 }
 
@@ -279,12 +297,14 @@ function profileLoginLockPath(profileDir: string): string {
 export async function acquireClaudeProfileLoginLock(
   profileDir: string,
   signal?: AbortSignal,
+  exactToken: string = createClaudeProcessLockToken(),
 ): Promise<() => void> {
   return acquireClaudeProcessLock(
     profileLoginLockPath(profileDir),
     "Claude profile login",
     "ACCOUNTS_TEST_PROFILE_LOGIN_LOCK_TIMEOUT_MS",
     signal,
+    exactToken,
   );
 }
 
@@ -293,8 +313,9 @@ async function acquireClaudeProcessLock(
   label: string,
   timeoutSetting: string,
   signal?: AbortSignal,
+  exactToken: string = createClaudeProcessLockToken(),
 ): Promise<() => void> {
-  const token = `${process.pid}:${randomUUID()}`;
+  const token = requireClaudeProcessLockToken(exactToken);
   const deadline = Date.now() + numericTestSetting(timeoutSetting, 600_000);
 
   while (true) {

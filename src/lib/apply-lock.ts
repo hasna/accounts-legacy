@@ -1,4 +1,18 @@
-import { closeSync, existsSync, fstatSync, lstatSync, mkdirSync, openSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import {
+  closeSync,
+  existsSync,
+  fstatSync,
+  fsyncSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { accountsHome, withStoreLock } from "../storage.js";
 import { AccountsError } from "../types.js";
@@ -14,49 +28,79 @@ function lockPath(): string {
 export const DEFAULT_APPLY_LOCK_WAIT_MS = 60_000;
 
 interface ApplyLockLease {
-  fd: number;
   path: string;
   dev: number;
   ino: number;
+  token: string;
 }
 
-function tryAcquireApplyLock(): ApplyLockLease | undefined {
+const APPLY_LOCK_TOKEN_RE = /^[1-9]\d*:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/** Pre-generate the exact token a durable operation records before acquiring the apply lock. */
+export function createApplyLockToken(): string {
+  return `${process.pid}:${randomUUID()}`;
+}
+
+function requireApplyLockToken(token: string): string {
+  if (!APPLY_LOCK_TOKEN_RE.test(token) || !token.startsWith(`${process.pid}:`)) {
+    throw new AccountsError("invalid apply lock ownership token");
+  }
+  return token;
+}
+
+function fsyncDirectory(path: string): void {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    fsyncSync(fd);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (!["EINVAL", "ENOTSUP", "EOPNOTSUPP", "EPERM", "EACCES", "EISDIR"].includes(code ?? "")) {
+      throw error;
+    }
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function tryAcquireApplyLock(exactToken: string = createApplyLockToken()): ApplyLockLease | undefined {
+  const token = requireApplyLockToken(exactToken);
   return withStoreLock(() => {
     const home = accountsHome();
     mkdirSync(home, { recursive: true });
     const path = lockPath();
+    const candidate = `${path}.candidate-${process.pid}-${randomUUID()}`;
     let fd: number | undefined;
-    let dev: number | undefined;
-    let ino: number | undefined;
     try {
-      fd = openSync(path, "wx", 0o600);
+      fd = openSync(candidate, "wx", 0o600);
+      writeFileSync(fd, `${token}\n`, { encoding: "utf8", mode: 0o600 });
+      fsyncSync(fd);
       const stat = fstatSync(fd);
-      dev = stat.dev;
-      ino = stat.ino;
-      writeFileSync(fd, `${process.pid}\n`, { encoding: "utf8", mode: 0o600 });
-      return { fd, path, dev, ino };
-    } catch (err) {
-      if (fd !== undefined) {
-        // Every cooperating acquirer/releaser holds the registry lock here, so
-        // inode validation and unlink cannot race another Accounts lease.
-        try {
-          if (dev !== undefined && ino !== undefined && existsSync(path)) {
-            const current = lstatSync(path);
-            if (current.isFile() && !current.isSymbolicLink() && current.dev === dev && current.ino === ino) {
-              unlinkSync(path);
-            }
-          }
-        } catch {
-          /* preserve the original acquisition error and fail closed */
+      closeSync(fd);
+      fd = undefined;
+      try {
+        // Publish a fully initialized inode. A hard death can leave an owned
+        // complete lock, never an empty/partial lock that recovery cannot CAS.
+        linkSync(candidate, path);
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === "EEXIST") {
+          return undefined;
         }
-        closeSync(fd);
+        throw error;
       }
+      rmSync(candidate, { force: true });
+      fsyncDirectory(home);
+      return { path, dev: stat.dev, ino: stat.ino, token };
+    } catch (err) {
+      if (fd !== undefined) closeSync(fd);
       const code = (err as NodeJS.ErrnoException).code;
-      if (code === "EEXIST") return undefined;
       if (code === "ENOENT") {
         throw new AccountsError(`could not create apply lock at ${path}: accounts home missing`);
       }
       throw err;
+    } finally {
+      rmSync(candidate, { force: true });
     }
   });
 }
@@ -71,7 +115,8 @@ function releaseApplyLock(lease: ApplyLockLease): void {
           current.isFile() &&
           !current.isSymbolicLink() &&
           current.dev === lease.dev &&
-          current.ino === lease.ino
+          current.ino === lease.ino &&
+          readFileSync(lease.path, "utf8") === `${lease.token}\n`
         ) {
           unlinkSync(lease.path);
         }
@@ -82,14 +127,12 @@ function releaseApplyLock(lease: ApplyLockLease): void {
   } catch {
     // If the registry lock is unavailable, retain the apply lock for manual
     // recovery rather than risking deletion of a replacement lease.
-  } finally {
-    closeSync(lease.fd);
   }
 }
 
 /** Exclusive lock for apply operations (best-effort cross-process). */
-export function withApplyLock<T>(fn: () => T): T {
-  const lease = tryAcquireApplyLock();
+export function withApplyLock<T>(fn: () => T, exactToken?: string): T {
+  const lease = tryAcquireApplyLock(exactToken);
   if (!lease) {
     throw new AccountsError(
       `another accounts apply is in progress at ${lockPath()}; ` +
@@ -104,8 +147,11 @@ export function withApplyLock<T>(fn: () => T): T {
 }
 
 /** Exclusive apply lock for async activation/rollback; never wrap an interactive child with it. */
-export async function withApplyLockAsync<T>(fn: () => Promise<T>): Promise<T> {
-  const lease = tryAcquireApplyLock();
+export async function withApplyLockAsync<T>(
+  fn: () => Promise<T>,
+  exactToken?: string,
+): Promise<T> {
+  const lease = tryAcquireApplyLock(exactToken);
   if (!lease) {
     throw new AccountsError(
       `another accounts apply is in progress at ${lockPath()}; ` +
@@ -122,13 +168,13 @@ export async function withApplyLockAsync<T>(fn: () => Promise<T>): Promise<T> {
 /** Wait for an in-flight apply, then run a synchronous rollback check under the same lock. */
 export async function withApplyLockWait<T>(
   fn: () => T,
-  opts: { timeoutMs?: number; pollMs?: number } = {},
+  opts: { timeoutMs?: number; pollMs?: number; exactToken?: string } = {},
 ): Promise<T> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_APPLY_LOCK_WAIT_MS;
   const pollMs = opts.pollMs ?? 25;
   const deadline = Date.now() + timeoutMs;
   while (true) {
-    const lease = tryAcquireApplyLock();
+    const lease = tryAcquireApplyLock(opts.exactToken);
     if (lease) {
       try {
         return fn();

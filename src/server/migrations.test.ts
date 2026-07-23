@@ -6,6 +6,7 @@ import {
   assertAccountsMigrationDeploySafe,
   resolveMigrationsDir,
   APP_MIGRATION_FILES,
+  LOGIN_CLEANUP_MIGRATION_BLOCKER_REASON,
 } from "./migrations.js";
 
 describe("accounts migrations", () => {
@@ -89,6 +90,9 @@ describe("accounts migrations", () => {
   });
 
   test("deployment remains blocked while cleanup migration atomicity is unresolved", () => {
+    expect(LOGIN_CLEANUP_MIGRATION_BLOCKER_REASON).toBe(
+      "login-cleanup-ledger-atomicity",
+    );
     let deploymentError: unknown;
     try {
       assertAccountsMigrationDeploySafe({
@@ -103,14 +107,17 @@ describe("accounts migrations", () => {
     expect(deploymentError).toBeInstanceOf(Error);
     const deploymentMessage = deploymentError instanceof Error ? deploymentError.message : "";
     expect(deploymentMessage).toContain("accounts migration 0010 is deployment-blocked");
+    expect(deploymentMessage).toContain(LOGIN_CLEANUP_MIGRATION_BLOCKER_REASON);
     expect(deploymentMessage).toContain("checksum-ledger recording");
     expect(deploymentMessage).toContain("same advisory lock");
+    expect(deploymentMessage).toContain("before running accounts-migrate");
     const deploymentGuide = readFileSync(
       join(process.cwd(), "docs", "STORAGE_STABILIZATION.md"),
       "utf8",
     );
     expect(deploymentGuide).toContain("Do not run `accounts-migrate`");
     expect(deploymentGuide).toContain("Source merge does not apply migrations");
+    expect(deploymentGuide).toContain(LOGIN_CLEANUP_MIGRATION_BLOCKER_REASON);
     const internalTodoId = /\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/i;
     expect(deploymentMessage).not.toMatch(internalTodoId);
     expect(deploymentGuide).not.toMatch(internalTodoId);

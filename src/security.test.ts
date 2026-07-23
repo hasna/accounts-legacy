@@ -22,7 +22,12 @@ import {
 import { CLAUDE_KEYCHAIN_SERVICE } from "./lib/claude-layout.js";
 import { saveStore, loadStore } from "./storage.js";
 import { shellQuotePath, hookScript } from "./lib/hook.js";
-import { withApplyLock, withApplyLockAsync, withApplyLockWait } from "./lib/apply-lock.js";
+import {
+  createApplyLockToken,
+  withApplyLock,
+  withApplyLockAsync,
+  withApplyLockWait,
+} from "./lib/apply-lock.js";
 import { AccountsError } from "./types.js";
 
 let home: string;
@@ -292,12 +297,23 @@ test("shellQuotePath escapes single quotes in hook path", () => {
 });
 
 test("withApplyLock creates mode 600 lock file", () => {
+  const token = createApplyLockToken();
   withApplyLock(() => {
     const lock = join(home, ".apply.lock");
     expect(existsSync(lock)).toBe(true);
     expect(statSync(lock).mode & 0o777).toBe(0o600);
-  });
+    expect(readFileSync(lock, "utf8")).toBe(`${token}\n`);
+  }, token);
   expect(existsSync(join(home, ".apply.lock"))).toBe(false);
+});
+
+test("withApplyLock never treats an empty partial publication as owned", () => {
+  const lock = join(home, ".apply.lock");
+  writeFileSync(lock, "", { mode: 0o600 });
+  expect(() => withApplyLock(() => undefined)).toThrow(
+    /automatic stale-lock reclaim is disabled/,
+  );
+  expect(readFileSync(lock, "utf8")).toBe("");
 });
 
 test("withApplyLock rejects concurrent apply", () => {

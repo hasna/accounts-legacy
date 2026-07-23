@@ -351,6 +351,111 @@ test("remove reconciliation reports an exact CAS-owned unreferenced auth identit
   expect(loadMachineStore().profileAuthRevisions).toEqual({});
 });
 
+test("remove reconciliation accepts exact legacy auth ownership without an incarnation", () => {
+  const authKey = "claude/legacy-owned";
+  saveStore({
+    version: 1,
+    current: {},
+    applied: {},
+    profileAuthRevisions: { [authKey]: "auth-legacy-owned" },
+    profileAuthCommitRevisions: { [authKey]: "commit-legacy-owned" },
+    profileAuthIncarnations: {},
+    toolLocks: {},
+    profiles: [],
+    tools: [],
+  });
+
+  expect(reconcileMachineProfileRemove("claude", "legacy-owned", undefined, {
+    authKey,
+    authIdentity: "auth-legacy-owned",
+    authCommitRevision: "commit-legacy-owned",
+  })).toEqual({ unreferencedAuthIdentities: ["auth-legacy-owned"] });
+  expect(loadMachineStore().profileAuthRevisions).toEqual({});
+  expect(loadMachineStore().profileAuthCommitRevisions).toEqual({});
+});
+
+test("legacy remove reconciliation preserves shared and concurrently replaced auth ownership", () => {
+  const targetKey = "claude/legacy-target";
+  const sharedKey = "claude/legacy-shared";
+  saveStore({
+    version: 1,
+    current: {},
+    applied: {},
+    profileAuthRevisions: {
+      [targetKey]: "shared-legacy-auth",
+      [sharedKey]: "shared-legacy-auth",
+    },
+    profileAuthCommitRevisions: {
+      [targetKey]: "target-legacy-commit",
+      [sharedKey]: "shared-legacy-commit",
+    },
+    profileAuthIncarnations: {},
+    toolLocks: {},
+    profiles: [],
+    tools: [],
+  });
+  const expected = {
+    authKey: targetKey,
+    authIdentity: "shared-legacy-auth",
+    authCommitRevision: "target-legacy-commit",
+  };
+
+  expect(reconcileMachineProfileRemove("claude", "legacy-target", undefined, expected))
+    .toEqual({ unreferencedAuthIdentities: [] });
+  expect(loadMachineStore().profileAuthRevisions).toEqual({
+    [sharedKey]: "shared-legacy-auth",
+  });
+
+  const replaced = loadMachineStore();
+  replaced.profileAuthRevisions[targetKey] = "replacement-legacy-auth";
+  replaced.profileAuthCommitRevisions[targetKey] = "replacement-legacy-commit";
+  saveStore(replaced);
+
+  expect(reconcileMachineProfileRemove("claude", "legacy-target", undefined, expected))
+    .toEqual({ unreferencedAuthIdentities: [] });
+  expect(loadMachineStore().profileAuthRevisions[targetKey]).toBe("replacement-legacy-auth");
+  expect(loadMachineStore().profileAuthCommitRevisions[targetKey]).toBe("replacement-legacy-commit");
+});
+
+test("legacy auth ownership cannot claim a modern or concurrently downgraded slot", () => {
+  const authKey = "claude/modern-target";
+  const modernExpectation = {
+    authKey,
+    authIdentity: "modern-auth",
+    authCommitRevision: "modern-commit",
+    authIncarnation: "modern-incarnation",
+  };
+  saveStore({
+    version: 1,
+    current: {},
+    applied: {},
+    profileAuthRevisions: { [authKey]: modernExpectation.authIdentity },
+    profileAuthCommitRevisions: { [authKey]: modernExpectation.authCommitRevision },
+    profileAuthIncarnations: { [authKey]: modernExpectation.authIncarnation },
+    toolLocks: {},
+    profiles: [],
+    tools: [],
+  });
+
+  expect(reconcileMachineProfileRemove("claude", "modern-target", undefined, {
+    authKey,
+    authIdentity: modernExpectation.authIdentity,
+    authCommitRevision: modernExpectation.authCommitRevision,
+  })).toEqual({ unreferencedAuthIdentities: [] });
+  expect(loadMachineStore().profileAuthRevisions[authKey]).toBe(modernExpectation.authIdentity);
+
+  const downgraded = loadMachineStore();
+  delete downgraded.profileAuthIncarnations[authKey];
+  saveStore(downgraded);
+  expect(reconcileMachineProfileRemove(
+    "claude",
+    "modern-target",
+    undefined,
+    modernExpectation,
+  )).toEqual({ unreferencedAuthIdentities: [] });
+  expect(loadMachineStore().profileAuthRevisions[authKey]).toBe(modernExpectation.authIdentity);
+});
+
 test("remove reconciliation preserves shared or concurrently replaced auth ownership", () => {
   const targetKey = "claude/target";
   const sharedKey = "claude/shared";

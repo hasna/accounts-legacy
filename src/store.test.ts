@@ -6,6 +6,9 @@ import { PassThrough } from "node:stream";
 import { createHash } from "node:crypto";
 import { Worker } from "node:worker_threads";
 import {
+  abandonLoginCleanupIntentInProcess,
+  beginLoginCleanupIntent,
+  evolveLoginCleanupIntent,
   resolveStore,
   setLoginCleanupFaultInjectorForTests,
   type AccountsStore,
@@ -1565,6 +1568,96 @@ describe("ApiStore routes registry ops to /v1", () => {
       await resolveStore(cloudEnv, { fetchImpl }).removeProfile(profile.name, { tool: profile.tool });
 
       expect(existsSync(join(home, ".auth-commits", identity))).toBe(false);
+    });
+
+    test("API remove purges committed auth snapshots for exact legacy machine ownership", async () => {
+      const profile = {
+        tool: "claude",
+        name: "snapshot-delete-legacy",
+        dir: join(home, "profiles", "claude", "snapshot-delete-legacy"),
+        createdAt: "2020-01-01T00:00:00Z",
+        incarnationId: "aaaaaaaa-1111-4111-8111-111111111111",
+      };
+      mkdirSync(profile.dir, { recursive: true });
+      writeClaudeAuth(profile.dir, "legacy-delete@example.com");
+      const identity = "bbbbbbbb-2222-4222-8222-222222222222";
+      const commit = "cccccccc-3333-4333-8333-333333333333";
+      writeClaudeProfileCommittedAuthSnapshot(profile.dir, identity, commit);
+      const authKey = "claude/snapshot-delete-legacy";
+      saveStore({
+        version: 1,
+        current: {},
+        applied: {},
+        profileAuthRevisions: { [authKey]: identity },
+        profileAuthCommitRevisions: { [authKey]: commit },
+        profileAuthIncarnations: {},
+        toolLocks: {},
+        profiles: [],
+        tools: [],
+      });
+      const { fetchImpl } = mockFetch((call) =>
+        call.method === "DELETE"
+          ? { status: 204, body: null }
+          : { status: 200, body: profile }
+      );
+
+      await resolveStore(cloudEnv, { fetchImpl }).removeProfile(profile.name, { tool: profile.tool });
+
+      expect(existsSync(join(home, ".auth-commits", identity))).toBe(false);
+      expect(loadMachineStore().profileAuthRevisions[authKey]).toBeUndefined();
+      expect(loadMachineStore().profileAuthCommitRevisions[authKey]).toBeUndefined();
+    });
+
+    test("interrupted API cleanup purges committed snapshots for exact legacy machine ownership", async () => {
+      const name = "snapshot-interrupted-legacy";
+      const tool = "claude";
+      const dir = join(home, "profiles", tool, name);
+      const plannedIncarnationId = "dddddddd-4444-4444-8444-444444444444";
+      const identity = "eeeeeeee-5555-4555-8555-555555555555";
+      const commit = "ffffffff-6666-4666-8666-666666666666";
+      mkdirSync(dir, { recursive: true });
+      writeClaudeAuth(dir, "legacy-interrupted@example.com");
+      writeClaudeProfileCommittedAuthSnapshot(dir, identity, commit);
+      let intent = beginLoginCleanupIntent(
+        name,
+        tool,
+        "api",
+        dir,
+        false,
+        plannedIncarnationId,
+      );
+      intent = evolveLoginCleanupIntent(intent, {
+        phase: "rollback",
+        ownership: {
+          cleanupOperationId: intent.cleanupOperationId,
+          cleanupRequestedAt: intent.cleanupRequestedAt,
+          authIdentity: identity,
+          authCommitRevision: commit,
+        },
+      });
+      abandonLoginCleanupIntentInProcess(intent.cleanupOperationId);
+      const authKey = `${tool}/${name}`;
+      saveStore({
+        version: 1,
+        current: {},
+        applied: {},
+        profileAuthRevisions: { [authKey]: identity },
+        profileAuthCommitRevisions: { [authKey]: commit },
+        profileAuthIncarnations: {},
+        toolLocks: {},
+        profiles: [],
+        tools: [],
+      });
+      const { fetchImpl } = mockFetch(() => ({
+        status: 404,
+        body: { error: "not found" },
+      }));
+
+      await resolveStore(cloudEnv, { fetchImpl }).reconcileInterruptedLoginCleanup!(name, tool);
+
+      expect(existsSync(join(home, ".auth-commits", identity))).toBe(false);
+      expect(loadMachineStore().profileAuthRevisions[authKey]).toBeUndefined();
+      expect(loadMachineStore().profileAuthCommitRevisions[authKey]).toBeUndefined();
     });
 
     test("API remove preserves committed snapshots for an identity still referenced by another profile", async () => {

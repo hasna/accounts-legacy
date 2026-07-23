@@ -608,16 +608,27 @@ function ownsExpectedAuth(
 ): expected is MachineProfileReconcileExpectation & {
   authKey: string;
   authIdentity: string;
-  authIncarnation: string;
 } {
-  return Boolean(
-    expected.authKey &&
-    expected.authIdentity &&
-    expected.authIncarnation &&
-    store.profileAuthRevisions[expected.authKey] === expected.authIdentity &&
-    (store.profileAuthCommitRevisions[expected.authKey] ?? null) === (expected.authCommitRevision ?? null) &&
-    store.profileAuthIncarnations[expected.authKey] === expected.authIncarnation,
-  );
+  if (
+    !expected.authKey ||
+    !expected.authIdentity ||
+    store.profileAuthRevisions[expected.authKey] !== expected.authIdentity ||
+    (store.profileAuthCommitRevisions[expected.authKey] ?? null) !==
+      (expected.authCommitRevision ?? null)
+  ) {
+    return false;
+  }
+  const currentIncarnation = store.profileAuthIncarnations[expected.authKey];
+  if (currentIncarnation) {
+    return Boolean(
+      expected.authIncarnation &&
+      currentIncarnation === expected.authIncarnation
+    );
+  }
+  // Upgrade compatibility: a slot captured without incarnation tracking may
+  // still be removed by exact key + identity + commit CAS. Never downgrade a
+  // captured modern slot into this legacy path after a concurrent mutation.
+  return expected.authIncarnation === undefined;
 }
 
 export function reconcileMachineProfileRename(

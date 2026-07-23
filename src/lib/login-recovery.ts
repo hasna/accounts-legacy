@@ -30,6 +30,7 @@ const JOURNAL_VERSION = 1;
 const JOURNAL_DIR = "login-finalization-journals";
 const JOURNAL_NAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.bin$/i;
 const LEASE_NAME = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.lease$/i;
+const PROCESS_LOCK_TOKEN = /^[1-9]\d*:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 type DurablePreparation = Omit<LoginPreparationReady, "releaseProfileLease">;
 
@@ -53,6 +54,7 @@ export interface LoginLeaseRecoveryIntent {
   ownerPid: number;
   ownerProcessStartId: string;
   profileDir: string;
+  profileLockToken?: string;
 }
 
 function journalDirectory(): string {
@@ -198,7 +200,16 @@ function publishLeaseIntent(intent: LoginLeaseRecoveryIntent): void {
   }
 }
 
-export function createLoginLeaseRecoveryIntent(profileDir: string): string {
+export function createLoginLeaseRecoveryIntent(
+  profileDir: string,
+  profileLockToken: string,
+): Pick<LoginLeaseRecoveryIntent, "id" | "profileLockToken"> & { profileLockToken: string } {
+  if (
+    !PROCESS_LOCK_TOKEN.test(profileLockToken) ||
+    !profileLockToken.startsWith(`${process.pid}:`)
+  ) {
+    throw new AccountsError("invalid login profile lock ownership token");
+  }
   const id = randomUUID();
   publishLeaseIntent({
     version: JOURNAL_VERSION,
@@ -206,8 +217,9 @@ export function createLoginLeaseRecoveryIntent(profileDir: string): string {
     ownerPid: process.pid,
     ownerProcessStartId: currentProcessStartId,
     profileDir: resolve(profileDir),
+    profileLockToken,
   });
-  return id;
+  return { id, profileLockToken };
 }
 
 export function clearLoginLeaseRecoveryIntent(id: string): void {
@@ -296,7 +308,14 @@ function validateJournal(value: unknown, expectedId: string): LoginRecoveryJourn
     !journal.preparation ||
     journal.preparation.status !== "ready" ||
     !journal.finalizationState ||
-    typeof journal.keychainCaptured !== "boolean"
+    !journal.finalizationState.writes ||
+    typeof journal.keychainCaptured !== "boolean" ||
+    (journal.finalizationState.writes.keychainLockToken !== undefined &&
+      (!PROCESS_LOCK_TOKEN.test(journal.finalizationState.writes.keychainLockToken) ||
+        !journal.finalizationState.writes.keychainLockToken.startsWith(`${journal.ownerPid}:`))) ||
+    (journal.finalizationState.writes.applyLockToken !== undefined &&
+      (!PROCESS_LOCK_TOKEN.test(journal.finalizationState.writes.applyLockToken) ||
+        !journal.finalizationState.writes.applyLockToken.startsWith(`${journal.ownerPid}:`)))
   ) {
     throw new AccountsError("invalid login recovery journal");
   }
@@ -383,7 +402,10 @@ export function readRecoverableLoginLeaseIntents(): LoginLeaseRecoveryIntent[] {
       value.id !== id ||
       typeof value.ownerPid !== "number" ||
       typeof value.ownerProcessStartId !== "string" ||
-      typeof value.profileDir !== "string"
+      typeof value.profileDir !== "string" ||
+      (value.profileLockToken !== undefined &&
+        (!PROCESS_LOCK_TOKEN.test(value.profileLockToken) ||
+          !value.profileLockToken.startsWith(`${value.ownerPid}:`)))
     ) {
       throw new AccountsError("invalid login lease recovery intent");
     }
@@ -415,36 +437,36 @@ function abandonedKeychainLockPath(): string {
 
 function removeExactAbandonedProcessLock(
   path: string,
+  exactToken: string | undefined,
   ownerPid: number,
   ownerProcessStartId: string,
-): void {
-  if (!existsSync(path)) return;
+): boolean {
+  if (!exactToken || !existsSync(path)) return false;
   const stat = lstatSync(path);
   if (!stat.isFile() || stat.isSymbolicLink()) {
-    throw new AccountsError(`invalid abandoned login lock at ${path}`);
+    return false;
   }
-  const token = readFileSync(path, "utf8").trim();
-  if (!new RegExp(`^${ownerPid}:[0-9a-f-]{36}$`, "i").test(token)) {
-    throw new AccountsError(`abandoned login lock ownership changed at ${path}`);
-  }
+  const token = readFileSync(path, "utf8");
+  if (token !== exactToken) return false;
   if (ownerIsLive(ownerPid, ownerProcessStartId)) {
     throw new AccountsError(`login recovery owner ${ownerPid} became live while reclaiming its lock`);
   }
   unlinkSync(path);
   fsyncDirectory(dirname(path));
+  return true;
 }
 
 function removeExactAbandonedApplyLock(journal: LoginRecoveryJournal): void {
+  const exactToken = journal.finalizationState?.writes?.applyLockToken;
+  if (!exactToken) return;
   withStoreLock(() => {
     const path = join(accountsHome(), ".apply.lock");
     if (!existsSync(path)) return;
     const stat = lstatSync(path);
     if (!stat.isFile() || stat.isSymbolicLink()) {
-      throw new AccountsError(`invalid abandoned apply lock at ${path}`);
+      return;
     }
-    if (readFileSync(path, "utf8") !== `${journal.ownerPid}\n`) {
-      throw new AccountsError(`abandoned apply lock ownership changed at ${path}`);
-    }
+    if (readFileSync(path, "utf8") !== `${exactToken}\n`) return;
     if (ownerIsLive(journal.ownerPid, journal.ownerProcessStartId)) {
       throw new AccountsError("login recovery owner became live while reclaiming its apply lock");
     }
@@ -456,18 +478,10 @@ function removeExactAbandonedApplyLock(journal: LoginRecoveryJournal): void {
 function releaseAbandonedLeaseIntentLocks(intent: LoginLeaseRecoveryIntent): void {
   removeExactAbandonedProcessLock(
     abandonedProfileLoginLockPath(intent.profileDir),
+    intent.profileLockToken,
     intent.ownerPid,
     intent.ownerProcessStartId,
   );
-  removeExactAbandonedProcessLock(
-    abandonedKeychainLockPath(),
-    intent.ownerPid,
-    intent.ownerProcessStartId,
-  );
-  removeExactAbandonedApplyLock({
-    ownerPid: intent.ownerPid,
-    ownerProcessStartId: intent.ownerProcessStartId,
-  } as LoginRecoveryJournal);
 }
 
 export function recoverAbandonedLoginLeaseIntents(): void {
@@ -481,12 +495,8 @@ export function recoverAbandonedLoginLeaseIntents(): void {
 export function releaseAbandonedLoginJournalLocks(journal: LoginRecoveryJournal): void {
   if (journal.preparation.tool.id !== "claude") return;
   removeExactAbandonedProcessLock(
-    abandonedProfileLoginLockPath(journal.preparation.profile.dir),
-    journal.ownerPid,
-    journal.ownerProcessStartId,
-  );
-  removeExactAbandonedProcessLock(
     abandonedKeychainLockPath(),
+    journal.finalizationState.writes.keychainLockToken,
     journal.ownerPid,
     journal.ownerProcessStartId,
   );

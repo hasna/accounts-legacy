@@ -33,6 +33,7 @@ import {
   storePath,
 } from "./storage.js";
 import { applyProfile, appliedProfileName } from "./lib/apply.js";
+import { createApplyLockToken } from "./lib/apply-lock.js";
 import { listAgentsAcrossProfiles } from "./lib/agents.js";
 import { importProfile } from "./lib/import-profile.js";
 import { pickProfile, resolvePickMode } from "./lib/pick.js";
@@ -75,6 +76,7 @@ import {
 import {
   acquireClaudeKeychainLock,
   acquireClaudeProfileLoginLock,
+  createClaudeProcessLockToken,
   prepareClaudeProfileKeychainLocked,
   planClaudeLaunch,
   redactArgv,
@@ -115,20 +117,61 @@ function loginStoreAuthority(store: AccountsStore): string {
 async function recoverInterruptedLoginFinalizations(store: AccountsStore): Promise<void> {
   recoverAbandonedLoginLeaseIntents();
   const authority = loginStoreAuthority(store);
-  for (const journal of readRecoverableLoginJournals()) {
+  const journals = readRecoverableLoginJournals();
+  for (const journal of journals) {
     if (journal.transport !== store.transport || journal.storeAuthority !== authority) {
       throw new AccountsError(
         "interrupted login belongs to a different Accounts storage authority; refusing recovery",
       );
     }
+  }
+  // Reclaim every dead journal's exact leases before replaying any one journal.
+  // Otherwise an earlier dead contender can block on a lock owned by a later
+  // dead contender whose journal has not yet been visited.
+  for (const journal of journals) {
+    if (journal.preparation.tool.id === "claude") {
+      releaseAbandonedLoginJournalLocks(journal);
+    }
+  }
+  for (const journal of journals) {
     let releaseProfileLease: (() => void) | undefined;
     let releaseKeychainLease: (() => void) | undefined;
+    let recoveryProfileLeaseIntentId: string | undefined;
     let replayComplete = false;
     try {
       if (journal.preparation.tool.id === "claude") {
-        releaseAbandonedLoginJournalLocks(journal);
-        releaseProfileLease = await acquireClaudeProfileLoginLock(journal.preparation.profile.dir);
-        if (keychainSupported()) releaseKeychainLease = await acquireClaudeKeychainLock();
+        // Rebind recovery to this process with fresh exact tokens before any
+        // acquisition. A second hard death can therefore be recovered by CAS.
+        journal.finalizationState.writes.keychainLockToken =
+          createClaudeProcessLockToken();
+        journal.finalizationState.writes.applyLockToken = createApplyLockToken();
+        persistLoginRecoveryJournal(
+          journal.id,
+          journal.preparation,
+          journal.finalizationState,
+          journal.priorKeychain,
+          journal.keychainCaptured,
+          journal.transport,
+          journal.storeAuthority,
+          journal.phase,
+        );
+        const profileLockToken = createClaudeProcessLockToken();
+        const recoveryIntent = createLoginLeaseRecoveryIntent(
+          journal.preparation.profile.dir,
+          profileLockToken,
+        );
+        recoveryProfileLeaseIntentId = recoveryIntent.id;
+        releaseProfileLease = await acquireClaudeProfileLoginLock(
+          journal.preparation.profile.dir,
+          undefined,
+          profileLockToken,
+        );
+        if (keychainSupported()) {
+          releaseKeychainLease = await acquireClaudeKeychainLock(
+            undefined,
+            journal.finalizationState.writes.keychainLockToken,
+          );
+        }
       }
       if (journal.phase === "rollback") {
         await rollbackLoginFinalization(journal.finalizationState, store);
@@ -149,6 +192,9 @@ async function recoverInterruptedLoginFinalizations(store: AccountsStore): Promi
     } finally {
       releaseKeychainLease?.();
       releaseProfileLease?.();
+      if (recoveryProfileLeaseIntentId) {
+        clearLoginLeaseRecoveryIntent(recoveryProfileLeaseIntentId);
+      }
       if (replayComplete) clearLoginRecoveryJournal(journal.id);
     }
   }
@@ -711,9 +757,15 @@ program
         },
         acquireProfileLease: async (dir, tool) => {
           if (tool.id !== "claude") return undefined;
-          loginLeaseRecoveryId = createLoginLeaseRecoveryIntent(dir);
+          const profileLockToken = createClaudeProcessLockToken();
+          const recoveryIntent = createLoginLeaseRecoveryIntent(dir, profileLockToken);
+          loginLeaseRecoveryId = recoveryIntent.id;
           try {
-            const release = await acquireClaudeProfileLoginLock(dir);
+            const release = await acquireClaudeProfileLoginLock(
+              dir,
+              undefined,
+              profileLockToken,
+            );
             return () => {
               release();
               if (loginLeaseRecoveryId) {
@@ -795,6 +847,8 @@ program
       try {
         if (pendingSignal) throw new AccountsError("login interrupted before Claude launch");
         finalizationState = await captureLoginFinalizationState(name, tool, store, profile);
+        finalizationState.writes.keychainLockToken = createClaudeProcessLockToken();
+        finalizationState.writes.applyLockToken = createApplyLockToken();
         recoveryJournalId = createLoginRecoveryJournal(
           prepared,
           finalizationState,
@@ -825,7 +879,10 @@ program
           console.log(chalk.dim("  After Claude exits, accounts will make this the live/default Claude account."));
         }
         if (tool.id === "claude" && keychainSupported()) {
-          releaseKeychainLock = await acquireClaudeKeychainLock(lockAbort.signal);
+          releaseKeychainLock = await acquireClaudeKeychainLock(
+            lockAbort.signal,
+            finalizationState.writes.keychainLockToken,
+          );
           finalizationState.writes.keychainLeaseHeld = true;
           finalizationState.writes.persist?.();
           if (pendingSignal) throw new AccountsError("login interrupted before Claude launch");

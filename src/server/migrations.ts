@@ -95,14 +95,23 @@ export interface MigrationStatus {
 }
 
 /**
+ * Stable public reason code for the migration 0010 deployment gate.
+ *
+ * Keep internal task identifiers out of runtime errors and operator docs.
+ */
+export const LOGIN_CLEANUP_MIGRATION_BLOCKER_REASON =
+  "login-cleanup-ledger-atomicity" as const;
+
+/**
  * Source merge must not make migration 0010 deployable. Its SQL and ledger
  * commit need an advisory-lock atomic runner.
  */
 export function assertAccountsMigrationDeploySafe(status: MigrationStatus): void {
   if (status.pending.includes("accounts_0010_login_cleanup_operations")) {
     throw new Error(
-      "accounts migration 0010 is deployment-blocked until SQL execution and " +
-        "checksum-ledger recording are atomic under the same advisory lock",
+      `accounts migration 0010 is deployment-blocked (${LOGIN_CLEANUP_MIGRATION_BLOCKER_REASON}): ` +
+        "make SQL execution and checksum-ledger recording atomic under the same advisory lock " +
+        "before running accounts-migrate",
     );
   }
 }

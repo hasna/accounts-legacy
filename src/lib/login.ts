@@ -1143,7 +1143,7 @@ export async function rollbackLoginFinalization(
       }
       if (applyRollback) pruneRolledBackApplyAuthWrites(machine, applyRollback);
       saveStore(machine);
-    })));
+    }), { exactToken: state.writes.applyLockToken }));
   } else if (toolSpecificRollbackAllowed && profileAuthSnapshots.length > 0) {
     await attempt(() => withApplyLockWait(() => withStoreLock(() => {
       const machine = loadMachineStore();
@@ -1168,7 +1168,7 @@ export async function rollbackLoginFinalization(
         state.profileClaudeIdentityRevision!,
         currentCommittedRevision,
       );
-    })));
+    }), { exactToken: state.writes.applyLockToken }));
   }
   const profileFields: ProfileRollbackFields = { ...state.writes.profile };
   if (state.writes.currentOperationId) {
@@ -1214,7 +1214,7 @@ export async function commitLoginFinalization(
       ),
     );
     return true;
-  }));
+  }), { exactToken: state.writes.applyLockToken });
 }
 
 /**
