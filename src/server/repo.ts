@@ -18,6 +18,7 @@ import type {
   RestoreAccountInput,
   UpdateAccountInput,
 } from "./schema.js";
+import { AccountIncarnationConflictError } from "./errors.js";
 
 export interface Account {
   tool: string;
@@ -406,7 +407,7 @@ export class AccountsRepo implements AccountsStore {
     const current = await this.get(tool, name);
     if (!current) throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
     if (current.incarnationId !== input.expectedIncarnationId) {
-      throw new AccountsError("profile changed while login finalization was in progress");
+      throw new AccountIncarnationConflictError();
     }
     // A same-incarnation concurrent email edit won the compare-and-set. Return
     // it unchanged so the client records no rollback ownership.
@@ -569,9 +570,13 @@ export class AccountsRepo implements AccountsStore {
       };
       const current = await this.getWith(client, tool, name, { forUpdate: true });
       if (!current) return finish(false, false);
+      const expectedCreatedAt = new Date(input.expectedCreatedAt).toISOString();
+      const expectedLastUsedAt = input.expectedLastUsedAt
+        ? new Date(input.expectedLastUsedAt).toISOString()
+        : null;
       const unchanged =
         current.incarnationId === input.expectedIncarnationId &&
-        current.createdAt === new Date(input.expectedCreatedAt).toISOString() &&
+        current.createdAt === expectedCreatedAt &&
         (current.email ?? null) === input.expectedEmail &&
         (current.displayName ?? null) === input.expectedDisplayName &&
         (current.identity ?? null) === input.expectedIdentity &&
@@ -579,7 +584,7 @@ export class AccountsRepo implements AccountsStore {
         isDeepStrictEqual(current.metadata, input.expectedMetadata) &&
         (current.dir ?? null) === input.expectedDir &&
         (current.description ?? null) === input.expectedDescription &&
-        (current.lastUsedAt ?? null) === input.expectedLastUsedAt;
+        (current.lastUsedAt ?? null) === expectedLastUsedAt;
       if (!unchanged) return finish(false, true);
 
       const selected = await client.get<{ name: string }>(
@@ -594,7 +599,8 @@ export class AccountsRepo implements AccountsStore {
       const result = await client.query<AccountRow>(
         `DELETE FROM accounts
           WHERE tool = $1 AND name = $2 AND incarnation_id = $3::uuid
-            AND created_at IS NOT DISTINCT FROM $4::timestamptz
+            AND date_trunc('milliseconds', created_at)
+                IS NOT DISTINCT FROM date_trunc('milliseconds', $4::timestamptz)
             AND email IS NOT DISTINCT FROM $5
             AND display_name IS NOT DISTINCT FROM $6
             AND identity IS NOT DISTINCT FROM $7
@@ -602,13 +608,14 @@ export class AccountsRepo implements AccountsStore {
             AND metadata IS NOT DISTINCT FROM $9::jsonb
             AND dir IS NOT DISTINCT FROM $10
             AND description IS NOT DISTINCT FROM $11
-            AND last_used_at IS NOT DISTINCT FROM $12::timestamptz
+            AND date_trunc('milliseconds', last_used_at)
+                IS NOT DISTINCT FROM date_trunc('milliseconds', $12::timestamptz)
         RETURNING *`,
         [
           tool,
           name,
           input.expectedIncarnationId,
-          input.expectedCreatedAt,
+          expectedCreatedAt,
           input.expectedEmail,
           input.expectedDisplayName,
           input.expectedIdentity,
@@ -616,7 +623,7 @@ export class AccountsRepo implements AccountsStore {
           JSON.stringify(input.expectedMetadata),
           input.expectedDir,
           input.expectedDescription,
-          input.expectedLastUsedAt,
+          expectedLastUsedAt,
         ],
       );
       const removed = result.rowCount === 1;

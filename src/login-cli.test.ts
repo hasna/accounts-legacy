@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -400,6 +400,7 @@ function readStore() {
     profileAuthIncarnations?: Record<string, string>;
     toolLocks?: Record<string, string>;
     toolLockRevisions?: Record<string, string>;
+    loginOperations?: Record<string, unknown>;
     profiles?: Array<{ name: string; tool: string; dir: string; createdAt: string; email?: string }>;
   };
 }
@@ -1211,6 +1212,113 @@ test("post-child SIGTERM rolls back finalization without Claude keychain support
   expect(readStore()).toEqual(storeBefore);
   expect(readLogEntries()).toHaveLength(1);
 });
+
+test("post-child SIGHUP rolls back finalization and exits with the shell convention", async () => {
+  const completed = join(home, "non-keychain-sighup-completed");
+  writeFinalizationSignalTool("fake-login-tool", "FAKE_LOGIN_HOME", "fake-login");
+  addFakeLoginTool();
+  expect(runCli("add", "prior", "--tool", "fake-login").status).toBe(0);
+  expect(runCli("add", "acct", "--tool", "fake-login").status).toBe(0);
+  expect(runCli("use", "prior", "--tool", "fake-login").status).toBe(0);
+  const storeBefore = readStore();
+  const child = spawnCliWith(["login", "acct", "--tool", "fake-login"], {
+    env: {
+      FAKE_LOGIN_COMPLETED: completed,
+      ACCOUNTS_TEST_LOGIN_FINALIZE_DELAY_MS: "500",
+    },
+  });
+  const resultPromise = collect(child);
+
+  await waitFor(() => existsSync(completed));
+  child.kill("SIGHUP");
+  const result = await resultPromise;
+
+  expect(result.code).toBe(129);
+  expect(result.signal).toBeNull();
+  expect(readStore()).toEqual(storeBefore);
+});
+
+const HARD_DEATH_RECOVERY_TEST_TIMEOUT_MS = 30_000;
+
+for (const crashPoint of ["pre-save", "post-apply", "post-finalize"] as const) {
+  test(`restart rolls back a hard-dead Claude finalization at ${crashPoint}`, () => {
+    const fixture = setupClaudeLogin("success");
+    const crashed = runCliWith(["login", "acct", "--tool", "claude"], {
+      env: {
+        ...fixture.env,
+        ACCOUNTS_TEST_LOGIN_HARD_CRASH_POINT: crashPoint,
+      },
+    });
+    expect(crashed.signal).toBe("SIGKILL");
+
+    writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude", 23);
+    const recovered = runCliWith(["login", "acct", "--tool", "claude"], {
+      env: fixture.env,
+    });
+    expect(recovered.stderr).toBe("");
+    expect(recovered.status).toBe(23);
+    const store = readStore();
+    expect(store.current?.claude).toBe("prior");
+    expect(store.applied?.claude).toBeUndefined();
+    expect(store.loginOperations).toEqual({});
+    expect(store.profiles?.find((profile) => profile.name === "acct")?.email).toBeUndefined();
+    expect(JSON.parse(readFileSync(fixture.keychainState, "utf8"))).toEqual({
+      account: "prior",
+      secret: "prior-secret",
+    });
+    const identity = store.profileAuthRevisions?.["claude/acct"];
+    const commit = store.profileAuthCommitRevisions?.["claude/acct"];
+    expect(identity).toBeTruthy();
+    expect(commit).toBeTruthy();
+    expect(readdirSync(join(home, ".auth-commits", identity!)).sort())
+      .toEqual([`${commit}.json`]);
+    const journalDir = join(home, "login-finalization-journals");
+    expect(existsSync(journalDir) ? readdirSync(journalDir) : []).toEqual([]);
+  }, HARD_DEATH_RECOVERY_TEST_TIMEOUT_MS);
+}
+
+test("committed hard-death replay finishes immutable auth retention before clearing its journal", () => {
+  const fixture = setupClaudeLogin("success");
+  const crashed = runCliWith(["login", "acct", "--tool", "claude"], {
+    env: {
+      ...fixture.env,
+      ACCOUNTS_TEST_LOGIN_HARD_CRASH_POINT: "post-commit-marker",
+    },
+  });
+  expect(crashed.signal).toBe("SIGKILL");
+
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude", 23);
+  expect(runCliWith(["login", "acct", "--tool", "claude"], { env: fixture.env }).status)
+    .toBe(23);
+  const store = readStore();
+  expect(store.current?.claude).toBe("acct");
+  expect(store.applied?.claude).toBe("acct");
+  expect(store.loginOperations).toEqual({});
+  const identity = store.profileAuthRevisions?.["claude/acct"];
+  const commit = store.profileAuthCommitRevisions?.["claude/acct"];
+  expect(readdirSync(join(home, ".auth-commits", identity!)).sort())
+    .toEqual([`${commit}.json`]);
+  expect(readdirSync(join(home, "login-finalization-journals"))).toEqual([]);
+}, HARD_DEATH_RECOVERY_TEST_TIMEOUT_MS);
+
+test("hard-death recovery preserves an initially absent Claude keychain", () => {
+  const fixture = setupClaudeLogin("success");
+  rmSync(fixture.keychainState, { force: true });
+  const crashed = runCliWith(["login", "acct", "--tool", "claude"], {
+    env: {
+      ...fixture.env,
+      ACCOUNTS_TEST_LOGIN_HARD_CRASH_POINT: "post-finalize",
+    },
+  });
+  expect(crashed.signal).toBe("SIGKILL");
+
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude", 23);
+  expect(runCliWith(["login", "acct", "--tool", "claude"], { env: fixture.env }).status)
+    .toBe(23);
+  expect(existsSync(fixture.keychainState)).toBe(false);
+  expect(readStore().current?.claude).toBe("prior");
+  expect(readStore().applied?.claude).toBeUndefined();
+}, HARD_DEATH_RECOVERY_TEST_TIMEOUT_MS);
 
 test("repeated parent SIGINT rolls back while holding the shared Claude keychain lease", async () => {
   const fixture = setupClaudeLogin("success");

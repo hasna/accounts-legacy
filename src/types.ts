@@ -112,6 +112,19 @@ export const profileSchema = z.object({
 
 export type Profile = z.infer<typeof profileSchema>;
 
+const loginOperationSchema = z.object({
+  tool: slugSchema,
+  name: profileNameSchema,
+  targetIncarnation: nonBlankStringSchema("target incarnation"),
+  activatedProfileLastUsedAt: nonBlankStringSchema("activated profile lastUsedAt"),
+  previousCurrentName: profileNameSchema.optional(),
+  previousCurrentIncarnation: nonBlankStringSchema("previous current incarnation").optional(),
+  previousProfileLastUsedAt: nonBlankStringSchema("previous profile lastUsedAt").optional(),
+  previousToolLock: slugSchema.optional(),
+  previousToolLockRevision: nonBlankStringSchema("previous tool lock revision").optional(),
+  writtenToolLockRevision: nonBlankStringSchema("written tool lock revision"),
+});
+
 export const storeSchema = z.object({
   version: z.literal(1),
   /** Map of toolId -> active profile name (for env/launch/shell). */
@@ -135,6 +148,8 @@ export const storeSchema = z.object({
   toolLocks: z.record(slugSchema, slugSchema).default({}),
   /** Mutation generation for each machine-local profile-name tool lock. */
   toolLockRevisions: z.record(slugSchema, z.string()).default({}),
+  /** Durable rollback records for local login activation operations. */
+  loginOperations: z.record(nonBlankStringSchema("login operation id"), loginOperationSchema).default({}),
   profiles: z.array(profileSchema).default([]),
   /** User-registered tools (apps) added at runtime, on top of built-ins. */
   tools: z.array(toolDefSchema).default([]),
@@ -150,7 +165,7 @@ export type NormalizedStore = z.output<typeof storeSchema>;
  */
 export type Store = Omit<
   NormalizedStore,
-  "currentRevisions" | "appliedRevisions" | "profileAuthRevisions" | "profileAuthCommitRevisions" | "profileAuthIncarnations" | "toolLockRevisions"
+  "currentRevisions" | "appliedRevisions" | "profileAuthRevisions" | "profileAuthCommitRevisions" | "profileAuthIncarnations" | "toolLockRevisions" | "loginOperations"
 > & {
   currentRevisions?: NormalizedStore["currentRevisions"];
   appliedRevisions?: NormalizedStore["appliedRevisions"];
@@ -158,6 +173,7 @@ export type Store = Omit<
   profileAuthCommitRevisions?: NormalizedStore["profileAuthCommitRevisions"];
   profileAuthIncarnations?: NormalizedStore["profileAuthIncarnations"];
   toolLockRevisions?: NormalizedStore["toolLockRevisions"];
+  loginOperations?: NormalizedStore["loginOperations"];
 };
 
 export class AccountsError extends Error {

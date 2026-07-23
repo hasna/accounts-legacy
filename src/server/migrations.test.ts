@@ -89,19 +89,31 @@ describe("accounts migrations", () => {
   });
 
   test("deployment remains blocked while cleanup migration atomicity is unresolved", () => {
-    expect(() => assertAccountsMigrationDeploySafe({
-      ledgerPresent: true,
-      pending: ["accounts_0010_login_cleanup_operations"],
-      unknown: [],
-      checksumMismatches: [],
-    })).toThrow(/f799e8a5-fc9e-4735-bfb9-8a0c17b90b25/);
+    let deploymentError: unknown;
+    try {
+      assertAccountsMigrationDeploySafe({
+        ledgerPresent: true,
+        pending: ["accounts_0010_login_cleanup_operations"],
+        unknown: [],
+        checksumMismatches: [],
+      });
+    } catch (error) {
+      deploymentError = error;
+    }
+    expect(deploymentError).toBeInstanceOf(Error);
+    const deploymentMessage = deploymentError instanceof Error ? deploymentError.message : "";
+    expect(deploymentMessage).toContain("accounts migration 0010 is deployment-blocked");
+    expect(deploymentMessage).toContain("checksum-ledger recording");
+    expect(deploymentMessage).toContain("same advisory lock");
     const deploymentGuide = readFileSync(
       join(process.cwd(), "docs", "STORAGE_STABILIZATION.md"),
       "utf8",
     );
     expect(deploymentGuide).toContain("Do not run `accounts-migrate`");
     expect(deploymentGuide).toContain("Source merge does not apply migrations");
-    expect(deploymentGuide).toContain("f799e8a5-fc9e-4735-bfb9-8a0c17b90b25");
+    const internalTodoId = /\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/i;
+    expect(deploymentMessage).not.toMatch(internalTodoId);
+    expect(deploymentGuide).not.toMatch(internalTodoId);
     const migrator = readFileSync(join(process.cwd(), "src", "server", "migrate.ts"), "utf8");
     const gate = migrator.indexOf("assertAccountsMigrationDeploySafe(status);");
     const apply = migrator.indexOf("const ledger = new MigrationLedger");

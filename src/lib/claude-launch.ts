@@ -360,6 +360,7 @@ async function acquireClaudeProcessLock(
 }
 
 export function signalExitCode(signal: NodeJS.Signals | null): number {
+  if (signal === "SIGHUP") return 129;
   if (signal === "SIGINT") return 130;
   if (signal === "SIGTERM") return 143;
   return signal ? 1 : 0;
@@ -455,12 +456,15 @@ export async function runToolProcess(
       killTimer = setTimeout(() => child.kill("SIGKILL"), numericTestSetting("ACCOUNTS_TEST_CHILD_KILL_TIMEOUT_MS", 2_500));
       killTimer.unref();
     };
+    const onSighup = () => forward("SIGHUP");
     const onSigint = () => forward("SIGINT");
     const onSigterm = () => forward("SIGTERM");
+    if (process.platform !== "win32") process.on("SIGHUP", onSighup);
     process.on("SIGINT", onSigint);
     process.on("SIGTERM", onSigterm);
 
     const cleanup = () => {
+      if (process.platform !== "win32") process.removeListener("SIGHUP", onSighup);
       process.removeListener("SIGINT", onSigint);
       process.removeListener("SIGTERM", onSigterm);
       if (killTimer) clearTimeout(killTimer);
@@ -488,8 +492,10 @@ export async function runClaudeLaunch(
   const credential = claudeKeychainCredentialFromProfile(profile.dir, profile.name);
   const release = await acquireClaudeKeychainLock();
   let pendingSignal: NodeJS.Signals | undefined;
+  const rememberSighup = () => { pendingSignal ??= "SIGHUP"; };
   const rememberSigint = () => { pendingSignal ??= "SIGINT"; };
   const rememberSigterm = () => { pendingSignal ??= "SIGTERM"; };
+  if (process.platform !== "win32") process.on("SIGHUP", rememberSighup);
   process.on("SIGINT", rememberSigint);
   process.on("SIGTERM", rememberSigterm);
   let prior: ReturnType<typeof captureClaudeKeychain>;
@@ -508,6 +514,7 @@ export async function runClaudeLaunch(
         restoreClaudeKeychain(prior);
       }
     } finally {
+      if (process.platform !== "win32") process.removeListener("SIGHUP", rememberSighup);
       process.removeListener("SIGINT", rememberSigint);
       process.removeListener("SIGTERM", rememberSigterm);
       release();

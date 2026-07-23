@@ -4,6 +4,7 @@ import { mintApiKey, verifyApiKey } from "@hasna/contracts/auth";
 import { createHandler, type ServiceContext } from "./app.js";
 import type { Account, AccountsStore, CurrentSelection, LoginCurrentSelection } from "./repo.js";
 import { AccountsError } from "../types.js";
+import { AccountIncarnationConflictError } from "./errors.js";
 import { buildOpenApiDoc } from "./openapi.js";
 
 const SIGNING_SECRET = "test-signing-secret-accounts";
@@ -74,7 +75,7 @@ class MemoryStore implements AccountsStore {
     const existing = this.accounts.get(this.key(tool, name));
     if (!existing) throw new AccountsError(`no profile named "${name}" for tool "${tool}"`);
     if (existing.incarnationId !== input.expectedIncarnationId) {
-      throw new AccountsError("profile changed while login finalization was in progress");
+      throw new AccountIncarnationConflictError();
     }
     const updated = { ...existing, email: input.email };
     this.accounts.set(this.key(tool, name), updated);
@@ -545,6 +546,43 @@ describe("accounts-serve handler", () => {
     }));
     expect(await cleanup.json()).toEqual({ removed: false, currentExists: true, expired: false });
     expect((await handle(req("GET", "/v1/current/codex", { key: admin }))).status).toBe(200);
+  });
+
+  test("login update returns the documented 409 when the account incarnation changes", async () => {
+    const handle = createHandler(makeCtx());
+    const admin = key(["accounts:*"]);
+    const originalResponse = await handle(req("POST", "/v1/accounts", {
+      key: admin,
+      body: { name: "recreated-login", tool: "claude", email: "original@example.com" },
+    }));
+    const original = await originalResponse.json() as Account;
+    expect((await handle(req("DELETE", "/v1/accounts/claude/recreated-login", { key: admin }))).status).toBe(204);
+    const replacementResponse = await handle(req("POST", "/v1/accounts", {
+      key: admin,
+      body: { name: "recreated-login", tool: "claude", email: "replacement@example.com" },
+    }));
+    const replacement = await replacementResponse.json() as Account;
+    expect(replacement.incarnationId).not.toBe(original.incarnationId);
+
+    const conflict = await handle(req("PATCH", "/v1/accounts/claude/recreated-login/login/update", {
+      key: admin,
+      body: {
+        expectedIncarnationId: original.incarnationId,
+        expectedEmail: "original@example.com",
+        email: "stale-finalizer@example.com",
+      },
+    }));
+
+    expect(conflict.status).toBe(409);
+    expect(await conflict.json()).toEqual({
+      error: "profile changed while login finalization was in progress",
+    });
+    const current = await handle(req("GET", "/v1/accounts/claude/recreated-login", { key: admin }));
+    expect((await current.json()).email).toBe("replacement@example.com");
+    const operation = buildOpenApiDoc("test").paths["/v1/accounts/{tool}/{name}/login/update"] as {
+      patch: { responses: Record<string, unknown> };
+    };
+    expect(operation.patch.responses["409"]).toBeDefined();
   });
 
   test("transactional login create is new-only and replays one exact incarnation", async () => {

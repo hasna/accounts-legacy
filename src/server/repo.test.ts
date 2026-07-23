@@ -224,6 +224,12 @@ describe("AccountsRepo account/current atomicity", () => {
     const deletion = statements.find((sql) => /DELETE FROM accounts/.test(sql)) ?? "";
     expect(deletion).toContain("incarnation_id");
     expect(deletion).toContain("IS NOT DISTINCT FROM");
+    expect(deletion).toMatch(
+      /date_trunc\('milliseconds', created_at\)\s+IS NOT DISTINCT FROM date_trunc\('milliseconds', \$4::timestamptz\)/,
+    );
+    expect(deletion).toMatch(
+      /date_trunc\('milliseconds', last_used_at\)\s+IS NOT DISTINCT FROM date_trunc\('milliseconds', \$12::timestamptz\)/,
+    );
     expect(statements.some((sql) => /requested_at < now\(\)/.test(sql))).toBe(true);
     expect(statements.some((sql) => /incomplete_count/.test(sql))).toBe(true);
     expect(statements.some((sql) => /OFFSET \$4/.test(sql))).toBe(true);

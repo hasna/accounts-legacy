@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { createHash } from "node:crypto";
+import { Worker } from "node:worker_threads";
 import {
   resolveStore,
   setLoginCleanupFaultInjectorForTests,
@@ -19,6 +20,8 @@ import {
   rollbackLoginPreparation,
 } from "./lib/login.js";
 import { importProfile } from "./lib/import-profile.js";
+import { writeClaudeProfileCommittedAuthSnapshot } from "./lib/claude-auth.js";
+import { loginRecoveryStoreAuthority } from "./lib/login-recovery.js";
 import {
   loadMachineStore,
   profileAuthIncarnation,
@@ -85,7 +88,44 @@ function nextEventLoopTurn(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
+function writeClaudeAuth(dir: string, email: string): void {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, ".claude.json"),
+    JSON.stringify({ oauthAccount: { emailAddress: email } }),
+    { mode: 0o600 },
+  );
+  writeFileSync(
+    join(dir, ".credentials.json"),
+    JSON.stringify({ claudeAiOauth: { refreshToken: `${email}-refresh` } }),
+    { mode: 0o600 },
+  );
+}
+
 describe("resolveStore transport selection", () => {
+  test("login recovery authority is secret-free and distinguishes API bases", () => {
+    const first = loginRecoveryStoreAuthority(
+      "api",
+      "/tmp/accounts-authority-test",
+      "https://user:password@api-a.example.test/v1?token=secret#fragment",
+    );
+    const sameAuthorityWithoutSecrets = loginRecoveryStoreAuthority(
+      "api",
+      "/tmp/accounts-authority-test",
+      "https://api-a.example.test/v1",
+    );
+    const other = loginRecoveryStoreAuthority(
+      "api",
+      "/tmp/accounts-authority-test",
+      "https://api-b.example.test/v1",
+    );
+    expect(first).toBe(sameAuthorityWithoutSecrets);
+    expect(first).not.toBe(other);
+    expect(first).toMatch(/^[0-9a-f]{64}$/);
+    expect(first).not.toContain("password");
+    expect(first).not.toContain("secret");
+  });
+
   test("LocalStore when API env is unset", () => {
     expect(resolveStore({} as NodeJS.ProcessEnv).transport).toBe("local");
   });
@@ -1491,6 +1531,132 @@ describe("ApiStore routes registry ops to /v1", () => {
       expect(loadMachineStore().profileAuthIncarnations[authKey]).toBeUndefined();
     });
 
+    test("API remove deletes committed auth snapshots after the identity becomes unreferenced", async () => {
+      const profile = {
+        tool: "claude",
+        name: "snapshot-delete",
+        dir: join(home, "profiles", "claude", "snapshot-delete"),
+        createdAt: "2020-01-01T00:00:00Z",
+        incarnationId: "11111111-1111-4111-8111-111111111111",
+      };
+      mkdirSync(profile.dir, { recursive: true });
+      writeClaudeAuth(profile.dir, "delete@example.com");
+      const identity = "22222222-2222-4222-8222-222222222222";
+      const commit = "33333333-3333-4333-8333-333333333333";
+      writeClaudeProfileCommittedAuthSnapshot(profile.dir, identity, commit);
+      const authKey = "claude/snapshot-delete";
+      saveStore({
+        version: 1,
+        current: {},
+        applied: {},
+        profileAuthRevisions: { [authKey]: identity },
+        profileAuthCommitRevisions: { [authKey]: commit },
+        profileAuthIncarnations: { [authKey]: profileAuthIncarnation(profile) },
+        toolLocks: {},
+        profiles: [],
+        tools: [],
+      });
+      const { fetchImpl } = mockFetch((call) =>
+        call.method === "DELETE"
+          ? { status: 204, body: null }
+          : { status: 200, body: profile }
+      );
+
+      await resolveStore(cloudEnv, { fetchImpl }).removeProfile(profile.name, { tool: profile.tool });
+
+      expect(existsSync(join(home, ".auth-commits", identity))).toBe(false);
+    });
+
+    test("API remove preserves committed snapshots for an identity still referenced by another profile", async () => {
+      const profile = {
+        tool: "claude",
+        name: "snapshot-shared",
+        dir: join(home, "profiles", "claude", "snapshot-shared"),
+        createdAt: "2020-01-01T00:00:00Z",
+        incarnationId: "44444444-4444-4444-8444-444444444444",
+      };
+      mkdirSync(profile.dir, { recursive: true });
+      writeClaudeAuth(profile.dir, "shared@example.com");
+      const identity = "55555555-5555-4555-8555-555555555555";
+      const commit = "66666666-6666-4666-8666-666666666666";
+      writeClaudeProfileCommittedAuthSnapshot(profile.dir, identity, commit);
+      const removedKey = "claude/snapshot-shared";
+      const retainedKey = "claude/retained";
+      saveStore({
+        version: 1,
+        current: {},
+        applied: {},
+        profileAuthRevisions: { [removedKey]: identity, [retainedKey]: identity },
+        profileAuthCommitRevisions: { [removedKey]: commit, [retainedKey]: commit },
+        profileAuthIncarnations: {
+          [removedKey]: profileAuthIncarnation(profile),
+          [retainedKey]: "retained-incarnation",
+        },
+        toolLocks: {},
+        profiles: [],
+        tools: [],
+      });
+      const { fetchImpl } = mockFetch((call) =>
+        call.method === "DELETE"
+          ? { status: 204, body: null }
+          : { status: 200, body: profile }
+      );
+
+      await resolveStore(cloudEnv, { fetchImpl }).removeProfile(profile.name, { tool: profile.tool });
+
+      expect(existsSync(join(home, ".auth-commits", identity, `${commit}.json`))).toBe(true);
+      expect(loadMachineStore().profileAuthRevisions[retainedKey]).toBe(identity);
+    });
+
+    test("API remove response incarnation mismatch preserves all local machine state", async () => {
+      const original = {
+        tool: "claude",
+        name: "remove-mismatch",
+        dir: join(home, "profiles", "claude", "remove-mismatch"),
+        createdAt: "2020-01-01T00:00:00Z",
+        incarnationId: "77777777-7777-4777-8777-777777777777",
+      };
+      const replacement = {
+        ...original,
+        createdAt: "2020-01-02T00:00:00Z",
+        incarnationId: "88888888-8888-4888-8888-888888888888",
+      };
+      const authKey = "claude/remove-mismatch";
+      const identity = "99999999-9999-4999-8999-999999999999";
+      saveStore({
+        version: 1,
+        current: { claude: original.name },
+        currentRevisions: { claude: "original-current" },
+        applied: { claude: original.name },
+        appliedRevisions: { claude: "original-applied" },
+        profileAuthRevisions: { [authKey]: identity },
+        profileAuthCommitRevisions: {},
+        profileAuthIncarnations: { [authKey]: profileAuthIncarnation(original) },
+        toolLocks: { [original.name]: original.tool },
+        toolLockRevisions: { [original.name]: "original-lock" },
+        profiles: [],
+        tools: [],
+      });
+      let getCount = 0;
+      const { fetchImpl } = mockFetch((call) => {
+        if (call.method === "DELETE") return { status: 204, body: null };
+        getCount += 1;
+        return { status: 200, body: getCount === 1 ? original : replacement };
+      });
+      const store = resolveStore(cloudEnv, { fetchImpl });
+
+      await expect(store.removeProfile(original.name, { tool: original.tool }))
+        .rejects.toThrow(/different profile incarnation/);
+      expect(loadMachineStore()).toMatchObject({
+        current: { claude: original.name },
+        currentRevisions: { claude: "original-current" },
+        applied: { claude: original.name },
+        appliedRevisions: { claude: "original-applied" },
+        profileAuthRevisions: { [authKey]: identity },
+        toolLocks: { [original.name]: original.tool },
+      });
+    });
+
     test("delayed API create cannot rotate a newer apply-owned auth generation", async () => {
       const profile = {
         tool: "claude",
@@ -1841,6 +2007,65 @@ describe("LocalStore reads/writes the on-box registry", () => {
     expect(existsSync(first.profile.dir)).toBe(false);
   });
 
+  test("a same-PID worker isolate cannot reconcile another isolate's live preparation", async () => {
+    const store = resolveStore({
+      ACCOUNTS_HOME: home,
+      HASNA_ACCOUNTS_STORAGE_MODE: "local",
+    } as NodeJS.ProcessEnv);
+    const tool = {
+      id: "worker-intent-tool",
+      label: "Worker Intent Tool",
+      envVar: "WORKER_INTENT_TOOL_HOME",
+      defaultDir: join(home, "worker-intent-default"),
+      bin: process.execPath,
+    };
+    await store.addTool(tool);
+    const prepared = await prepareLogin("worker-intent", {
+      toolId: tool.id,
+      env: process.env,
+      store,
+    });
+    if (prepared.status !== "ready") throw new Error("expected ready login preparation");
+    const ownedPath = join(prepared.profile.dir, "worker-owned.json");
+    writeFileSync(ownedPath, "{}\n", { mode: 0o600 });
+    const storeModule = new URL("./lib/store.ts", import.meta.url).href;
+    const result = await new Promise<{ pid: number; message?: string }>((resolveResult, reject) => {
+      const worker = new Worker(
+        `
+          const { parentPort, workerData } = require("node:worker_threads");
+          process.env.ACCOUNTS_HOME = workerData.home;
+          process.env.HASNA_ACCOUNTS_STORAGE_MODE = "local";
+          import(workerData.storeModule).then(async ({ resolveStore }) => {
+            try {
+              const isolated = resolveStore(process.env);
+              await isolated.reconcileInterruptedLoginCleanup(workerData.name, workerData.tool);
+              parentPort.postMessage({ pid: process.pid });
+            } catch (error) {
+              parentPort.postMessage({ pid: process.pid, message: error?.message ?? String(error) });
+            }
+          }).catch((error) => parentPort.postMessage({ pid: process.pid, message: String(error) }));
+        `,
+        {
+          eval: true,
+          workerData: {
+            home,
+            storeModule,
+            name: prepared.profile.name,
+            tool: tool.id,
+          },
+        },
+      );
+      worker.once("message", resolveResult);
+      worker.once("error", reject);
+    });
+
+    expect(result.pid).toBe(process.pid);
+    expect(result.message).toMatch(/login preparation is still in progress/);
+    expect(existsSync(ownedPath)).toBe(true);
+    expect(await store.findProfile(prepared.profile.name, tool.id)).toEqual(prepared.profile);
+    await rollbackLoginPreparation(prepared, store);
+  });
+
   test("legacy three-argument restoreCurrent still restores the named prior profile", async () => {
     const store = resolveStore({ ACCOUNTS_HOME: home } as NodeJS.ProcessEnv);
     await store.addProfile({ name: "prior", tool: "claude" });
@@ -1863,6 +2088,34 @@ describe("LocalStore reads/writes the on-box registry", () => {
       store.useProfileForLogin!("target", "claude", operationId, replacement),
     ).rejects.toThrow(/operation id is already bound to another profile incarnation/);
     expect(await store.currentProfile("claude")).toBeUndefined();
+  });
+
+  test("local login activation rollback survives a new LocalStore instance", async () => {
+    const firstStore = resolveStore({ ACCOUNTS_HOME: home } as NodeJS.ProcessEnv);
+    const prior = await firstStore.addProfile({ name: "prior-restart", tool: "claude" });
+    const target = await firstStore.addProfile({ name: "target-restart", tool: "claude" });
+    await firstStore.useProfile(prior.name, prior.tool);
+    const beforeTargetLastUsedAt = target.lastUsedAt;
+    const operationId = "restart-owned-login-operation";
+    await firstStore.useProfileForLogin!(
+      target.name,
+      target.tool,
+      operationId,
+      target,
+    );
+
+    const restartedStore = resolveStore({ ACCOUNTS_HOME: home } as NodeJS.ProcessEnv);
+    expect(
+      await restartedStore.restoreCurrentOperation!(
+        target.tool,
+        target.name,
+        operationId,
+      ),
+    ).toBe(true);
+    expect((await restartedStore.currentProfile(target.tool))?.name).toBe(prior.name);
+    expect((await restartedStore.getProfile(target.name, target.tool)).lastUsedAt)
+      .toBe(beforeTargetLastUsedAt);
+    expect(loadMachineStore().loginOperations[operationId]).toBeUndefined();
   });
 
   test("operation rollback never restores a recreated local profile with colliding legacy fields", async () => {

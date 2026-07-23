@@ -6,7 +6,12 @@ import { isDeepStrictEqual } from "node:util";
 import { createInterface, type Interface } from "node:readline";
 import type { Profile } from "../types.js";
 import { AccountsError } from "../types.js";
-import { applyProfile, ownsApplyAuthWrites, type ApplyTransactionTracker } from "./apply.js";
+import {
+  applyProfile,
+  ownsApplyAuthRefsBeforeWrites,
+  ownsApplyAuthWrites,
+  type ApplyTransactionTracker,
+} from "./apply.js";
 import {
   assertClaudeProfileCommittedAuthSnapshot,
   captureClaudeLiveAuthSnapshot,
@@ -17,6 +22,7 @@ import {
   restoreClaudeProfileAuthSnapshot,
   writeClaudeProfileCommittedAuthSnapshot,
   pruneClaudeProfileCommittedAuthSnapshotSets,
+  removeClaudeProfileCommittedAuthSnapshots,
   type ClaudeLiveAuthSnapshot,
   type ClaudeProfileAuthSnapshot,
 } from "./claude-auth.js";
@@ -87,6 +93,38 @@ function ownedProfileIdentityKey(
   return currentKey && machine.profileAuthRevisions[currentKey] === identity
     ? currentKey
     : undefined;
+}
+
+function pruneRolledBackApplyAuthWrites(
+  machine: ReturnType<typeof loadMachineStore>,
+  rollback: NonNullable<LoginFinalizationState["writes"]["applyRollback"]>,
+): void {
+  const identities = new Set(
+    rollback.profileAuthWrites.flatMap((write) => write.identity ? [write.identity] : []),
+  );
+  for (const identity of identities) {
+    const referencedKeys = Object.entries(machine.profileAuthRevisions)
+      .filter(([, candidate]) => candidate === identity)
+      .map(([key]) => key);
+    if (referencedKeys.length === 0) {
+      removeClaudeProfileCommittedAuthSnapshots(identity);
+      continue;
+    }
+    const retained = new Set(
+      referencedKeys.flatMap((key) =>
+        machine.profileAuthCommitRevisions[key]
+          ? [machine.profileAuthCommitRevisions[key]!]
+          : []
+      ),
+    );
+    if (retained.size === 1) {
+      pruneClaudeProfileCommittedAuthSnapshotSets([
+        { identity, keepRevision: [...retained][0]! },
+      ]);
+    } else if (retained.size > 1) {
+      throw new AccountsError("conflicting committed Claude auth revisions while rolling back login");
+    }
+  }
 }
 
 export interface ToolAvailability {
@@ -936,11 +974,15 @@ function recordEmailFinalizationWrite(state: LoginFinalizationState | undefined,
   const afterEmail = profile.email ?? null;
   const anticipated = state.writes.profile.email;
   if (anticipated) {
-    if (afterEmail !== anticipated.expected) delete state.writes.profile.email;
+    if (afterEmail !== anticipated.expected) {
+      delete state.writes.profile.email;
+      state.writes.persist?.();
+    }
     return;
   }
   if (beforeEmail !== afterEmail) {
     state.writes.profile.email = { expected: afterEmail, restore: beforeEmail };
+    state.writes.persist?.();
   }
 }
 
@@ -956,6 +998,7 @@ function expectEmailFinalizationWrite(
     // Record ownership before the awaited registry write so a committed write
     // with a lost response can still be conditionally rolled back.
     state.writes.profile.email = { expected: detected, restore: beforeEmail };
+    state.writes.persist?.();
   }
 }
 
@@ -965,6 +1008,7 @@ function recordLastUsedFinalizationWrite(state: LoginFinalizationState | undefin
   const afterLastUsedAt = profile.lastUsedAt ?? null;
   if (beforeLastUsedAt !== afterLastUsedAt) {
     state.writes.profile.lastUsedAt = { expected: afterLastUsedAt, restore: beforeLastUsedAt };
+    state.writes.persist?.();
   }
 }
 
@@ -1058,9 +1102,23 @@ export async function rollbackLoginFinalization(
       const appliedRevisionNow = machine.appliedRevisions[state.tool.id];
       const expectedName = state.writes.appliedRevision ? state.profile.name : appliedBeforeApply?.name;
       const expectedRevision = state.writes.appliedRevision ?? appliedBeforeApply?.revision;
-      const ownsAppliedState = appliedNow === expectedName && appliedRevisionNow === expectedRevision;
-      const ownsAuthState = !applyRollback || ownsApplyAuthWrites(machine, applyRollback);
-      if (!ownsAppliedState || !ownsAuthState) return;
+      const ownsWrittenState =
+        appliedNow === expectedName &&
+        appliedRevisionNow === expectedRevision &&
+        (!applyRollback || ownsApplyAuthWrites(machine, applyRollback));
+      const ownsPreSaveState = Boolean(
+        applyRollback &&
+        appliedNow === applyRollback.applied?.name &&
+        appliedRevisionNow === applyRollback.applied?.revision &&
+        ownsApplyAuthRefsBeforeWrites(machine, applyRollback),
+      ) || Boolean(
+        applyRollback &&
+        !applyRollback.applied &&
+        appliedNow === undefined &&
+        appliedRevisionNow === undefined &&
+        ownsApplyAuthRefsBeforeWrites(machine, applyRollback),
+      );
+      if (!ownsWrittenState && !ownsPreSaveState) return;
       for (const snapshot of profileAuthSnapshots) restoreClaudeProfileAuthSnapshot(snapshot);
       if (applyRollback) {
         for (const ref of applyRollback.profileAuthRefs) {
@@ -1073,13 +1131,17 @@ export async function rollbackLoginFinalization(
         }
       }
       if (liveBeforeApply) restoreClaudeLiveAuthSnapshot(liveBeforeApply);
-      if (appliedBeforeApply) {
+      if (ownsPreSaveState) {
+        // The registry never crossed its save boundary; preserve the exact
+        // prior applied generation rather than manufacturing a new one.
+      } else if (appliedBeforeApply) {
         machine.applied[state.tool.id] = appliedBeforeApply.name;
         machine.appliedRevisions[state.tool.id] = randomUUID();
       } else {
         delete machine.applied[state.tool.id];
         delete machine.appliedRevisions[state.tool.id];
       }
+      if (applyRollback) pruneRolledBackApplyAuthWrites(machine, applyRollback);
       saveStore(machine);
     })));
   } else if (toolSpecificRollbackAllowed && profileAuthSnapshots.length > 0) {
@@ -1133,9 +1195,11 @@ export async function rollbackLoginFinalization(
 export async function commitLoginFinalization(
   state: LoginFinalizationState,
   canCommit: () => boolean = () => true,
+  markCommitted: () => void = () => {},
 ): Promise<boolean> {
   return withApplyLockWait(() => withStoreLock(() => {
     if (!canCommit()) return false;
+    markCommitted();
     const rollback = state.writes.applyRollback;
     if (!rollback) return true;
     const machine = loadMachineStore();
@@ -1185,7 +1249,10 @@ export async function finalizeLogin(
     const redetected = await store.redetectEmail(name, tool.id, state?.profile);
     recordEmailFinalizationWrite(state, redetected);
     const applied = await applyProfile(name, tool.id, store, state?.writes, state?.profile);
-    if (state) state.writes.currentRevision = requireLoginCurrentRevision(applied.currentRevision);
+    if (state) {
+      state.writes.currentRevision = requireLoginCurrentRevision(applied.currentRevision);
+      state.writes.persist?.();
+    }
     recordLastUsedFinalizationWrite(state, applied.profile);
     return { profile: applied.profile, applied: true };
   }
@@ -1194,13 +1261,19 @@ export async function finalizeLogin(
   const updated = await store.redetectEmail(name, tool.id, state?.profile);
   recordEmailFinalizationWrite(state, updated);
   const operationId = state ? randomUUID() : undefined;
-  if (state) state.writes.currentOperationId = operationId;
+  if (state) {
+    state.writes.currentOperationId = operationId;
+    state.writes.persist?.();
+  }
   const active = state
     ? await store.useProfileForLogin!(name, tool.id, operationId!, state.profile)
     : await store.useProfile(name, tool.id);
-  if (state) state.writes.currentRevision = requireLoginCurrentRevision(active.currentRevision);
-  if (state) state.writes.currentPreviousName = active.previousCurrentName;
-  if (state) state.writes.currentPreviousProfileLastUsedAt = active.previousProfileLastUsedAt;
+  if (state) {
+    state.writes.currentRevision = requireLoginCurrentRevision(active.currentRevision);
+    state.writes.currentPreviousName = active.previousCurrentName;
+    state.writes.currentPreviousProfileLastUsedAt = active.previousProfileLastUsedAt;
+    state.writes.persist?.();
+  }
   recordLastUsedFinalizationWrite(state, active.profile);
   return { profile: active.profile, applied: false };
 }

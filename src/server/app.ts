@@ -15,6 +15,7 @@ import {
 import { AccountsError, toolDefSchema } from "../types.js";
 import { BUILTIN_TOOLS, isBuiltinTool } from "../lib/tools.js";
 import { AccountsRepo, type AccountsStore } from "./repo.js";
+import { AccountIncarnationConflictError } from "./errors.js";
 import { accountsMigrations, readMigrationStatus } from "./migrations.js";
 import {
   createAccountSchema,
@@ -457,6 +458,9 @@ export function createHandler(ctx: ServiceContext): (req: Request) => Promise<Re
 
       return json(errorBody("not found"), 404);
     } catch (err) {
+      if (err instanceof AccountIncarnationConflictError) {
+        return json(errorBody(err.message), 409);
+      }
       if (err instanceof AccountsError) {
         const msg = err.message;
         const status = /already exists/.test(msg) ? 409 : /no profile named/.test(msg) ? 404 : 400;

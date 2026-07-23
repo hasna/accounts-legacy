@@ -328,6 +328,74 @@ test("raw machine pointers survive cloud-only profiles and reconcile rename/remo
   expect(loadMachineStore().toolLocks).toEqual({});
 });
 
+test("remove reconciliation reports an exact CAS-owned unreferenced auth identity", () => {
+  const authKey = "claude/owned";
+  saveStore({
+    version: 1,
+    current: {},
+    applied: {},
+    profileAuthRevisions: { [authKey]: "auth-owned" },
+    profileAuthCommitRevisions: { [authKey]: "commit-owned" },
+    profileAuthIncarnations: { [authKey]: "incarnation-owned" },
+    toolLocks: {},
+    profiles: [],
+    tools: [],
+  });
+
+  expect(reconcileMachineProfileRemove("claude", "owned", undefined, {
+    authKey,
+    authIdentity: "auth-owned",
+    authCommitRevision: "commit-owned",
+    authIncarnation: "incarnation-owned",
+  })).toEqual({ unreferencedAuthIdentities: ["auth-owned"] });
+  expect(loadMachineStore().profileAuthRevisions).toEqual({});
+});
+
+test("remove reconciliation preserves shared or concurrently replaced auth ownership", () => {
+  const targetKey = "claude/target";
+  const sharedKey = "claude/shared";
+  saveStore({
+    version: 1,
+    current: {},
+    applied: {},
+    profileAuthRevisions: {
+      [targetKey]: "shared-auth",
+      [sharedKey]: "shared-auth",
+    },
+    profileAuthCommitRevisions: {
+      [targetKey]: "target-commit",
+      [sharedKey]: "shared-commit",
+    },
+    profileAuthIncarnations: {
+      [targetKey]: "target-incarnation",
+      [sharedKey]: "shared-incarnation",
+    },
+    toolLocks: {},
+    profiles: [],
+    tools: [],
+  });
+  const expected = {
+    authKey: targetKey,
+    authIdentity: "shared-auth",
+    authCommitRevision: "target-commit",
+    authIncarnation: "target-incarnation",
+  };
+
+  expect(reconcileMachineProfileRemove("claude", "target", undefined, expected))
+    .toEqual({ unreferencedAuthIdentities: [] });
+  expect(loadMachineStore().profileAuthRevisions).toEqual({ [sharedKey]: "shared-auth" });
+
+  const replaced = loadMachineStore();
+  replaced.profileAuthRevisions[targetKey] = "replacement-auth";
+  replaced.profileAuthCommitRevisions[targetKey] = "replacement-commit";
+  replaced.profileAuthIncarnations[targetKey] = "replacement-incarnation";
+  saveStore(replaced);
+
+  expect(reconcileMachineProfileRemove("claude", "target", undefined, expected))
+    .toEqual({ unreferencedAuthIdentities: [] });
+  expect(loadMachineStore().profileAuthRevisions[targetKey]).toBe("replacement-auth");
+});
+
 test("machine pointer reconciliation reads after acquiring the registry lock", async () => {
   saveStore({
     version: 1,

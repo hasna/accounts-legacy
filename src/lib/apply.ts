@@ -70,6 +70,18 @@ export function ownsApplyAuthWrites(
   );
 }
 
+/** True while the registry still has the exact auth references captured before apply. */
+export function ownsApplyAuthRefsBeforeWrites(
+  local: ReturnType<typeof loadMachineStore>,
+  rollback: ApplyRollbackState,
+): boolean {
+  return rollback.profileAuthRefs.every((ref) =>
+    (local.profileAuthRevisions[ref.key] ?? undefined) === ref.identity &&
+    (local.profileAuthCommitRevisions[ref.key] ?? undefined) === ref.commitRevision &&
+    (local.profileAuthIncarnations[ref.key] ?? undefined) === ref.incarnation
+  );
+}
+
 export interface ApplyTransactionTracker {
   applyStarted?: boolean;
   appliedRevision?: string;
@@ -80,6 +92,8 @@ export interface ApplyTransactionTracker {
   profileAuthSnapshots?: ClaudeProfileAuthSnapshot[];
   applyRollback?: ApplyRollbackState;
   keychainLeaseHeld?: boolean;
+  /** Persist the current rollback ownership before crossing a hard-death boundary. */
+  persist?: () => void;
 }
 
 function singleMatch(profiles: Profile[]): Profile | undefined {
@@ -161,14 +175,25 @@ export async function applyProfile(
     return await withApplyLockAsync(async () => {
       let result: ReturnType<typeof applyProfileAuth>;
       try {
-        if (tracker) tracker.applyStarted = true;
-        result = applyProfileAuth(profile, tool, toolProfiles, tracker);
+        const operationId = randomUUID();
+        const appliedRevision = randomUUID();
+        if (tracker) {
+          tracker.applyStarted = true;
+          tracker.currentOperationId = operationId;
+          tracker.appliedRevision = appliedRevision;
+          tracker.persist?.();
+        }
+        result = applyProfileAuth(profile, tool, toolProfiles, appliedRevision, tracker);
       } catch (error) {
         restoreKeychainAfterFailure(keychainBefore, error);
       }
-      if (tracker) tracker.appliedRevision = result.appliedRevision;
-      const operationId = randomUUID();
-      if (tracker) tracker.currentOperationId = operationId;
+      const operationId = tracker?.currentOperationId ?? randomUUID();
+      if (
+        process.env.NODE_ENV === "test" &&
+        process.env.ACCOUNTS_TEST_LOGIN_HARD_CRASH_POINT === "post-apply"
+      ) {
+        process.kill(process.pid, "SIGKILL");
+      }
       let active;
       try {
         active = await useProfileForLogin(profile.name, tool.id, operationId, expectedProfile ?? profile);
@@ -200,9 +225,12 @@ export async function applyProfile(
           error,
         );
       }
-      if (tracker) tracker.currentRevision = active.currentRevision;
-      if (tracker) tracker.currentPreviousName = active.previousCurrentName;
-      if (tracker) tracker.currentPreviousProfileLastUsedAt = active.previousProfileLastUsedAt;
+      if (tracker) {
+        tracker.currentRevision = active.currentRevision;
+        tracker.currentPreviousName = active.previousCurrentName;
+        tracker.currentPreviousProfileLastUsedAt = active.previousProfileLastUsedAt;
+        tracker.persist?.();
+      }
       if (!tracker) {
         pruneClaudeProfileCommittedAuthSnapshotSets(
           result.rollback.profileAuthWrites.flatMap((write) =>
@@ -360,6 +388,7 @@ function applyProfileAuth(
   profile: Profile,
   tool: ToolDef,
   toolProfiles: Profile[],
+  appliedRevision: string,
   tracker?: ApplyTransactionTracker,
 ): { profile: Profile; previous?: string; appliedRevision: string; rollback: ApplyRollbackState } {
   assertRestorableProfileAuth(profile.dir, tool, profile.name);
@@ -377,7 +406,10 @@ function applyProfileAuth(
     };
     const targetAuthKey = adoptProfileAuthIncarnation(local, rollback.profileAuthRefs, profile);
     const touchedProfiles = new Map<string, Profile>([[targetAuthKey, profile]]);
-    if (tracker) tracker.applyRollback = rollback;
+    if (tracker) {
+      tracker.applyRollback = rollback;
+      tracker.persist?.();
+    }
 
     // Preserve whatever auth is currently live by snapshotting it into the
     // profile that actually owns it. The live OAuth email is the source of
@@ -401,6 +433,7 @@ function applyProfileAuth(
       }
       const ownerAuthKey = adoptProfileAuthIncarnation(local, rollback.profileAuthRefs, owner);
       touchedProfiles.set(ownerAuthKey, owner);
+      tracker?.persist?.();
       try {
         snapshotLiveAuthToProfile(owner.dir, tool);
       } catch (error) {
@@ -411,19 +444,15 @@ function applyProfileAuth(
     }
     try {
       ensureProfileAuthSnapshot(profile.dir, tool);
-      restoreClaudeAuthFromProfile(profile.dir, tool, profile.name);
-
       local.applied[tool.id] = profile.name;
-      const appliedRevision = randomUUID();
       local.appliedRevisions[tool.id] = appliedRevision;
-      for (const [authKey, touchedProfile] of touchedProfiles) {
-        const authIdentity = local.profileAuthRevisions[authKey] ?? randomUUID();
-        const authCommitRevision = randomUUID();
-        writeClaudeProfileCommittedAuthSnapshot(
-          touchedProfile.dir,
-          authIdentity,
-          authCommitRevision,
-        );
+      const plannedAuthWrites = [...touchedProfiles].map(([authKey, touchedProfile]) => ({
+        authKey,
+        touchedProfile,
+        authIdentity: local.profileAuthRevisions[authKey] ?? randomUUID(),
+        authCommitRevision: randomUUID(),
+      }));
+      for (const { authKey, touchedProfile, authIdentity, authCommitRevision } of plannedAuthWrites) {
         local.profileAuthRevisions[authKey] = authIdentity;
         local.profileAuthCommitRevisions[authKey] = authCommitRevision;
         local.profileAuthIncarnations[authKey] = profileAuthIncarnation(touchedProfile);
@@ -438,7 +467,23 @@ function applyProfileAuth(
         commitRevision: local.profileAuthCommitRevisions[key] ?? null,
         incarnation: local.profileAuthIncarnations[key] ?? null,
       }));
+      tracker?.persist?.();
+      restoreClaudeAuthFromProfile(profile.dir, tool, profile.name);
+      for (const { touchedProfile, authIdentity, authCommitRevision } of plannedAuthWrites) {
+        writeClaudeProfileCommittedAuthSnapshot(
+          touchedProfile.dir,
+          authIdentity,
+          authCommitRevision,
+        );
+      }
+      if (
+        process.env.NODE_ENV === "test" &&
+        process.env.ACCOUNTS_TEST_LOGIN_HARD_CRASH_POINT === "pre-save"
+      ) {
+        process.kill(process.pid, "SIGKILL");
+      }
       saveStore(local);
+      tracker?.persist?.();
 
       return { profile, appliedRevision, rollback, ...(previous && previous !== profile.name ? { previous } : {}) };
     } catch (error) {

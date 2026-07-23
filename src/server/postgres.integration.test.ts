@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { Pool } from "pg";
 import { mintApiKey, verifyApiKey } from "@hasna/contracts/auth";
 import {
@@ -547,6 +547,50 @@ describePostgres("PostgreSQL migration and repository integration", () => {
         ["runtime-role-tool"],
       ),
     ).toEqual({ id: "runtime-role-tool" });
+  });
+
+  test("conditional login cleanup compares PostgreSQL timestamps at wire millisecond precision", async () => {
+    const repo = new AccountsRepo(appClient);
+    const profile = await repo.create({
+      tool: "precision-tool",
+      name: "microsecond-profile",
+      email: "precision@example.test",
+      metadata: { precision: "milliseconds" },
+    });
+    await appClient.execute(
+      `UPDATE accounts
+          SET created_at = $3::timestamptz,
+              last_used_at = $4::timestamptz
+        WHERE tool = $1 AND name = $2`,
+      [
+        profile.tool,
+        profile.name,
+        "2026-07-23T10:11:12.123456Z",
+        "2026-07-23T10:11:13.654321Z",
+      ],
+    );
+    const wireProfile = await repo.get(profile.tool, profile.name);
+    if (!wireProfile) throw new Error("missing timestamp precision fixture");
+    expect(wireProfile.createdAt).toBe("2026-07-23T10:11:12.123Z");
+    expect(wireProfile.lastUsedAt).toBe("2026-07-23T10:11:13.654Z");
+
+    const result = await repo.removeCreated(profile.tool, profile.name, {
+      cleanupOperationId: randomUUID(),
+      cleanupRequestedAt: new Date().toISOString(),
+      expectedIncarnationId: wireProfile.incarnationId,
+      expectedCreatedAt: wireProfile.createdAt,
+      expectedEmail: wireProfile.email ?? null,
+      expectedDisplayName: wireProfile.displayName ?? null,
+      expectedIdentity: wireProfile.identity ?? null,
+      expectedCardLast4: wireProfile.cardLast4 ?? null,
+      expectedMetadata: wireProfile.metadata,
+      expectedDir: wireProfile.dir ?? null,
+      expectedDescription: wireProfile.description ?? null,
+      expectedLastUsedAt: wireProfile.lastUsedAt ?? null,
+    });
+
+    expect(result).toEqual({ removed: true, currentExists: false, expired: false });
+    expect(await repo.get(profile.tool, profile.name)).toBeNull();
   });
 
   test("legacy migrator is downgrade-guarded; app rollback keeps the new migrator", async () => {

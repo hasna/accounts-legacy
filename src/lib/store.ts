@@ -85,6 +85,7 @@ import {
 import { accountsHome, loadMachineStore, loadStore, saveStore, withStoreLock } from "../storage.js";
 import { resolveAccountsCloud, type AccountsCloudApi } from "./cloud-accounts.js";
 import { assertSafeWritePath } from "./safe-path.js";
+import { removeClaudeProfileCommittedAuthSnapshots } from "./claude-auth.js";
 
 export interface CurrentEntry {
   tool: string;
@@ -202,6 +203,8 @@ export interface AccountsStore {
     name?: string,
     restoreLastUsedAt?: string | null,
   ): Promise<boolean>;
+  /** Forget a completed durable local activation rollback record. API stores are server-owned. */
+  commitLoginOperation?(operationId: string): Promise<void>;
   currentProfile(tool: string): Promise<Profile | undefined>;
   listCurrent(): Promise<CurrentEntry[]>;
   /** Strict generation-aware current snapshot used only before transactional login. */
@@ -473,7 +476,7 @@ export type LoginCleanupFaultPoint =
   | "pre-purge";
 
 let loginCleanupFaultInjector: ((point: LoginCleanupFaultPoint) => void) | undefined;
-const activeLoginCleanupOperations = new Set<string>();
+const activeLoginCleanupOperations = new Map<string, LoginCleanupIntent>();
 
 export class LoginCleanupInProgressError extends AccountsError {}
 
@@ -502,7 +505,7 @@ export function injectLoginCleanupFaultForTests(
   try {
     loginCleanupFaultInjector(point);
   } catch (error) {
-    if (cleanupOperationId) activeLoginCleanupOperations.delete(cleanupOperationId);
+    if (cleanupOperationId) abandonLoginCleanupIntentInProcess(cleanupOperationId);
     throw new InjectedLoginCleanupFault(point, { cause: error });
   }
 }
@@ -532,6 +535,8 @@ export interface LoginCleanupIntent {
   ownership: CreatedProfileRollbackOwnership;
   ownerPid: number;
   ownerProcessStartId: string;
+  /** Explicit handoff from a live owner to crash-recovery reconciliation. */
+  ownerReleased?: boolean;
 }
 
 interface LoginCleanupMarker {
@@ -638,6 +643,7 @@ function parseLoginCleanupIntent(
     "ownership",
     "ownerPid",
     "ownerProcessStartId",
+    "ownerReleased",
   ]);
   const allowedOwnership = new Set([
     "cleanupOperationId",
@@ -677,6 +683,7 @@ function parseLoginCleanupIntent(
     intent.ownerPid <= 0 ||
     typeof intent.ownerProcessStartId !== "string" ||
     !/^(?:(?:linux|darwin)-[A-Za-z0-9-]+|fallback-[0-9a-f-]+)$/i.test(intent.ownerProcessStartId) ||
+    (intent.ownerReleased !== undefined && typeof intent.ownerReleased !== "boolean") ||
     (!intent.profileExisted &&
       resolve(intent.dir) !== resolve(managedProfileDirectory(name, tool))) ||
     !["planned", "profile-created", "lock-planned", "rollback"].includes(intent.phase ?? "") ||
@@ -729,13 +736,14 @@ export function beginLoginCleanupIntent(
       ownership: { cleanupOperationId, cleanupRequestedAt },
       ownerPid: process.pid,
       ownerProcessStartId: profileDirectoryProcessIncarnation,
+      ownerReleased: false,
     };
     publishAtomicJson(
       loginCleanupIntentPath(name, tool, transport),
       intent,
       accountsHome(),
     );
-    activeLoginCleanupOperations.add(cleanupOperationId);
+    activeLoginCleanupOperations.set(cleanupOperationId, intent);
     return intent;
   });
 }
@@ -762,6 +770,7 @@ export function evolveLoginCleanupIntent(
       next,
       accountsHome(),
     );
+    activeLoginCleanupOperations.set(next.cleanupOperationId, next);
     return next;
   });
 }
@@ -782,20 +791,35 @@ export function clearLoginCleanupIntent(intent: LoginCleanupIntent): void {
 }
 
 export function abandonLoginCleanupIntentInProcess(cleanupOperationId: string): void {
-  activeLoginCleanupOperations.delete(cleanupOperationId);
+  withStoreLock(() => {
+    const owned = activeLoginCleanupOperations.get(cleanupOperationId);
+    if (owned) {
+      const current = parseLoginCleanupIntent(owned.name, owned.tool, owned.transport);
+      if (current?.cleanupOperationId === cleanupOperationId && !current.ownerReleased) {
+        publishAtomicJson(
+          loginCleanupIntentPath(current.name, current.tool, current.transport),
+          { ...current, ownerReleased: true },
+          accountsHome(),
+        );
+      }
+    }
+    activeLoginCleanupOperations.delete(cleanupOperationId);
+  });
 }
 
 function loginCleanupIntentOwnerIsLive(intent: LoginCleanupIntent): boolean {
+  if (intent.ownerReleased) return false;
   if (activeLoginCleanupOperations.has(intent.cleanupOperationId)) return true;
   if (intent.ownerPid === process.pid) {
     if (
       isVerifiableDirectoryProcessStartId(intent.ownerProcessStartId) &&
       isVerifiableDirectoryProcessStartId(profileDirectoryProcessIncarnation)
     ) {
-      return intent.ownerProcessStartId === profileDirectoryProcessIncarnation &&
-        activeLoginCleanupOperations.has(intent.cleanupOperationId);
+      return intent.ownerProcessStartId === profileDirectoryProcessIncarnation;
     }
-    return false;
+    // A worker/module isolate shares our PID but not module globals. Without
+    // an explicit release marker, fail closed and treat that owner as live.
+    return true;
   }
   const observed = profileDirectoryProcessStartId(intent.ownerPid);
   if (
@@ -1129,21 +1153,27 @@ function profileFromLoginCleanupIntent(intent: LoginCleanupIntent): Profile {
   };
 }
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function reconcileMachineProfileRemoveAndPruneCommittedAuth(
+  tool: string,
+  name: string,
+  incarnation: string | undefined,
+  expectation: ReturnType<typeof captureMachineProfileReconcileExpectation>,
+): void {
+  withStoreLock(() => {
+    const result = reconcileMachineProfileRemove(tool, name, incarnation, expectation);
+    for (const identity of result.unreferencedAuthIdentities) {
+      if (UUID_PATTERN.test(identity)) {
+        removeClaudeProfileCommittedAuthSnapshots(identity);
+      }
+    }
+  });
+}
+
 /** On-box JSON registry. Delegates to the core profile library. */
 class LocalStore implements AccountsStore {
   readonly transport = "local" as const;
-  private readonly loginOperations = new Map<string, {
-    tool: string;
-    name: string;
-    targetIncarnation: string;
-    activatedProfileLastUsedAt: string;
-    previousCurrentName?: string;
-    previousCurrentIncarnation?: string;
-    previousProfileLastUsedAt?: string;
-    previousToolLock?: string;
-    previousToolLockRevision?: string;
-    writtenToolLockRevision: string;
-  }>();
 
   async listProfiles(tool?: string): Promise<Profile[]> {
     return localList(tool);
@@ -1555,7 +1585,7 @@ class LocalStore implements AccountsStore {
       if (expectedProfile && targetIncarnation !== profileAuthIncarnation(expectedProfile)) {
         throw new AccountsError("profile changed while login activation was in progress");
       }
-      const completed = this.loginOperations.get(operationId);
+      const completed = machine.loginOperations[operationId];
       if (completed) {
         if (completed.tool !== profile.tool || completed.name !== profile.name) {
           throw new AccountsError("login operation id is already bound to another profile");
@@ -1591,8 +1621,7 @@ class LocalStore implements AccountsStore {
       machine.toolLocks[profile.name] = profile.tool;
       machine.toolLockRevisions[profile.name] = writtenToolLockRevision;
       profile.lastUsedAt = new Date().toISOString();
-      saveStore(machine);
-      this.loginOperations.set(operationId, {
+      machine.loginOperations[operationId] = {
         tool: profile.tool,
         name: profile.name,
         targetIncarnation,
@@ -1605,7 +1634,8 @@ class LocalStore implements AccountsStore {
         ...(previousToolLock ? { previousToolLock } : {}),
         ...(previousToolLockRevision ? { previousToolLockRevision } : {}),
         writtenToolLockRevision,
-      });
+      };
+      saveStore(machine);
       return {
         profile: structuredClone(profile),
         toolId: profile.tool,
@@ -1666,7 +1696,7 @@ class LocalStore implements AccountsStore {
     return withStoreLock(() => {
       const machine = loadMachineStore();
       if (machine.current[tool] !== expectedName || machine.currentRevisions[tool] !== operationId) return false;
-      const operation = this.loginOperations.get(operationId);
+      const operation = machine.loginOperations[operationId];
       if (operation && (operation.tool !== tool || operation.name !== expectedName)) {
         throw new AccountsError("login operation id is already bound to another profile");
       }
@@ -1714,9 +1744,17 @@ class LocalStore implements AccountsStore {
         delete machine.current[tool];
         delete machine.currentRevisions[tool];
       }
+      delete machine.loginOperations[operationId];
       saveStore(machine);
-      this.loginOperations.delete(operationId);
       return true;
+    });
+  }
+  async commitLoginOperation(operationId: string): Promise<void> {
+    withStoreLock(() => {
+      const machine = loadMachineStore();
+      if (!(operationId in machine.loginOperations)) return;
+      delete machine.loginOperations[operationId];
+      saveStore(machine);
     });
   }
   async currentProfile(tool: string): Promise<Profile | undefined> {
@@ -1899,7 +1937,17 @@ class ApiStore implements AccountsStore {
     const existing = await this.resolve(name, opts.tool);
     const expectation = captureMachineProfileReconcileExpectation(existing);
     const profile = await this.api.remove(existing.name, existing.tool);
-    reconcileMachineProfileRemove(
+    const sameIncarnation = existing.incarnationId || profile.incarnationId
+      ? Boolean(existing.incarnationId && profile.incarnationId === existing.incarnationId)
+      : profileAuthIncarnation(profile) === profileAuthIncarnation(existing);
+    if (
+      profile.name !== existing.name ||
+      profile.tool !== existing.tool ||
+      !sameIncarnation
+    ) {
+      throw new AccountsError("Accounts API removed a different profile incarnation; local machine state was preserved");
+    }
+    reconcileMachineProfileRemoveAndPruneCommittedAuth(
       profile.tool,
       profile.name,
       profileAuthIncarnation(profile),
@@ -1985,7 +2033,7 @@ class ApiStore implements AccountsStore {
           );
           return;
         }
-        reconcileMachineProfileRemove(
+        reconcileMachineProfileRemoveAndPruneCommittedAuth(
           tool,
           name,
           profileAuthIncarnation(synthetic),
@@ -2099,7 +2147,7 @@ class ApiStore implements AccountsStore {
         ) {
           return { profile, purged: false };
         }
-        reconcileMachineProfileRemove(
+        reconcileMachineProfileRemoveAndPruneCommittedAuth(
           profile.tool,
           profile.name,
           profileAuthIncarnation(profile),

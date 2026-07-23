@@ -124,6 +124,28 @@ test("permission source normalization rejects duplicates and preset/pass-through
     permissions: "none",
     passthroughArgs: ["--permissions", "dangerous"],
   })).toThrow(/cannot be supplied both/);
+  expect(resolvePermissionInputs(claude, {
+    passthroughArgs: ["--permission-mode", "bypassPermissions"],
+  })).toEqual({ args: [] });
+  for (const passthroughArgs of [
+    ["--permission-mode", "bypassPermissions"],
+    ["--permission-mode=bypassPermissions"],
+  ]) {
+    expect(() => resolvePermissionInputs(claude, {
+      permissions: "none",
+      passthroughArgs,
+    })).toThrow(/cannot be combined/);
+  }
+  expect(() => resolvePermissionInputs(claude, {
+    passthroughArgs: [
+      "--permission-mode",
+      "plan",
+      "--permission-mode=bypassPermissions",
+    ],
+  })).toThrow(/may be supplied only once/);
+  expect(() => resolvePermissionInputs(claude, {
+    passthroughArgs: ["--permission-mode"],
+  })).toThrow(/requires a value/);
   expect(() => validateRawPermissionInputs([
     "switch",
     "acct",
@@ -142,6 +164,16 @@ test("mergeToolArgs prepends permission args without duplicating explicit flags"
   ]);
   expect(mergeToolArgs(claude, ["--dangerously-skip-permissions"], { permissions: "dangerous" })).toEqual([
     "--dangerously-skip-permissions",
+  ]);
+  expect(mergeToolArgs(claude, ["-p", "plan"], { permissions: "plan" })).toEqual([
+    "--permission-mode",
+    "plan",
+    "-p",
+    "plan",
+  ]);
+  expect(mergeToolArgs(claude, ["--permission-mode", "plan"], { permissions: "plan" })).toEqual([
+    "--permission-mode",
+    "plan",
   ]);
   expect(mergeToolArgs(getTool("codex"), ["resume", "--last"], { permissions: "dangerous" })).toEqual([
     "--dangerously-bypass-approvals-and-sandbox",

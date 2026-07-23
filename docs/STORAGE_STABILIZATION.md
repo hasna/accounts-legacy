@@ -69,13 +69,13 @@ instead of a parse or compile failure. The retired `remote`, `hybrid`, and
    migration owner owns the Accounts schema and its objects and is used only by
    `accounts-migrate`; the other role is used only by `accounts-serve`.
 3. **Deployment is blocked for this branch. Do not run `accounts-migrate` or
-   deploy source containing migration `0010`.** Critical task
-   `f799e8a5-fc9e-4735-bfb9-8a0c17b90b25` must first make SQL execution and the
-   checksum-ledger write atomic under the same advisory lock. Source merge does not apply migrations,
+   deploy source containing migration `0010`.** Migration-runner remediation
+   must first make SQL execution and the checksum-ledger write atomic under the
+   same advisory lock. Source merge does not apply migrations,
    and this branch's executable migrator rejects a
    non-dry-run plan while `0010` is pending. A dry run may inspect the blocked
    plan without applying it.
-4. After that critical task lands and this explicit gate is removed in a
+4. After that remediation lands and this explicit gate is removed in a
    reviewed follow-up, run `accounts-migrate` with the owner DSN and
    `HASNA_ACCOUNTS_RUNTIME_ROLE=<accounts-serve-role>`. Migration
    `0003` is additive and creates `custom_tools`. Migration `0004` copies
@@ -171,10 +171,10 @@ manifest are revalidated.
 | Client | Server | Result |
 | --- | --- | --- |
 | Old | Old | Existing account and selection operations are unchanged. |
-| Old | New | Compatibility is testable after migrations through 0010, but deployment remains blocked by critical task `f799e8a5-fc9e-4735-bfb9-8a0c17b90b25`. Account creation with a previously local, unseen custom tool id succeeds without a tools-registration call. A durably removed id is rejected; a database trigger advances current-selection generations for legacy conflict updates. |
+| Old | New | Compatibility is testable after migrations through 0010, but deployment remains blocked until migration-runner atomicity remediation lands. Account creation with a previously local, unseen custom tool id succeeds without a tools-registration call. A durably removed id is rejected; a database trigger advances current-selection generations for legacy conflict updates. |
 | New | Old | Existing non-login operations work, including Account reads whose legacy response omits `incarnationId` or `email`. Minimal legacy built-in Tool responses are accepted. Login preflight, rename, custom-tool mutations, conditional created-profile cleanup, and generation-owned failed-login rollback require a server upgrade and fail with an actionable error. Transactional activation and rollback use new-only routes, so old replicas reject rather than partially execute them. |
 | New | New before migrations 0003 through 0010 | `/ready` is unavailable with a pending-migration reason. Do not send traffic. |
-| New | New after migrations 0003 through 0010 | Not deploy-approved on this branch. After the critical migration-runner task and a fresh review remove the gate, the tested runtime contract includes full AccountsStore routing, durable tool lifecycle state, conditional created-profile cleanup, rollback fencing, and pointer reconciliation. |
+| New | New after migrations 0003 through 0010 | Not deploy-approved on this branch. After migration-runner atomicity remediation and a fresh review remove the gate, the tested runtime contract includes full AccountsStore routing, durable tool lifecycle state, conditional created-profile cleanup, rollback fencing, and pointer reconciliation. |
 
 ## Rollback And Forward Fix
 

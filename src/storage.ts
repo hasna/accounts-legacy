@@ -67,6 +67,7 @@ const EMPTY_STORE: NormalizedStore = {
   version: 1,
   current: {},
   currentRevisions: {},
+  loginOperations: {},
   applied: {},
   appliedRevisions: {},
   profileAuthRevisions: {},
@@ -513,6 +514,10 @@ export interface MachineProfileReconcileExpectation {
   authIncarnation?: string;
 }
 
+export interface MachineProfileRemoveReconcileResult {
+  unreferencedAuthIdentities: string[];
+}
+
 export interface MachineProfileAuthSlotExpectation {
   authKey: string;
   authIdentity: string | null;
@@ -690,10 +695,11 @@ export function reconcileMachineProfileRemove(
   name: string,
   incarnation?: string,
   expected?: MachineProfileReconcileExpectation,
-): void {
-  withStoreLock(() => {
+): MachineProfileRemoveReconcileResult {
+  return withStoreLock(() => {
     const store = parseStoreFile();
     let changed = false;
+    const removedAuthIdentities = new Set<string>();
     const ownsCurrent = expected
       ? Boolean(expected.currentRevision && store.current[toolId] === name && store.currentRevisions[toolId] === expected.currentRevision)
       : store.current[toolId] === name;
@@ -736,7 +742,9 @@ export function reconcileMachineProfileRemove(
           ])
       : new Set<string>();
     for (const key of authKeys) {
-      if (store.profileAuthRevisions[key]) {
+      const authIdentity = store.profileAuthRevisions[key];
+      if (authIdentity) {
+        removedAuthIdentities.add(authIdentity);
         delete store.profileAuthRevisions[key];
         changed = true;
       }
@@ -750,6 +758,12 @@ export function reconcileMachineProfileRemove(
       }
     }
     if (changed) saveStoreLocked(store);
+    const referencedAuthIdentities = new Set(Object.values(store.profileAuthRevisions));
+    return {
+      unreferencedAuthIdentities: [...removedAuthIdentities].filter(
+        (identity) => !referencedAuthIdentities.has(identity),
+      ),
+    };
   });
 }
 

@@ -183,6 +183,7 @@ export interface ToolArgOptions {
 }
 
 export const CLAUDE_DANGEROUS_PERMISSION_ARG = "--dangerously-skip-permissions";
+const CLAUDE_PERMISSION_MODE_ARG = "--permission-mode";
 
 export interface PermissionInputs {
   permissions?: string;
@@ -261,6 +262,53 @@ export function validatePermissionInputs(inputs: PermissionInputs): void {
   }
 }
 
+/**
+ * Treat native Claude permission modes as a permission source without
+ * constraining the value to today's built-in presets. Claude may add modes,
+ * but a caller still must not use a native mode to override another source.
+ */
+function validateClaudePermissionModeInputs(inputs: PermissionInputs): void {
+  const passthroughArgs = inputs.passthroughArgs ?? [];
+  let nativeModeOccurrences = 0;
+  for (let index = 0; index < passthroughArgs.length; index += 1) {
+    const arg = passthroughArgs[index]!;
+    if (arg === CLAUDE_PERMISSION_MODE_ARG) {
+      const value = passthroughArgs[index + 1];
+      if (!value?.trim() || value.startsWith("-")) {
+        throw new AccountsError(`${CLAUDE_PERMISSION_MODE_ARG} requires a value`);
+      }
+      nativeModeOccurrences += 1;
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith(`${CLAUDE_PERMISSION_MODE_ARG}=`)) {
+      if (!arg.slice(CLAUDE_PERMISSION_MODE_ARG.length + 1).trim()) {
+        throw new AccountsError(`${CLAUDE_PERMISSION_MODE_ARG} requires a value`);
+      }
+      nativeModeOccurrences += 1;
+    }
+  }
+  if (nativeModeOccurrences > 1) {
+    throw new AccountsError("--permissions may be supplied only once");
+  }
+  if (nativeModeOccurrences === 0) return;
+
+  const hasOtherSource =
+    Boolean(inputs.permissions) ||
+    Boolean(inputs.dangerouslySkipPermissions) ||
+    passthroughArgs.some(
+      (arg) =>
+        arg === CLAUDE_DANGEROUS_PERMISSION_ARG ||
+        arg === "--permissions" ||
+        arg.startsWith("--permissions="),
+    );
+  if (hasOtherSource) {
+    throw new AccountsError(
+      `${CLAUDE_PERMISSION_MODE_ARG} cannot be combined with another permission source`,
+    );
+  }
+}
+
 /** Reject duplicate Accounts/native permission switches directly from argv. */
 export function validateRawPermissionInputs(argv: readonly string[]): void {
   let permissionsOccurrences = 0;
@@ -281,6 +329,7 @@ export function resolvePermissionInputs(
   inputs: PermissionInputs,
 ): ResolvedPermissionInputs {
   validatePermissionInputs(inputs);
+  if (tool.id === "claude") validateClaudePermissionModeInputs(inputs);
   const hasNativePassthrough = (inputs.passthroughArgs ?? []).includes(
     CLAUDE_DANGEROUS_PERMISSION_ARG,
   );
@@ -325,9 +374,18 @@ export function launchArgsFor(tool: ToolDef, profile?: Profile): string[] {
   return profile ? args.map((arg) => renderToolArg(arg, profile)) : args;
 }
 
+function includesArgVector(args: readonly string[], vector: readonly string[]): boolean {
+  if (vector.length === 0) return true;
+  for (let index = 0; index <= args.length - vector.length; index += 1) {
+    if (vector.every((arg, offset) => args[index + offset] === arg)) return true;
+  }
+  return false;
+}
+
 export function mergeToolArgs(tool: ToolDef, args: string[], opts: ToolArgOptions = {}): string[] {
   const launchArgs = launchArgsFor(tool, opts.profile).filter((arg) => !args.includes(arg));
-  const permissionArgs = permissionArgsFor(tool, opts.permissions).filter((arg) => !args.includes(arg));
+  const configuredPermissionArgs = permissionArgsFor(tool, opts.permissions);
+  const permissionArgs = includesArgVector(args, configuredPermissionArgs) ? [] : configuredPermissionArgs;
   return [...permissionArgs, ...launchArgs, ...args];
 }
 

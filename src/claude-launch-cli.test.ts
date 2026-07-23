@@ -16,6 +16,7 @@ import {
   prepareWindowsBatchCommand,
   redactArgv,
   redactText,
+  signalExitCode,
 } from "./lib/claude-launch.js";
 import { getTool } from "./lib/tools.js";
 import { AccountsError } from "./types.js";
@@ -106,6 +107,7 @@ appendFileSync(process.env.FAKE_CLAUDE_LOG, JSON.stringify({
 }) + "\\n");
 if (process.env.FAKE_STDOUT !== "0") console.log("fake-claude-stdout");
 if (process.env.FAKE_STDERR !== "0") console.error("fake-claude-stderr");
+if (process.env.FAKE_IGNORE_HUP === "1") process.on("SIGHUP", () => {});
 if (process.env.FAKE_IGNORE_TERM === "1") process.on("SIGTERM", () => {});
 const delay = Number(process.env.FAKE_SLEEP_MS ?? 0);
 if (delay > 0) await Bun.sleep(delay);
@@ -504,6 +506,82 @@ test("launch accepts the historical direct Claude dangerous-permissions flag", (
   ]);
 });
 
+test("launch preserves one native Claude permission mode and rejects mixed permission sources", () => {
+  addProfile("acct");
+  const standalone = runCli([
+    "launch",
+    "acct",
+    "--tool",
+    "claude",
+    "--skip-configs",
+    "--headless",
+    "--",
+    "--permission-mode=bypassPermissions",
+    "Prompt",
+  ]);
+  const splitConflict = runCli([
+    "launch",
+    "acct",
+    "--tool",
+    "claude",
+    "--skip-configs",
+    "--headless",
+    "--permissions",
+    "none",
+    "--",
+    "--permission-mode",
+    "bypassPermissions",
+    "Prompt",
+  ]);
+  const equalsConflict = runCli([
+    "launch",
+    "acct",
+    "--tool",
+    "claude",
+    "--skip-configs",
+    "--headless",
+    "--permissions",
+    "none",
+    "--",
+    "--permission-mode=bypassPermissions",
+    "Prompt",
+  ]);
+
+  expectStatus(standalone, 0);
+  expect(standalone.stderr).not.toContain("error:");
+  expect(splitConflict.status).toBe(1);
+  expect(splitConflict.stderr).toContain("cannot be combined");
+  expect(equalsConflict.status).toBe(1);
+  expect(equalsConflict.stderr).toContain("cannot be combined");
+  expect(claudeEntries().map((entry) => entry.args)).toEqual([
+    ["-p", "--permission-mode=bypassPermissions", "Prompt"],
+  ]);
+});
+
+test("multi-token permission presets remain atomic when the prompt repeats a preset value", () => {
+  addProfile("acct");
+  const result = runCli([
+    "launch",
+    "acct",
+    "--tool",
+    "claude",
+    "--skip-configs",
+    "--headless",
+    "--permissions",
+    "plan",
+    "--",
+    "plan",
+  ]);
+
+  expectStatus(result, 0);
+  expect(claudeEntries()[0]?.args).toEqual([
+    "--permission-mode",
+    "plan",
+    "-p",
+    "plan",
+  ]);
+});
+
 test("launch rejects duplicate or non-Claude direct dangerous-permissions inputs before spawning", () => {
   addProfile("acct");
   expect(runCli(["add", "codexer", "--tool", "codex"]).status).toBe(0);
@@ -813,6 +891,31 @@ test("SIGTERM is forwarded, returns nonzero, and restores the prior keychain", a
   child.kill("SIGTERM");
   const completed = await result;
   expect(completed.code).toBe(143);
+  expect(readKeychain()).toEqual({ account: "prior", secret: "prior-credential-value" });
+  expect(existsSync(keychainLock)).toBe(false);
+});
+
+test("SIGHUP is forwarded as 129 and restores the prior keychain", async () => {
+  if (process.platform === "win32") return;
+  expect(signalExitCode("SIGHUP")).toBe(129);
+  addProfile("acct", "profile-credential-value");
+  setKeychain("prior", "prior-credential-value");
+  const child = spawnCli(
+    ["launch", "acct", "--tool", "claude", "--skip-configs", "--headless", "--", "Prompt"],
+    {
+      ACCOUNTS_TEST_KEYCHAIN: "1",
+      ACCOUNTS_TEST_SECURITY_BIN: securityBin,
+      ACCOUNTS_TEST_CHILD_KILL_TIMEOUT_MS: "100",
+      FAKE_IGNORE_HUP: "1",
+      FAKE_SLEEP_MS: "10000",
+    },
+  );
+  const result = collect(child);
+  await waitFor(() => claudeEntries().length === 1);
+  child.kill("SIGHUP");
+  const completed = await result;
+  expect(completed.code).toBe(129);
+  expect(completed.signal).toBeNull();
   expect(readKeychain()).toEqual({ account: "prior", secret: "prior-credential-value" });
   expect(existsSync(keychainLock)).toBe(false);
 });

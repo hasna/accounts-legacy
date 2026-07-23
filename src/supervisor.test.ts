@@ -346,7 +346,7 @@ test("switch --supervisor sends configs prelaunch flags to the supervisor", asyn
   }
 });
 
-test("supervisor CLI routes preserve a single native Claude permission source", async () => {
+test("supervisor CLI routes preserve a single native Claude permission source and reject conflicts", async () => {
   addProfile({ name: "two", tool: "claude" });
 
   const requests: Array<Record<string, unknown>> = [];
@@ -393,16 +393,73 @@ test("supervisor CLI routes preserve a single native Claude permission source", 
       expect({ exitCode, stderr }).toMatchObject({ exitCode: 0, stderr: "" });
     }
 
-    expect(requests).toHaveLength(2);
+    const nativeMode = Bun.spawn({
+      cmd: [
+        process.execPath,
+        "run",
+        "src/cli.ts",
+        "supervisor",
+        "switch",
+        "two",
+        "--tool",
+        "claude",
+        "--",
+        "--permission-mode=bypassPermissions",
+      ],
+      env: { ...process.env, ACCOUNTS_HOME: home },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [nativeModeExit, nativeModeStderr] = await Promise.all([
+      nativeMode.exited,
+      new Response(nativeMode.stderr).text(),
+    ]);
+    expect({ exitCode: nativeModeExit, stderr: nativeModeStderr }).toMatchObject({
+      exitCode: 0,
+      stderr: "",
+    });
+
+    const conflict = Bun.spawn({
+      cmd: [
+        process.execPath,
+        "run",
+        "src/cli.ts",
+        "supervisor",
+        "switch",
+        "two",
+        "--tool",
+        "claude",
+        "--permissions",
+        "none",
+        "--",
+        "--permission-mode",
+        "bypassPermissions",
+      ],
+      env: { ...process.env, ACCOUNTS_HOME: home },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [conflictExit, conflictStderr] = await Promise.all([
+      conflict.exited,
+      new Response(conflict.stderr).text(),
+    ]);
+    expect(conflictExit).toBe(1);
+    expect(conflictStderr).toContain("cannot be combined");
+
+    expect(requests).toHaveLength(3);
     for (const request of requests) {
       expect(request).toMatchObject({
         type: "switch_profile",
         name: "two",
         tool: "claude",
-        args: ["--dangerously-skip-permissions"],
       });
       expect(request).not.toHaveProperty("permissions");
     }
+    expect(requests.map((request) => request.args)).toEqual([
+      ["--dangerously-skip-permissions"],
+      ["--dangerously-skip-permissions"],
+      ["--permission-mode=bypassPermissions"],
+    ]);
   } finally {
     server.close();
     rmSync(supervisorSocketPath("claude"), { force: true });

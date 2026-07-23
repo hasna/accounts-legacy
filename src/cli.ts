@@ -22,7 +22,7 @@ import {
   expandPath,
   type ProfileMetadata,
 } from "./lib/profiles.js";
-import { resolveStore } from "./lib/store.js";
+import { resolveStore, type AccountsStore } from "./lib/store.js";
 import {
   accountsHome,
   getAccountsStorageStatus,
@@ -50,6 +50,17 @@ import {
   commitLoginPreparation,
   type LoginFinalizationState,
 } from "./lib/login.js";
+import {
+  clearLoginRecoveryJournal,
+  clearLoginLeaseRecoveryIntent,
+  createLoginLeaseRecoveryIntent,
+  createLoginRecoveryJournal,
+  loginRecoveryStoreAuthority,
+  persistLoginRecoveryJournal,
+  readRecoverableLoginJournals,
+  recoverAbandonedLoginLeaseIntents,
+  releaseAbandonedLoginJournalLocks,
+} from "./lib/login-recovery.js";
 import { switchProfile, type SwitchMode } from "./lib/switch.js";
 import { configsSessionToolFor, runConfigsPrelaunch, type ConfigsPrelaunchMode, type ConfigsPrelaunchOptions } from "./lib/configs-prelaunch.js";
 import { getConfigsPrelaunchSummary, type ConfigsPrelaunchSummary } from "./lib/configs-prelaunch-status.js";
@@ -87,6 +98,60 @@ const program = new Command();
 function die(message: string): never {
   console.error(chalk.red(`error: ${message}`));
   process.exit(1);
+}
+
+function loginSignalExitCode(signal: NodeJS.Signals): number {
+  return signal === "SIGHUP" ? 129 : signalExitCode(signal);
+}
+
+function loginStoreAuthority(store: AccountsStore): string {
+  return loginRecoveryStoreAuthority(
+    store.transport,
+    accountsHome(),
+    process.env.HASNA_ACCOUNTS_API_URL,
+  );
+}
+
+async function recoverInterruptedLoginFinalizations(store: AccountsStore): Promise<void> {
+  recoverAbandonedLoginLeaseIntents();
+  const authority = loginStoreAuthority(store);
+  for (const journal of readRecoverableLoginJournals()) {
+    if (journal.transport !== store.transport || journal.storeAuthority !== authority) {
+      throw new AccountsError(
+        "interrupted login belongs to a different Accounts storage authority; refusing recovery",
+      );
+    }
+    let releaseProfileLease: (() => void) | undefined;
+    let releaseKeychainLease: (() => void) | undefined;
+    let replayComplete = false;
+    try {
+      if (journal.preparation.tool.id === "claude") {
+        releaseAbandonedLoginJournalLocks(journal);
+        releaseProfileLease = await acquireClaudeProfileLoginLock(journal.preparation.profile.dir);
+        if (keychainSupported()) releaseKeychainLease = await acquireClaudeKeychainLock();
+      }
+      if (journal.phase === "rollback") {
+        await rollbackLoginFinalization(journal.finalizationState, store);
+        await rollbackLoginPreparation(
+          journal.preparation,
+          store,
+          journal.finalizationState.profileClaudeIdentityRevision,
+          journal.finalizationState.profileClaudeCommitRevision,
+        );
+        if (journal.keychainCaptured) restoreClaudeKeychain(journal.priorKeychain);
+      } else {
+        await commitLoginFinalization(journal.finalizationState);
+        commitLoginPreparation(journal.preparation, store);
+        const operationId = journal.finalizationState.writes.currentOperationId;
+        if (operationId) await store.commitLoginOperation?.(operationId);
+      }
+      replayComplete = true;
+    } finally {
+      releaseKeychainLease?.();
+      releaseProfileLease?.();
+      if (replayComplete) clearLoginRecoveryJournal(journal.id);
+    }
+  }
 }
 
 /** True for a cloud-transport HTTP error (`HasnaHttpError`: status/method/path/body). */
@@ -633,6 +698,8 @@ program
     action(async (name: string, opts: { tool?: string } & PermissionCliOptions) => {
       validateCliPermissionSyntax(opts);
       const store = resolveStore();
+      await recoverInterruptedLoginFinalizations(store);
+      let loginLeaseRecoveryId: string | undefined;
       let permissionArgs: string[] = [];
       const prepared = await prepareLogin(name, {
         toolId: opts.tool,
@@ -642,9 +709,24 @@ program
         validateTool: (tool) => {
           permissionArgs = resolveCliPermissions(tool, opts).args;
         },
-        acquireProfileLease: (dir, tool) => tool.id === "claude"
-          ? acquireClaudeProfileLoginLock(dir)
-          : Promise.resolve(undefined),
+        acquireProfileLease: async (dir, tool) => {
+          if (tool.id !== "claude") return undefined;
+          loginLeaseRecoveryId = createLoginLeaseRecoveryIntent(dir);
+          try {
+            const release = await acquireClaudeProfileLoginLock(dir);
+            return () => {
+              release();
+              if (loginLeaseRecoveryId) {
+                clearLoginLeaseRecoveryIntent(loginLeaseRecoveryId);
+                loginLeaseRecoveryId = undefined;
+              }
+            };
+          } catch (error) {
+            clearLoginLeaseRecoveryIntent(loginLeaseRecoveryId);
+            loginLeaseRecoveryId = undefined;
+            throw error;
+          }
+        },
         store,
       });
       if (prepared.status === "stopped") {
@@ -657,11 +739,14 @@ program
         ...permissionArgs.filter((arg) => !baseLoginArgs.includes(arg)),
         ...baseLoginArgs,
       ];
-      let priorKeychain: ReturnType<typeof captureClaudeKeychain>;
+      let priorKeychain: ReturnType<typeof captureClaudeKeychain> = undefined;
       let keychainCaptured = false;
       let releaseKeychainLock: (() => void) | undefined;
       let releaseProfileLoginLock = prepared.releaseProfileLease;
       let finalizationState: LoginFinalizationState | undefined;
+      let recoveryJournalId: string | undefined;
+      let recoveryResolved = false;
+      let finalizationCommitted = false;
       let pendingSignal: NodeJS.Signals | undefined;
       const lockAbort = new AbortController();
       const rememberSignal = (signal: NodeJS.Signals) => {
@@ -670,31 +755,65 @@ program
       };
       const onSigint = () => rememberSignal("SIGINT");
       const onSigterm = () => rememberSignal("SIGTERM");
+      const onSighup = () => rememberSignal("SIGHUP");
       let rollbackPromise: Promise<void> | undefined;
       const rollback = async () => {
         rollbackPromise ??= (async () => {
-          try {
-            if (finalizationState) await rollbackLoginFinalization(finalizationState, store);
-          } finally {
+          let firstError: unknown;
+          if (finalizationState) {
             try {
-              await rollbackLoginPreparation(
-                prepared,
-                store,
-                finalizationState?.profileClaudeIdentityRevision,
-                finalizationState?.profileClaudeCommitRevision,
-              );
-            } finally {
-              if (keychainCaptured) restoreClaudeKeychain(priorKeychain);
+              await rollbackLoginFinalization(finalizationState, store);
+            } catch (error) {
+              firstError ??= error;
             }
           }
+          try {
+            await rollbackLoginPreparation(
+              prepared,
+              store,
+              finalizationState?.profileClaudeIdentityRevision,
+              finalizationState?.profileClaudeCommitRevision,
+            );
+          } catch (error) {
+            firstError ??= error;
+          }
+          if (keychainCaptured) {
+            try {
+              restoreClaudeKeychain(priorKeychain);
+            } catch (error) {
+              firstError ??= error;
+            }
+          }
+          if (firstError) throw firstError;
+          recoveryResolved = true;
         })();
         await rollbackPromise;
       };
       process.on("SIGINT", onSigint);
       process.on("SIGTERM", onSigterm);
+      process.on("SIGHUP", onSighup);
       try {
         if (pendingSignal) throw new AccountsError("login interrupted before Claude launch");
         finalizationState = await captureLoginFinalizationState(name, tool, store, profile);
+        recoveryJournalId = createLoginRecoveryJournal(
+          prepared,
+          finalizationState,
+          priorKeychain,
+          keychainCaptured,
+          store.transport,
+          loginStoreAuthority(store),
+        );
+        finalizationState.writes.persist = () => {
+          persistLoginRecoveryJournal(
+            recoveryJournalId!,
+            prepared,
+            finalizationState!,
+            priorKeychain,
+            keychainCaptured,
+            store.transport,
+            loginStoreAuthority(store),
+          );
+        };
         await new Promise<void>((resolve) => setImmediate(resolve));
         if (pendingSignal) throw new AccountsError("login interrupted before tool launch");
         const env = profileEnv(profile, tool);
@@ -708,9 +827,11 @@ program
         if (tool.id === "claude" && keychainSupported()) {
           releaseKeychainLock = await acquireClaudeKeychainLock(lockAbort.signal);
           finalizationState.writes.keychainLeaseHeld = true;
+          finalizationState.writes.persist?.();
           if (pendingSignal) throw new AccountsError("login interrupted before Claude launch");
           priorKeychain = captureClaudeKeychain();
           keychainCaptured = true;
+          finalizationState.writes.persist?.();
           if (pendingSignal) throw new AccountsError("login interrupted before Claude launch");
         }
         prepareClaudeProfileKeychain(profile.dir, tool, profile.name);
@@ -730,29 +851,69 @@ program
         await new Promise<void>((resolve) => setImmediate(resolve));
         if (pendingSignal) {
           await rollback();
-          process.exitCode = signalExitCode(pendingSignal);
+          process.exitCode = loginSignalExitCode(pendingSignal);
           return;
         }
         const finalized = await finalizeLogin(name, tool.id, store, finalizationState);
+        if (
+          process.env.NODE_ENV === "test" &&
+          process.env.ACCOUNTS_TEST_LOGIN_HARD_CRASH_POINT === "post-finalize"
+        ) {
+          process.kill(process.pid, "SIGKILL");
+        }
         await new Promise<void>((resolve) => setImmediate(resolve));
         if (pendingSignal) {
           await rollback();
-          process.exitCode = signalExitCode(pendingSignal);
+          process.exitCode = loginSignalExitCode(pendingSignal);
           return;
         }
-        const committed = await commitLoginFinalization(finalizationState, () => !pendingSignal);
+        const committed = await commitLoginFinalization(
+          finalizationState,
+          () => !pendingSignal,
+          () => {
+            persistLoginRecoveryJournal(
+              recoveryJournalId!,
+              prepared,
+              finalizationState!,
+              priorKeychain,
+              keychainCaptured,
+              store.transport,
+              loginStoreAuthority(store),
+              "committed",
+            );
+            if (
+              process.env.NODE_ENV === "test" &&
+              process.env.ACCOUNTS_TEST_LOGIN_HARD_CRASH_POINT === "post-commit-marker"
+            ) {
+              process.kill(process.pid, "SIGKILL");
+            }
+            finalizationCommitted = true;
+          },
+        );
         if (!committed) {
           await rollback();
-          process.exitCode = signalExitCode(pendingSignal!);
+          process.exitCode = loginSignalExitCode(pendingSignal!);
           return;
         }
         commitLoginPreparation(prepared, store);
+        if (finalizationState.writes.currentOperationId) {
+          await store.commitLoginOperation?.(finalizationState.writes.currentOperationId);
+        }
+        recoveryResolved = true;
         if (finalized.applied) {
           console.log(chalk.green(`✓ ${chalk.bold(name)} is now the live/default ${tool.label} account`));
         } else {
           console.log(chalk.green(`✓ ${chalk.bold(name)} login finished and profile is active`));
         }
       } catch (error) {
+        if (finalizationCommitted) {
+          commitLoginPreparation(prepared, store);
+          if (finalizationState?.writes.currentOperationId) {
+            await store.commitLoginOperation?.(finalizationState.writes.currentOperationId);
+          }
+          recoveryResolved = true;
+          throw error;
+        }
         try {
           await rollback();
         } catch (rollbackError) {
@@ -760,15 +921,20 @@ program
           throw new AccountsError(`login rollback failed: ${message}`);
         }
         if (pendingSignal) {
-          process.exitCode = signalExitCode(pendingSignal);
+          process.exitCode = loginSignalExitCode(pendingSignal);
           return;
         }
         throw error;
       } finally {
         process.removeListener("SIGINT", onSigint);
         process.removeListener("SIGTERM", onSigterm);
+        process.removeListener("SIGHUP", onSighup);
         releaseKeychainLock?.();
         releaseProfileLoginLock?.();
+        if (recoveryResolved && recoveryJournalId) {
+          clearLoginRecoveryJournal(recoveryJournalId);
+          recoveryJournalId = undefined;
+        }
       }
     }),
   );
