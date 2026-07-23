@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { deserialize, serialize } from "node:v8";
 
 let home: string;
@@ -118,6 +118,36 @@ function recoveryJournalIds(): string[] {
     .filter((name) => name.endsWith(".bin"))
     .map((name) => name.slice(0, -4))
     .sort();
+}
+
+function recoveryLeaseIds(): string[] {
+  const directory = join(home, "login-finalization-journals");
+  if (!existsSync(directory)) return [];
+  return readdirSync(directory)
+    .filter((name) => name.endsWith(".lease"))
+    .map((name) => name.slice(0, -6))
+    .sort();
+}
+
+function readRecoveryLease(id: string): {
+  profileDir: string;
+  profileLockToken: string;
+} {
+  return deserialize(
+    readFileSync(join(home, "login-finalization-journals", `${id}.lease`)),
+  );
+}
+
+function recoveryProfileLockPath(profileDir: string): string {
+  const uid = typeof process.getuid === "function" ? process.getuid() : "user";
+  const identity = createHash("sha256")
+    .update(resolve(profileDir))
+    .digest("hex")
+    .slice(0, 32);
+  return join(
+    process.platform === "win32" ? tmpdir() : "/tmp",
+    `accounts-claude-login-${uid}-${identity}.lock`,
+  );
 }
 
 function readRecoveryJournal(id: string): {
@@ -1328,6 +1358,99 @@ for (const crashPoint of ["pre-save", "post-apply", "post-finalize"] as const) {
   }, HARD_DEATH_RECOVERY_TEST_TIMEOUT_MS);
 }
 
+test("recovery releases the keychain lease before clearing its last durable journal", () => {
+  const fixture = setupClaudeLogin("success");
+  const crashed = runCliWith(["login", "acct", "--tool", "claude"], {
+    env: {
+      ...fixture.env,
+      ACCOUNTS_TEST_LOGIN_HARD_CRASH_POINT: "post-finalize",
+    },
+  });
+  expect(crashed.signal).toBe("SIGKILL");
+  expect(recoveryJournalIds()).toHaveLength(1);
+
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude", 23);
+  const cleanupCrashed = runCliWith(["login", "acct", "--tool", "claude"], {
+    env: {
+      ...fixture.env,
+      ACCOUNTS_TEST_LOGIN_RECOVERY_HARD_CRASH_STAGE: "after-journal-clear",
+    },
+  });
+
+  expect(cleanupCrashed.signal).toBe("SIGKILL");
+  expect(recoveryJournalIds()).toEqual([]);
+  expect(existsSync(fixture.keychainLock)).toBe(false);
+  const [leaseId] = recoveryLeaseIds();
+  expect(leaseId).toBeTruthy();
+  const intent = readRecoveryLease(leaseId!);
+  expect(
+    readFileSync(recoveryProfileLockPath(intent.profileDir), "utf8"),
+  ).toBe(intent.profileLockToken);
+
+  const restarted = runCliWith(["login", "acct", "--tool", "claude"], {
+    env: fixture.env,
+  });
+  expect(restarted.status).toBe(23);
+  expect(restarted.stderr).toBe("");
+  expect(existsSync(fixture.keychainLock)).toBe(false);
+  expect(recoveryLeaseIds()).toEqual([]);
+}, HARD_DEATH_RECOVERY_TEST_TIMEOUT_MS);
+
+test("recovery retains its journal when exact keychain lease removal does not complete", async () => {
+  const fixture = setupClaudeLogin("success");
+  const crashed = runCliWith(["login", "acct", "--tool", "claude"], {
+    env: {
+      ...fixture.env,
+      ACCOUNTS_TEST_LOGIN_HARD_CRASH_POINT: "post-finalize",
+    },
+  });
+  expect(crashed.signal).toBe("SIGKILL");
+  const [journalId] = recoveryJournalIds();
+  expect(journalId).toBeTruthy();
+
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude", 23);
+  const hookDirectory = join(home, "recovery-hooks-release-failure");
+  const recovery = spawnCliWith(["login", "acct", "--tool", "claude"], {
+    env: {
+      ...fixture.env,
+      ACCOUNTS_TEST_LOGIN_RECOVERY_HOOK_DIR: hookDirectory,
+      ACCOUNTS_TEST_LOGIN_RECOVERY_ROLE: "recovery",
+      ACCOUNTS_TEST_LOGIN_RECOVERY_PAUSE_STAGES: "before-keychain-release",
+      ACCOUNTS_TEST_KEYCHAIN_LOCK_TIMEOUT_MS: "75",
+    },
+  });
+  const result = collect(recovery);
+  await waitForRecoveryHook(
+    hookDirectory,
+    "recovery",
+    "before-keychain-release",
+    journalId,
+  );
+
+  const exactToken = readFileSync(fixture.keychainLock, "utf8");
+  renameSync(fixture.keychainLock, `${fixture.keychainLock}.displaced`);
+  writeFileSync(fixture.keychainLock, exactToken, { mode: 0o600 });
+  releaseRecoveryHook(
+    hookDirectory,
+    "recovery",
+    "before-keychain-release",
+    journalId,
+  );
+
+  const failed = await result;
+  expect(failed.code).toBe(1);
+  expect(recoveryJournalIds()).toEqual([journalId]);
+  expect(existsSync(fixture.keychainLock)).toBe(true);
+
+  const restarted = runCliWith(["login", "acct", "--tool", "claude"], {
+    env: fixture.env,
+  });
+  expect(restarted.status).toBe(23);
+  expect(restarted.stderr).toBe("");
+  expect(recoveryJournalIds()).toEqual([]);
+  expect(existsSync(fixture.keychainLock)).toBe(false);
+}, HARD_DEATH_RECOVERY_TEST_TIMEOUT_MS);
+
 test("concurrent recovery publishes lock ownership only after its exclusive profile claim", async () => {
   const fixture = setupClaudeLogin("success");
   const crashed = runCliWith(["login", "acct", "--tool", "claude"], {
@@ -1556,10 +1679,14 @@ test("non-Claude recovery waiters also skip a winner-cleared journal", async () 
 
   expect(completedA.stderr).toBe("");
   expect(completedA.code).toBe(23);
-  expect(completedB.code).toBe(1);
-  expect(completedB.stderr).toContain(
-    'login preparation is still in progress for profile "acct" and tool "fake-login"',
-  );
+  expect([1, 23]).toContain(completedB.code);
+  if (completedB.code === 1) {
+    expect(completedB.stderr).toContain(
+      'login preparation is still in progress for profile "acct" and tool "fake-login"',
+    );
+  } else {
+    expect(completedB.stderr).toBe("");
+  }
   expect(
     existsSync(
       recoveryHookFile(

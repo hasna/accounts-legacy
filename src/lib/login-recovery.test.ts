@@ -3,10 +3,12 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -23,11 +25,16 @@ import { setBeforeExactProcessLockClaimForTest } from "./exact-process-lock.js";
 let home: string;
 let profileLock: string | undefined;
 
+function uniqueReclaimClaimPath(path: string, pid = process.pid): string {
+  return `${path}.reclaim-${pid}-${randomUUID()}`;
+}
+
 beforeEach(() => {
   profileLock = undefined;
   home = mkdtempSync(join(tmpdir(), "accounts-login-recovery-test-"));
   process.env.ACCOUNTS_HOME = home;
   process.env.ACCOUNTS_TEST_KEYCHAIN_LOCK_PATH = join(home, "keychain.lock");
+  delete process.env.ACCOUNTS_TEST_KEYCHAIN_LOCK_TIMEOUT_MS;
 });
 
 afterEach(() => {
@@ -36,6 +43,7 @@ afterEach(() => {
   rmSync(home, { recursive: true, force: true });
   delete process.env.ACCOUNTS_HOME;
   delete process.env.ACCOUNTS_TEST_KEYCHAIN_LOCK_PATH;
+  delete process.env.ACCOUNTS_TEST_KEYCHAIN_LOCK_TIMEOUT_MS;
 });
 
 test.skipIf(process.platform !== "linux")(
@@ -83,10 +91,167 @@ test("normal process lock release does not unlink a replacement lease", async ()
     writeFileSync(keychainLock, successorToken, { mode: 0o600 });
   });
 
-  releaseOwner();
+  expect(releaseOwner()).toBe(true);
 
   expect(readFileSync(keychainLock, "utf8")).toBe(successorToken);
 });
+
+test("process lock release reports an unresolved exact canonical lease", async () => {
+  const keychainLock = process.env.ACCOUNTS_TEST_KEYCHAIN_LOCK_PATH!;
+  const ownerToken = `${process.pid}:${randomUUID()}`;
+  const releaseOwner = await acquireClaudeKeychainLock(undefined, ownerToken);
+  const observation = lstatSync(keychainLock);
+  const claimHash = createHash("sha256")
+    .update(`${observation.dev}:${observation.ino}:`)
+    .update(ownerToken)
+    .digest("hex")
+    .slice(0, 24);
+  const legacyClaim = `${keychainLock}.reclaim-${claimHash}`;
+  linkSync(keychainLock, legacyClaim);
+
+  expect(releaseOwner()).toBe(false);
+  expect(readFileSync(keychainLock, "utf8")).toBe(ownerToken);
+
+  unlinkSync(legacyClaim);
+  rmSync(keychainLock, { force: true });
+});
+
+test.skipIf(process.platform !== "linux")(
+  "restart removes a dead unique claim left by hard death immediately after claim-link",
+  async () => {
+    const profileDir = join(home, "profiles", "claude", "acct");
+    const keychainLock = process.env.ACCOUNTS_TEST_KEYCHAIN_LOCK_PATH!;
+    const abandonedToken = `${process.pid}:${randomUUID()}`;
+    await acquireClaudeKeychainLock(undefined, abandonedToken);
+    const deadClaim = uniqueReclaimClaimPath(keychainLock, 2_147_483_647);
+    linkSync(keychainLock, deadClaim);
+
+    releaseAbandonedLoginJournalLocks({
+      ownerPid: process.pid,
+      ownerProcessStartId: "linux-0",
+      preparation: {
+        tool: { id: "claude" },
+        profile: { dir: profileDir },
+      },
+      finalizationState: {
+        writes: {
+          keychainLockToken: abandonedToken,
+        },
+      },
+    } as unknown as LoginRecoveryJournal);
+
+    expect(existsSync(keychainLock)).toBe(false);
+    expect(existsSync(deadClaim)).toBe(false);
+  },
+);
+
+test.skipIf(process.platform !== "linux")(
+  "restart resolves a dead unique claim after canonical unlink before clearing its intent",
+  () => {
+    const profileDir = join(home, "profiles", "claude", "acct");
+    const uid = typeof process.getuid === "function" ? process.getuid() : "user";
+    const identity = createHash("sha256").update(profileDir).digest("hex").slice(0, 32);
+    profileLock = join("/tmp", `accounts-claude-login-${uid}-${identity}.lock`);
+    const intentId = "00000000-0000-4000-8000-000000000003";
+    const abandonedToken = `${process.pid}:${randomUUID()}`;
+    const directory = join(home, "login-finalization-journals");
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    writeFileSync(profileLock, abandonedToken, { mode: 0o600 });
+    const deadClaim = uniqueReclaimClaimPath(profileLock, 2_147_483_647);
+    linkSync(profileLock, deadClaim);
+    unlinkSync(profileLock);
+    writeFileSync(
+      join(directory, `${intentId}.lease`),
+      serialize({
+        version: 1,
+        id: intentId,
+        ownerPid: process.pid,
+        ownerProcessStartId: "linux-0",
+        profileDir,
+        profileLockToken: abandonedToken,
+      }),
+      { mode: 0o600 },
+    );
+
+    recoverAbandonedLoginLeaseIntents();
+
+    expect(existsSync(deadClaim)).toBe(false);
+    expect(existsSync(join(directory, `${intentId}.lease`))).toBe(false);
+  },
+);
+
+test.skipIf(process.platform !== "linux")(
+  "recovery retains its durable intent until every live unique claim is resolved",
+  () => {
+    const profileDir = join(home, "profiles", "claude", "acct");
+    const uid = typeof process.getuid === "function" ? process.getuid() : "user";
+    const identity = createHash("sha256").update(profileDir).digest("hex").slice(0, 32);
+    profileLock = join("/tmp", `accounts-claude-login-${uid}-${identity}.lock`);
+    const intentId = "00000000-0000-4000-8000-000000000004";
+    const abandonedToken = `${process.pid}:${randomUUID()}`;
+    const directory = join(home, "login-finalization-journals");
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    writeFileSync(profileLock, abandonedToken, { mode: 0o600 });
+    const liveClaim = uniqueReclaimClaimPath(profileLock);
+    linkSync(profileLock, liveClaim);
+    writeFileSync(
+      join(directory, `${intentId}.lease`),
+      serialize({
+        version: 1,
+        id: intentId,
+        ownerPid: process.pid,
+        ownerProcessStartId: "linux-0",
+        profileDir,
+        profileLockToken: abandonedToken,
+      }),
+      { mode: 0o600 },
+    );
+
+    recoverAbandonedLoginLeaseIntents();
+
+    expect(existsSync(profileLock)).toBe(false);
+    expect(existsSync(liveClaim)).toBe(true);
+    expect(existsSync(join(directory, `${intentId}.lease`))).toBe(true);
+
+    unlinkSync(liveClaim);
+    recoverAbandonedLoginLeaseIntents();
+    expect(existsSync(join(directory, `${intentId}.lease`))).toBe(false);
+  },
+);
+
+test(
+  "all simultaneous live unique claimants fence successor publication",
+  async () => {
+    const keychainLock = process.env.ACCOUNTS_TEST_KEYCHAIN_LOCK_PATH!;
+    const abandonedToken = `${process.pid}:${randomUUID()}`;
+    await acquireClaudeKeychainLock(undefined, abandonedToken);
+    const firstClaim = uniqueReclaimClaimPath(keychainLock);
+    const secondClaim = uniqueReclaimClaimPath(keychainLock);
+    linkSync(keychainLock, firstClaim);
+    linkSync(keychainLock, secondClaim);
+    expect(lstatSync(firstClaim).ino).toBe(lstatSync(secondClaim).ino);
+    unlinkSync(keychainLock);
+    process.env.ACCOUNTS_TEST_KEYCHAIN_LOCK_TIMEOUT_MS = "30";
+
+    await expect(
+      acquireClaudeKeychainLock(undefined, `${process.pid}:${randomUUID()}`),
+    ).rejects.toThrow(/timed out waiting for the Claude keychain lock/);
+
+    unlinkSync(firstClaim);
+    await expect(
+      acquireClaudeKeychainLock(undefined, `${process.pid}:${randomUUID()}`),
+    ).rejects.toThrow(/timed out waiting for the Claude keychain lock/);
+
+    unlinkSync(secondClaim);
+    const releaseSuccessor = await acquireClaudeKeychainLock(
+      undefined,
+      `${process.pid}:${randomUUID()}`,
+    );
+    expect(existsSync(keychainLock)).toBe(true);
+    releaseSuccessor();
+    expect(existsSync(keychainLock)).toBe(false);
+  },
+);
 
 test.skipIf(process.platform !== "linux")(
   "fails closed when another exact-inode deletion claim already exists",

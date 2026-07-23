@@ -123,6 +123,11 @@ async function loginRecoveryTestHook(
   journalId = "batch",
 ): Promise<void> {
   if (process.env.NODE_ENV !== "test") return;
+  if (
+    process.env.ACCOUNTS_TEST_LOGIN_RECOVERY_HARD_CRASH_STAGE === stage
+  ) {
+    process.kill(process.pid, "SIGKILL");
+  }
   const directory = process.env.ACCOUNTS_TEST_LOGIN_RECOVERY_HOOK_DIR;
   const role = process.env.ACCOUNTS_TEST_LOGIN_RECOVERY_ROLE;
   if (!directory || !role) return;
@@ -161,8 +166,8 @@ async function recoverInterruptedLoginFinalizations(store: AccountsStore): Promi
     }
   }
   for (const journal of journals) {
-    let releaseProfileLease: (() => void) | undefined;
-    let releaseKeychainLease: (() => void) | undefined;
+    let releaseProfileLease: (() => boolean) | undefined;
+    let releaseKeychainLease: (() => boolean) | undefined;
     let recoveryProfileLeaseIntentId: string | undefined;
     let recoveryProfileLockToken: string | undefined;
     let claimedJournalFingerprint: string | undefined;
@@ -318,13 +323,29 @@ async function recoverInterruptedLoginFinalizations(store: AccountsStore): Promi
           "lost exact login recovery ownership before journal cleanup",
         );
       }
-      // Clear while the profile claim is still held, so a waiter can only see
-      // a missing journal and can never replay the winner's stale snapshot.
+      // The journal is the last durable record that can reclaim an abandoned
+      // keychain lease. Release that lease first while the exact profile claim
+      // still excludes waiters. A hard death before this release leaves the
+      // journal recoverable; a hard death after it leaves no keychain orphan.
+      await loginRecoveryTestHook("before-keychain-release", replayJournal.id);
+      if (releaseKeychainLease && !releaseKeychainLease()) {
+        throw new AccountsError(
+          "failed to release the exact Claude keychain lease; retaining login recovery journal",
+        );
+      }
+      releaseKeychainLease = undefined;
+      await loginRecoveryTestHook("after-keychain-release", replayJournal.id);
+
+      // Clear only after the keychain lease is gone and while the profile claim
+      // is still held. A waiter can then only see a missing journal and can
+      // never replay the winner's stale snapshot. If this process dies after
+      // the clear, the separate profile-lease intent reclaims that exact claim.
       clearLoginRecoveryJournal(replayJournal.id);
+      await loginRecoveryTestHook("after-journal-clear", replayJournal.id);
     } finally {
       releaseKeychainLease?.();
-      releaseProfileLease?.();
-      if (recoveryProfileLeaseIntentId) {
+      const profileLeaseReleased = releaseProfileLease?.() ?? true;
+      if (profileLeaseReleased && recoveryProfileLeaseIntentId) {
         clearLoginLeaseRecoveryIntent(recoveryProfileLeaseIntentId);
       }
     }

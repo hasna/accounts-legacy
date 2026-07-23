@@ -26,6 +26,7 @@ import type {
 } from "./login.js";
 import type { KeychainCredential } from "./keychain.js";
 import {
+  exactProcessLockHasLiveReclaimClaims,
   observeExactProcessLock,
   removeObservedExactProcessLock,
 } from "./exact-process-lock.js";
@@ -476,13 +477,18 @@ function removeExactAbandonedProcessLock(
   ownerPid: number,
   ownerProcessStartId: string,
 ): boolean {
-  if (!exactToken) return false;
+  if (!exactToken) return !exactProcessLockHasLiveReclaimClaims(path);
   const observation = observeExactProcessLock(path, exactToken);
-  if (!observation) return false;
-  if (ownerIsLive(ownerPid, ownerProcessStartId)) {
-    throw new AccountsError(`login recovery owner ${ownerPid} became live while reclaiming its lock`);
+  if (observation) {
+    if (ownerIsLive(ownerPid, ownerProcessStartId)) {
+      throw new AccountsError(`login recovery owner ${ownerPid} became live while reclaiming its lock`);
+    }
+    removeObservedExactProcessLock(observation);
   }
-  return removeObservedExactProcessLock(observation);
+  return (
+    !exactProcessLockHasLiveReclaimClaims(path) &&
+    !observeExactProcessLock(path, exactToken)
+  );
 }
 
 function removeExactAbandonedApplyLock(journal: LoginRecoveryJournal): void {
@@ -504,8 +510,8 @@ function removeExactAbandonedApplyLock(journal: LoginRecoveryJournal): void {
   });
 }
 
-function releaseAbandonedLeaseIntentLocks(intent: LoginLeaseRecoveryIntent): void {
-  removeExactAbandonedProcessLock(
+function releaseAbandonedLeaseIntentLocks(intent: LoginLeaseRecoveryIntent): boolean {
+  return removeExactAbandonedProcessLock(
     abandonedProfileLoginLockPath(intent.profileDir),
     intent.profileLockToken,
     intent.ownerPid,
@@ -546,8 +552,9 @@ export function ownsLoginRecoveryProfileClaim(
 
 export function recoverAbandonedLoginLeaseIntents(): void {
   for (const intent of readRecoverableLoginLeaseIntents()) {
-    releaseAbandonedLeaseIntentLocks(intent);
-    clearLoginLeaseRecoveryIntent(intent.id);
+    if (releaseAbandonedLeaseIntentLocks(intent)) {
+      clearLoginLeaseRecoveryIntent(intent.id);
+    }
   }
 }
 

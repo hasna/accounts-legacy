@@ -23,7 +23,11 @@ import {
   restoreClaudeKeychain,
   writeClaudeKeychain,
 } from "./keychain.js";
-import { removeObservedExactProcessLock } from "./exact-process-lock.js";
+import {
+  exactProcessLockHasLiveReclaimClaims,
+  observeExactProcessLock,
+  removeObservedExactProcessLock,
+} from "./exact-process-lock.js";
 
 export interface ClaudeLaunchOptions {
   headless?: boolean;
@@ -262,7 +266,7 @@ function requireClaudeProcessLockToken(token: string): string {
 export async function acquireClaudeKeychainLock(
   signal?: AbortSignal,
   exactToken: string = createClaudeProcessLockToken(),
-): Promise<() => void> {
+): Promise<() => boolean> {
   return acquireClaudeProcessLock(
     keychainLockPath(),
     "Claude keychain",
@@ -299,7 +303,7 @@ export async function acquireClaudeProfileLoginLock(
   profileDir: string,
   signal?: AbortSignal,
   exactToken: string = createClaudeProcessLockToken(),
-): Promise<() => void> {
+): Promise<() => boolean> {
   return acquireClaudeProcessLock(
     profileLoginLockPath(profileDir),
     "Claude profile login",
@@ -315,12 +319,17 @@ async function acquireClaudeProcessLock(
   timeoutSetting: string,
   signal?: AbortSignal,
   exactToken: string = createClaudeProcessLockToken(),
-): Promise<() => void> {
+): Promise<() => boolean> {
   const token = requireClaudeProcessLockToken(exactToken);
   const deadline = Date.now() + numericTestSetting(timeoutSetting, 600_000);
 
   while (true) {
     if (signal?.aborted) throw new AccountsError(`interrupted while waiting for the ${label} lock`);
+    if (exactProcessLockHasLiveReclaimClaims(path)) {
+      if (Date.now() >= deadline) throw new AccountsError(`timed out waiting for the ${label} lock`);
+      await sleep(25);
+      continue;
+    }
     const candidate = `${path}.candidate-${process.pid}-${randomUUID()}`;
     let candidateFd: number | undefined;
     let published = false;
@@ -350,7 +359,17 @@ async function acquireClaudeProcessLock(
               ino: candidateStat.ino,
             });
           } catch {
-            // A missing lock is already released; a replaced lock belongs to another process.
+            // Verification below is authoritative: a directory-fsync failure
+            // can occur after the exact canonical name was already removed.
+          }
+          try {
+            // Absence or a byte/inode-distinct replacement means this exact
+            // ownership is resolved. An exact canonical lock still present
+            // means a reclaim fence prevented release and durable callers must
+            // retain their recovery record.
+            return !observeExactProcessLock(path, token);
+          } catch {
+            return false;
           }
         };
       }
