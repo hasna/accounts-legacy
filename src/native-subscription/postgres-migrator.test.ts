@@ -4,6 +4,7 @@ import { AccountsError } from "./errors.js";
 import {
   POSTGRES_FINAL_TABLES,
   POSTGRES_GLOBAL_REALM_TABLES,
+  POSTGRES_MIGRATIONS,
   POSTGRES_MIGRATION_CHECKSUM,
   POSTGRES_MUTABLE_RUNTIME_TABLES,
   POSTGRES_OWNER_TABLES,
@@ -62,6 +63,7 @@ interface FakeMigrationState {
   tableExists: boolean;
   rows: Array<{ version: string; checksum: string }>;
   appliedSql: string[];
+  residualObjectCount?: number;
   driftRls?: boolean;
 }
 
@@ -75,8 +77,11 @@ function fakeClient(state: FakeMigrationState): PostgresSqlClient {
     if (query.includes("to_regclass('accounts.schema_migrations')")) {
       return [{ migration_table: state.tableExists ? "accounts.schema_migrations" : null }];
     }
+    if (query.includes("AS package_owned_objects")) {
+      return [{ package_owned_objects: state.residualObjectCount ?? 0 }];
+    }
     if (query.includes("SELECT version::text AS version, checksum")) {
-      return [...state.rows].sort((left, right) => Number(left.version) - Number(right.version));
+      return [...state.rows];
     }
     if (query.includes("INSERT INTO accounts.schema_migrations")) {
       state.tableExists = true;
@@ -309,6 +314,100 @@ describe("Postgres migration runner", () => {
       code: "SCHEMA_CHECKSUM_MISMATCH",
     } satisfies Partial<AccountsError>);
     expect(state.appliedSql).toEqual([]);
+  });
+
+  test("rejects a gapped ledger before applying SQL", async () => {
+    const state: FakeMigrationState = {
+      tableExists: true,
+      rows: [POSTGRES_MIGRATIONS[0], POSTGRES_MIGRATIONS[2]].map((migration) => ({
+        version: String(migration.version),
+        checksum: migration.checksum,
+      })),
+      appliedSql: [],
+    };
+    await expect(
+      runPostgresMigrations(fakeClient(state), { runtimeRole: RUNTIME_ROLE }),
+    ).rejects.toMatchObject({
+      code: "SCHEMA_CHECKSUM_MISMATCH",
+    } satisfies Partial<AccountsError>);
+    expect(state.appliedSql).toEqual([]);
+  });
+
+  test("rejects an empty ledger before applying SQL", async () => {
+    const state: FakeMigrationState = {
+      tableExists: true,
+      rows: [],
+      appliedSql: [],
+    };
+    await expect(
+      runPostgresMigrations(fakeClient(state), { runtimeRole: RUNTIME_ROLE }),
+    ).rejects.toMatchObject({
+      code: "SCHEMA_CHECKSUM_MISMATCH",
+    } satisfies Partial<AccountsError>);
+    expect(state.appliedSql).toEqual([]);
+  });
+
+  test("rejects a missing ledger when package-owned objects remain", async () => {
+    const state: FakeMigrationState = {
+      tableExists: false,
+      rows: [],
+      appliedSql: [],
+      residualObjectCount: 1,
+    };
+    await expect(
+      runPostgresMigrations(fakeClient(state), { runtimeRole: RUNTIME_ROLE }),
+    ).rejects.toMatchObject({
+      code: "SCHEMA_CHECKSUM_MISMATCH",
+    } satisfies Partial<AccountsError>);
+    expect(state.appliedSql).toEqual([]);
+  });
+
+  test("applies only migrations after a valid non-empty ledger prefix", async () => {
+    const firstMigration = POSTGRES_MIGRATIONS[0];
+    const state: FakeMigrationState = {
+      tableExists: true,
+      rows: [{
+        version: String(firstMigration.version),
+        checksum: firstMigration.checksum,
+      }],
+      appliedSql: [],
+    };
+
+    const report = await runPostgresMigrations(
+      fakeClient(state),
+      { runtimeRole: RUNTIME_ROLE },
+    );
+
+    expect(report.appliedVersions).toEqual(["2", "3"]);
+    expect(state.appliedSql.filter((sql) =>
+      POSTGRES_MIGRATIONS.some((migration) => migration.sql === sql)
+    )).toEqual([
+      POSTGRES_MIGRATIONS[1].sql,
+      POSTGRES_MIGRATIONS[2].sql,
+    ]);
+  });
+
+  test("rejects duplicate and out-of-order ledger rows before applying SQL", async () => {
+    const validRows = POSTGRES_MIGRATIONS.map((migration) => ({
+      version: String(migration.version),
+      checksum: migration.checksum,
+    }));
+    for (const rows of [
+      [validRows[0], validRows[1], validRows[1]],
+      [validRows[1], validRows[0]],
+    ]) {
+      const state: FakeMigrationState = {
+        tableExists: true,
+        rows,
+        appliedSql: [],
+      };
+      await expect(
+        runPostgresMigrations(fakeClient(state), { runtimeRole: RUNTIME_ROLE }),
+      ).rejects.toMatchObject({
+        code: "SCHEMA_CHECKSUM_MISMATCH",
+      } satisfies Partial<AccountsError>);
+      expect(state.appliedSql).toEqual([]);
+    }
   });
 
   test("rejects a newer schema before applying package SQL", async () => {

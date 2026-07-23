@@ -29,6 +29,10 @@ interface MigrationRow {
   readonly checksum: string;
 }
 
+interface PackageOwnedObjectRow {
+  readonly package_owned_objects: string | number | bigint;
+}
+
 interface RoleRow {
   readonly rolname: string;
   readonly rolsuper: boolean;
@@ -226,22 +230,7 @@ export async function runPostgresMigrations(
           SELECT pg_catalog.to_regclass('accounts.schema_migrations')::text AS migration_table
         `;
 
-      const existing = new Map<number, string>();
-      if (migrationTable !== null) {
-        const rows = await transaction<MigrationRow[]>`
-          SELECT version::text AS version, checksum
-          FROM accounts.schema_migrations
-          ORDER BY version ASC
-        `;
-        for (const row of rows) existing.set(Number(row.version), row.checksum);
-      }
-
-      const highest = Math.max(0, ...existing.keys());
-      if (highest > POSTGRES_SCHEMA_VERSION) {
-        throw new AccountsError("SCHEMA_VERSION_UNSUPPORTED", "Postgres schema is newer", {
-          details: { adapter: "postgres", schemaVersion: String(highest) },
-        });
-      }
+      const existing = await preflightMigrationLedger(transaction, migrationTable);
 
       const applied: string[] = [];
       for (const migration of POSTGRES_MIGRATIONS) {
@@ -279,6 +268,86 @@ export async function runPostgresMigrations(
       details: { adapter: "postgres" },
     });
   }
+}
+
+async function preflightMigrationLedger(
+  transaction: PostgresTransaction,
+  migrationTable: string | null,
+): Promise<ReadonlyMap<number, string>> {
+  if (migrationTable === null) {
+    const [
+      { package_owned_objects: packageOwnedObjects } = { package_owned_objects: 0 },
+    ] = await transaction<PackageOwnedObjectRow[]>`
+      SELECT (
+        (
+          SELECT count(*)
+          FROM pg_catalog.pg_class AS relation
+          JOIN pg_catalog.pg_namespace AS namespace
+            ON namespace.oid = relation.relnamespace
+          WHERE namespace.nspname = 'accounts'
+        ) + (
+          SELECT count(*)
+          FROM pg_catalog.pg_proc AS function_entry
+          JOIN pg_catalog.pg_namespace AS namespace
+            ON namespace.oid = function_entry.pronamespace
+          WHERE namespace.nspname = 'accounts'
+        ) + (
+          SELECT count(*)
+          FROM pg_catalog.pg_type AS type_entry
+          JOIN pg_catalog.pg_namespace AS namespace
+            ON namespace.oid = type_entry.typnamespace
+          WHERE namespace.nspname = 'accounts'
+        )
+      )::bigint AS package_owned_objects
+    `;
+    if (BigInt(packageOwnedObjects) !== 0n) {
+      throw catalogMismatch("migration_history", "missing_ledger");
+    }
+    return new Map();
+  }
+
+  const rows = await transaction<MigrationRow[]>`
+    SELECT version::text AS version, checksum
+    FROM accounts.schema_migrations
+    ORDER BY applied_at ASC, version ASC
+  `;
+  if (rows.length === 0) {
+    throw catalogMismatch("migration_history", "empty_ledger");
+  }
+
+  const parsed = rows.map((row) => {
+    const versionText = String(row.version);
+    if (!/^[1-9][0-9]*$/.test(versionText)) {
+      throw catalogMismatch("migration_history", versionText);
+    }
+    return {
+      version: BigInt(versionText),
+      checksum: row.checksum,
+    };
+  });
+  const highest = parsed.reduce(
+    (candidate, row) => row.version > candidate ? row.version : candidate,
+    0n,
+  );
+  if (highest > BigInt(POSTGRES_SCHEMA_VERSION)) {
+    throw new AccountsError("SCHEMA_VERSION_UNSUPPORTED", "Postgres schema is newer", {
+      details: { adapter: "postgres", schemaVersion: String(highest) },
+    });
+  }
+
+  const existing = new Map<number, string>();
+  for (const [index, row] of parsed.entries()) {
+    const expected = POSTGRES_MIGRATIONS[index];
+    if (
+      expected === undefined ||
+      row.version !== BigInt(expected.version) ||
+      row.checksum !== expected.checksum
+    ) {
+      throw catalogMismatch("migration_history", String(row.version));
+    }
+    existing.set(expected.version, row.checksum);
+  }
+  return existing;
 }
 
 async function assertMigrationLedger(transaction: PostgresTransaction): Promise<void> {

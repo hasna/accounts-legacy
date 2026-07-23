@@ -9,6 +9,7 @@ import type {
 } from "./capsule-maintenance.js";
 import { PostgresCapsuleMaintenanceLedger } from "./postgres-capsule-maintenance.js";
 import {
+  POSTGRES_MIGRATIONS,
   POSTGRES_MIGRATION_CHECKSUM,
   POSTGRES_SCHEMA_VERSION,
 } from "./postgres-migrations.js";
@@ -18,7 +19,7 @@ import {
   installPostgresRuntimeContext,
   type PostgresRuntimeRoleBoundary,
 } from "./postgres-runtime.js";
-import type { PostgresSqlClient } from "./postgres-sql.js";
+import type { PostgresSqlClient, PostgresTransaction } from "./postgres-sql.js";
 
 const DATABASE_URL = process.env.HASNA_ACCOUNTS_TEST_DATABASE_URL;
 
@@ -93,6 +94,59 @@ describePostgres("native-subscription PostgreSQL catalog and concurrency", () =>
     return `"${value.replaceAll('"', '""')}"`;
   }
 
+  async function resetAccountsSchema(): Promise<void> {
+    await admin.query("DROP SCHEMA IF EXISTS accounts CASCADE");
+    await admin.query(
+      `CREATE SCHEMA accounts AUTHORIZATION ${identifier(ownerRole)}`,
+    );
+  }
+
+  async function createMigrationLedger(
+    rows: readonly { readonly version: number; readonly checksum: string }[],
+  ): Promise<void> {
+    await ownerSql`
+      CREATE TABLE accounts.schema_migrations (
+        version BIGINT PRIMARY KEY CHECK (version > 0),
+        checksum TEXT NOT NULL CHECK (checksum ~ '^sha256:[0-9a-f]{64}$'),
+        applied_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+      )
+    `;
+    for (const row of rows) {
+      await ownerSql`
+        INSERT INTO accounts.schema_migrations(version, checksum)
+        VALUES (${row.version}, ${row.checksum})
+      `;
+    }
+  }
+
+  function observeMigrationSql(): {
+    readonly client: PostgresSqlClient;
+    readonly appliedSql: string[];
+  } {
+    const appliedSql: string[] = [];
+    return {
+      client: {
+        begin: async (options, callback) =>
+          ownerSql.begin(options, async (transaction) => {
+            const tracked = Object.assign(
+              (
+                strings: TemplateStringsArray,
+                ...values: unknown[]
+              ) => transaction(strings, ...values),
+              {
+                unsafe: (statement: string) => {
+                  appliedSql.push(statement);
+                  return transaction.unsafe(statement);
+                },
+              },
+            ) as unknown as PostgresTransaction;
+            return callback(tracked);
+          }),
+      },
+      appliedSql,
+    };
+  }
+
   async function expectSchemaDrift(
     mutations: readonly string[],
     restorations: readonly string[],
@@ -151,7 +205,68 @@ describePostgres("native-subscription PostgreSQL catalog and concurrency", () =>
     await admin?.end();
   });
 
-  test("applies, reapplies, catalog-attests, and uses the configured SET ROLE boundary", async () => {
+  test("preflights invalid ledgers before SQL and applies a valid prefix", async () => {
+    await ownerSql`CREATE TABLE accounts.residual_marker (id BIGINT PRIMARY KEY)`;
+    let observed = observeMigrationSql();
+    await expect(runPostgresMigrations(
+      observed.client,
+      { runtimeRole: roleBoundary },
+    )).rejects.toMatchObject({ code: "SCHEMA_CHECKSUM_MISMATCH" });
+    expect(observed.appliedSql).toEqual([]);
+
+    await resetAccountsSchema();
+    await createMigrationLedger([]);
+    observed = observeMigrationSql();
+    await expect(runPostgresMigrations(
+      observed.client,
+      { runtimeRole: roleBoundary },
+    )).rejects.toMatchObject({ code: "SCHEMA_CHECKSUM_MISMATCH" });
+    expect(observed.appliedSql).toEqual([]);
+
+    await resetAccountsSchema();
+    await createMigrationLedger([
+      POSTGRES_MIGRATIONS[0],
+      POSTGRES_MIGRATIONS[2],
+    ]);
+    observed = observeMigrationSql();
+    await expect(runPostgresMigrations(
+      observed.client,
+      { runtimeRole: roleBoundary },
+    )).rejects.toMatchObject({ code: "SCHEMA_CHECKSUM_MISMATCH" });
+    expect(observed.appliedSql).toEqual([]);
+
+    await resetAccountsSchema();
+    await createMigrationLedger([
+      POSTGRES_MIGRATIONS[1],
+      POSTGRES_MIGRATIONS[0],
+    ]);
+    observed = observeMigrationSql();
+    await expect(runPostgresMigrations(
+      observed.client,
+      { runtimeRole: roleBoundary },
+    )).rejects.toMatchObject({ code: "SCHEMA_CHECKSUM_MISMATCH" });
+    expect(observed.appliedSql).toEqual([]);
+
+    await resetAccountsSchema();
+    await ownerSql.unsafe(POSTGRES_MIGRATIONS[0].sql).simple();
+    await ownerSql`
+      INSERT INTO accounts.schema_migrations(version, checksum)
+      VALUES (${POSTGRES_MIGRATIONS[0].version}, ${POSTGRES_MIGRATIONS[0].checksum})
+    `;
+    observed = observeMigrationSql();
+    const prefixReport = await runPostgresMigrations(
+      observed.client,
+      { runtimeRole: roleBoundary },
+    );
+    expect(prefixReport.appliedVersions).toEqual(["2", "3"]);
+    expect(observed.appliedSql).not.toContain(POSTGRES_MIGRATIONS[0].sql);
+    expect(observed.appliedSql).toContain(POSTGRES_MIGRATIONS[1].sql);
+    expect(observed.appliedSql).toContain(POSTGRES_MIGRATIONS[2].sql);
+
+    await resetAccountsSchema();
+  });
+
+  test("applies a clean fresh schema, reapplies, catalog-attests, and uses the configured SET ROLE boundary", async () => {
     const first = await runPostgresMigrations(
       ownerSql as unknown as PostgresSqlClient,
       { runtimeRole: roleBoundary },
