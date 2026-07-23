@@ -3,13 +3,13 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
   existsSync,
+  fstatSync,
   fsyncSync,
   linkSync,
   lstatSync,
   openSync,
   readFileSync,
   rmSync,
-  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -23,6 +23,7 @@ import {
   restoreClaudeKeychain,
   writeClaudeKeychain,
 } from "./keychain.js";
+import { removeObservedExactProcessLock } from "./exact-process-lock.js";
 
 export interface ClaudeLaunchOptions {
   headless?: boolean;
@@ -327,6 +328,7 @@ async function acquireClaudeProcessLock(
       candidateFd = openSync(candidate, "wx", 0o600);
       writeFileSync(candidateFd, token, { encoding: "utf8" });
       fsyncSync(candidateFd);
+      const candidateStat = fstatSync(candidateFd);
       closeSync(candidateFd);
       candidateFd = undefined;
       try {
@@ -341,7 +343,12 @@ async function acquireClaudeProcessLock(
       if (published) {
         return () => {
           try {
-            if (readFileSync(path, "utf8") === token) unlinkSync(path);
+            removeObservedExactProcessLock({
+              path,
+              text: token,
+              dev: candidateStat.dev,
+              ino: candidateStat.ino,
+            });
           } catch {
             // A missing lock is already released; a replaced lock belongs to another process.
           }

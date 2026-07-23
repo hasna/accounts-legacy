@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
+  linkSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -16,6 +17,8 @@ import {
   releaseAbandonedLoginJournalLocks,
   type LoginRecoveryJournal,
 } from "./login-recovery.js";
+import { acquireClaudeKeychainLock } from "./claude-launch.js";
+import { setBeforeExactProcessLockClaimForTest } from "./exact-process-lock.js";
 
 let home: string;
 let profileLock: string | undefined;
@@ -28,11 +31,101 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  setBeforeExactProcessLockClaimForTest(undefined);
   if (profileLock) rmSync(profileLock, { force: true });
   rmSync(home, { recursive: true, force: true });
   delete process.env.ACCOUNTS_HOME;
   delete process.env.ACCOUNTS_TEST_KEYCHAIN_LOCK_PATH;
 });
+
+test.skipIf(process.platform !== "linux")(
+  "does not unlink a live successor that replaces an observed abandoned process lock",
+  async () => {
+    const profileDir = join(home, "profiles", "claude", "acct");
+    const keychainLock = process.env.ACCOUNTS_TEST_KEYCHAIN_LOCK_PATH!;
+    const abandonedToken = `${process.pid}:${randomUUID()}`;
+    const successorToken = `${process.pid}:${randomUUID()}`;
+    const releaseAbandoned = await acquireClaudeKeychainLock(undefined, abandonedToken);
+
+    setBeforeExactProcessLockClaimForTest(() => {
+      setBeforeExactProcessLockClaimForTest(undefined);
+      releaseAbandoned();
+      writeFileSync(keychainLock, successorToken, { mode: 0o600 });
+    });
+
+    releaseAbandonedLoginJournalLocks({
+      ownerPid: process.pid,
+      ownerProcessStartId: "linux-0",
+      preparation: {
+        tool: { id: "claude" },
+        profile: { dir: profileDir },
+      },
+      finalizationState: {
+        writes: {
+          keychainLockToken: abandonedToken,
+        },
+      },
+    } as unknown as LoginRecoveryJournal);
+
+    expect(readFileSync(keychainLock, "utf8")).toBe(successorToken);
+  },
+);
+
+test("normal process lock release does not unlink a replacement lease", async () => {
+  const keychainLock = process.env.ACCOUNTS_TEST_KEYCHAIN_LOCK_PATH!;
+  const ownerToken = `${process.pid}:${randomUUID()}`;
+  const successorToken = `${process.pid}:${randomUUID()}`;
+  const releaseOwner = await acquireClaudeKeychainLock(undefined, ownerToken);
+
+  setBeforeExactProcessLockClaimForTest(() => {
+    setBeforeExactProcessLockClaimForTest(undefined);
+    rmSync(keychainLock, { force: true });
+    writeFileSync(keychainLock, successorToken, { mode: 0o600 });
+  });
+
+  releaseOwner();
+
+  expect(readFileSync(keychainLock, "utf8")).toBe(successorToken);
+});
+
+test.skipIf(process.platform !== "linux")(
+  "fails closed when another exact-inode deletion claim already exists",
+  async () => {
+    const profileDir = join(home, "profiles", "claude", "acct");
+    const keychainLock = process.env.ACCOUNTS_TEST_KEYCHAIN_LOCK_PATH!;
+    const abandonedToken = `${process.pid}:${randomUUID()}`;
+    await acquireClaudeKeychainLock(undefined, abandonedToken);
+    let claimPath = "";
+
+    setBeforeExactProcessLockClaimForTest((observation) => {
+      setBeforeExactProcessLockClaimForTest(undefined);
+      const claimHash = createHash("sha256")
+        .update(`${observation.dev}:${observation.ino}:`)
+        .update(observation.text)
+        .digest("hex")
+        .slice(0, 24);
+      claimPath = `${observation.path}.reclaim-${claimHash}`;
+      linkSync(observation.path, claimPath);
+    });
+
+    releaseAbandonedLoginJournalLocks({
+      ownerPid: process.pid,
+      ownerProcessStartId: "linux-0",
+      preparation: {
+        tool: { id: "claude" },
+        profile: { dir: profileDir },
+      },
+      finalizationState: {
+        writes: {
+          keychainLockToken: abandonedToken,
+        },
+      },
+    } as unknown as LoginRecoveryJournal);
+
+    expect(readFileSync(keychainLock, "utf8")).toBe(abandonedToken);
+    expect(readFileSync(claimPath, "utf8")).toBe(abandonedToken);
+  },
+);
 
 test.skipIf(process.platform !== "linux")(
   "does not reclaim a newer exact-token lock when the owner PID was reused",

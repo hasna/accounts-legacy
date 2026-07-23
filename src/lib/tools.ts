@@ -385,6 +385,10 @@ function includesArgVector(args: readonly string[], vector: readonly string[]): 
 export function mergeToolArgs(tool: ToolDef, args: string[], opts: ToolArgOptions = {}): string[] {
   const launchArgs = launchArgsFor(tool, opts.profile).filter((arg) => !args.includes(arg));
   const configuredPermissionArgs = permissionArgsFor(tool, opts.permissions);
+  if (tool.id === "claude") {
+    validatePermissionInputs({ passthroughArgs: args });
+    validateClaudePermissionModeInputs({ passthroughArgs: args });
+  }
   if (tool.id === "claude" && opts.permissions) {
     if (
       configuredPermissionArgs.length > 0 &&

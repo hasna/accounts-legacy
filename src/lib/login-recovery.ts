@@ -25,6 +25,10 @@ import type {
   LoginPreparationReady,
 } from "./login.js";
 import type { KeychainCredential } from "./keychain.js";
+import {
+  observeExactProcessLock,
+  removeObservedExactProcessLock,
+} from "./exact-process-lock.js";
 
 const JOURNAL_VERSION = 1;
 const JOURNAL_DIR = "login-finalization-journals";
@@ -441,19 +445,13 @@ function removeExactAbandonedProcessLock(
   ownerPid: number,
   ownerProcessStartId: string,
 ): boolean {
-  if (!exactToken || !existsSync(path)) return false;
-  const stat = lstatSync(path);
-  if (!stat.isFile() || stat.isSymbolicLink()) {
-    return false;
-  }
-  const token = readFileSync(path, "utf8");
-  if (token !== exactToken) return false;
+  if (!exactToken) return false;
+  const observation = observeExactProcessLock(path, exactToken);
+  if (!observation) return false;
   if (ownerIsLive(ownerPid, ownerProcessStartId)) {
     throw new AccountsError(`login recovery owner ${ownerPid} became live while reclaiming its lock`);
   }
-  unlinkSync(path);
-  fsyncDirectory(dirname(path));
-  return true;
+  return removeObservedExactProcessLock(observation);
 }
 
 function removeExactAbandonedApplyLock(journal: LoginRecoveryJournal): void {
