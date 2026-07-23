@@ -41,6 +41,7 @@ const RUNTIME_FUNCTIONS = new Set([
 ]);
 
 const TRIGGERS = new Map([
+  ["schema_migrations_immutable", ["schema_migrations", "reject_append_only_change"]],
   ["credential_binding_handles_nonterminal", ["credential_binding_handles", "reject_terminal_credential_handle"]],
   ["credential_bindings_revoke_removes_handle", ["credential_bindings", "require_handle_removed_before_revoke"]],
   ["provider_subject_claims_immutable", ["provider_subject_claims", "reject_append_only_change"]],
@@ -61,8 +62,14 @@ const TRIGGERS = new Map([
 
 interface FakeMigrationState {
   tableExists: boolean;
-  rows: Array<{ version: string; checksum: string }>;
+  rows: Array<{
+    version: string;
+    checksum: string;
+    appliedAt?: string;
+    ledgerSequence?: string;
+  }>;
   appliedSql: string[];
+  hasLedgerSequence?: boolean;
   residualObjectCount?: number;
   driftRls?: boolean;
 }
@@ -80,12 +87,66 @@ function fakeClient(state: FakeMigrationState): PostgresSqlClient {
     if (query.includes("AS package_owned_objects")) {
       return [{ package_owned_objects: state.residualObjectCount ?? 0 }];
     }
+    if (query.includes("AS has_ledger_sequence")) {
+      return [{
+        has_ledger_sequence: state.hasLedgerSequence ?? false,
+        ledger_sequence_is_identity: state.hasLedgerSequence ?? false,
+      }];
+    }
     if (query.includes("SELECT version::text AS version, checksum")) {
-      return [...state.rows];
+      const rows = [...state.rows];
+      if (
+        query.includes("ORDER BY applied_at ASC") &&
+        rows.every((row) => row.appliedAt !== undefined)
+      ) {
+        rows.sort((left, right) =>
+          left.appliedAt!.localeCompare(right.appliedAt!)
+        );
+      }
+      if (query.includes("ORDER BY ledger_sequence ASC")) {
+        rows.sort((left, right) =>
+          BigInt(left.ledgerSequence ?? "0") < BigInt(right.ledgerSequence ?? "0")
+            ? -1
+            : 1
+        );
+      }
+      return rows.map(({ version, checksum, appliedAt, ledgerSequence }) => ({
+        version,
+        checksum,
+        applied_at: appliedAt ?? `implicit-${version}`,
+        applied_at_is_finite: appliedAt !== "infinity" && appliedAt !== "-infinity",
+        applied_at_occurrences: appliedAt === undefined
+          ? "1"
+          : String(state.rows.filter((row) => row.appliedAt === appliedAt).length),
+        ledger_sequence: ledgerSequence ?? null,
+        ledger_sequence_occurrences: ledgerSequence === undefined
+          ? "0"
+          : String(
+            state.rows.filter((row) => row.ledgerSequence === ledgerSequence).length,
+          ),
+      }));
     }
     if (query.includes("INSERT INTO accounts.schema_migrations")) {
       state.tableExists = true;
-      state.rows.push({ version: String(values[0]), checksum: String(values[1]) });
+      state.rows.push({
+        version: String(values[0]),
+        checksum: String(values[1]),
+        appliedAt: new Date(Date.UTC(2030, 0, 1) + state.rows.length).toISOString(),
+        ...(state.hasLedgerSequence
+          ? {
+            ledgerSequence: String(
+              state.rows.reduce(
+                (highest, row) =>
+                  row.ledgerSequence !== undefined &&
+                    BigInt(row.ledgerSequence) > highest
+                    ? BigInt(row.ledgerSequence)
+                    : highest,
+                0n,
+              ) + 1n,
+            ),
+          }
+          : {}),
+      });
       return [];
     }
     if (query === "SELECT current_user AS owner") {
@@ -118,6 +179,25 @@ function fakeClient(state: FakeMigrationState): PostgresSqlClient {
         public_create: false,
         foreign_objects: 0,
         foreign_grants: 0,
+      }];
+    }
+    if (query.includes("pg_catalog.pg_sequence AS sequence")) {
+      return [{
+        sequence_name: "schema_migrations_ledger_sequence_seq",
+        owner_is_current: true,
+        owned_by_ledger_sequence: true,
+        data_type: "bigint",
+        increment: "1",
+        minimum_value: "1",
+        maximum_value: "9223372036854775807",
+        cache_size: "1",
+        cycles: false,
+        public_select: false,
+        public_usage: false,
+        public_update: false,
+        runtime_select: false,
+        runtime_usage: false,
+        runtime_update: false,
       }];
     }
     if (query.includes("relation.relrowsecurity AS row_security")) {
@@ -204,6 +284,12 @@ function fakeClient(state: FakeMigrationState): PostgresSqlClient {
     simple: async () => {
       state.appliedSql.push(sql);
       if (sql.includes("CREATE TABLE accounts.schema_migrations")) state.tableExists = true;
+      if (sql.includes("ADD COLUMN ledger_sequence BIGINT")) {
+        state.hasLedgerSequence = true;
+        state.rows.forEach((row, index) => {
+          row.ledgerSequence = String(index + 1);
+        });
+      }
       return [];
     },
   })) as PostgresTransaction["unsafe"];
@@ -292,7 +378,7 @@ describe("Postgres migration runner", () => {
     const first = await runPostgresMigrations(client, { runtimeRole: RUNTIME_ROLE });
     const second = await runPostgresMigrations(client, { runtimeRole: RUNTIME_ROLE });
 
-    expect(first.appliedVersions).toEqual(["1", "2", "3"]);
+    expect(first.appliedVersions).toEqual(["1", "2", "3", "4"]);
     expect(second.appliedVersions).toEqual([]);
     expect(first.migrationChecksum).toBe(POSTGRES_MIGRATION_CHECKSUM);
     expect(first.runtimeRole).toBe(RUNTIME_ROLE.roleName);
@@ -378,12 +464,13 @@ describe("Postgres migration runner", () => {
       { runtimeRole: RUNTIME_ROLE },
     );
 
-    expect(report.appliedVersions).toEqual(["2", "3"]);
+    expect(report.appliedVersions).toEqual(["2", "3", "4"]);
     expect(state.appliedSql.filter((sql) =>
       POSTGRES_MIGRATIONS.some((migration) => migration.sql === sql)
     )).toEqual([
       POSTGRES_MIGRATIONS[1].sql,
       POSTGRES_MIGRATIONS[2].sql,
+      POSTGRES_MIGRATIONS[3].sql,
     ]);
   });
 
@@ -410,10 +497,74 @@ describe("Postgres migration runner", () => {
     }
   });
 
+  test("rejects equal-timestamp insertion order before applying SQL", async () => {
+    const appliedAt = "2030-07-18T12:00:00.000Z";
+    const state: FakeMigrationState = {
+      tableExists: true,
+      rows: [POSTGRES_MIGRATIONS[1], POSTGRES_MIGRATIONS[0]].map((migration) => ({
+        version: String(migration.version),
+        checksum: migration.checksum,
+        appliedAt,
+      })),
+      appliedSql: [],
+    };
+
+    await expect(
+      runPostgresMigrations(fakeClient(state), { runtimeRole: RUNTIME_ROLE }),
+    ).rejects.toMatchObject({
+      code: "SCHEMA_CHECKSUM_MISMATCH",
+    } satisfies Partial<AccountsError>);
+    expect(state.appliedSql).toEqual([]);
+  });
+
+  test("accepts a valid sequenced ledger independently of timestamp ties", async () => {
+    const appliedAt = "2030-07-18T12:00:00.000Z";
+    const state: FakeMigrationState = {
+      tableExists: true,
+      hasLedgerSequence: true,
+      rows: POSTGRES_MIGRATIONS.map((migration, index) => ({
+        version: String(migration.version),
+        checksum: migration.checksum,
+        appliedAt,
+        ledgerSequence: String(index + 1),
+      })),
+      appliedSql: [],
+    };
+
+    const report = await runPostgresMigrations(
+      fakeClient(state),
+      { runtimeRole: RUNTIME_ROLE },
+    );
+
+    expect(report.appliedVersions).toEqual([]);
+    expect(state.appliedSql.filter((sql) =>
+      POSTGRES_MIGRATIONS.some((migration) => migration.sql === sql)
+    )).toEqual([]);
+  });
+
+  test("rejects non-finite legacy timestamps before applying SQL", async () => {
+    const state: FakeMigrationState = {
+      tableExists: true,
+      rows: [{
+        version: String(POSTGRES_MIGRATIONS[0].version),
+        checksum: POSTGRES_MIGRATIONS[0].checksum,
+        appliedAt: "infinity",
+      }],
+      appliedSql: [],
+    };
+
+    await expect(
+      runPostgresMigrations(fakeClient(state), { runtimeRole: RUNTIME_ROLE }),
+    ).rejects.toMatchObject({
+      code: "SCHEMA_CHECKSUM_MISMATCH",
+    } satisfies Partial<AccountsError>);
+    expect(state.appliedSql).toEqual([]);
+  });
+
   test("rejects a newer schema before applying package SQL", async () => {
     const state: FakeMigrationState = {
       tableExists: true,
-      rows: [{ version: "4", checksum: `sha256:${"1".repeat(64)}` }],
+      rows: [{ version: "5", checksum: `sha256:${"1".repeat(64)}` }],
       appliedSql: [],
     };
     await expect(

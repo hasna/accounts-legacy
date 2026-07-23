@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-export const POSTGRES_SCHEMA_VERSION = 3;
+export const POSTGRES_SCHEMA_VERSION = 4;
 
 export const POSTGRES_REQUIRED_TABLES = Object.freeze([
   "schema_migrations",
@@ -768,7 +768,47 @@ export const POSTGRES_MIGRATION_V3_CHECKSUM = `sha256:${createHash("sha256")
   .update(POSTGRES_MIGRATION_V3, "utf8")
   .digest("hex")}`;
 
-export const POSTGRES_MIGRATION_CHECKSUM = POSTGRES_MIGRATION_V3_CHECKSUM;
+export const POSTGRES_MIGRATION_V4 = `
+ALTER TABLE accounts.schema_migrations
+  ADD COLUMN ledger_sequence BIGINT;
+
+WITH ordered_migrations AS (
+  SELECT
+    version,
+    row_number() OVER (ORDER BY applied_at ASC) AS ledger_sequence
+  FROM accounts.schema_migrations
+)
+UPDATE accounts.schema_migrations AS migration
+SET ledger_sequence = ordered_migrations.ledger_sequence
+FROM ordered_migrations
+WHERE ordered_migrations.version = migration.version;
+
+ALTER TABLE accounts.schema_migrations
+  ALTER COLUMN ledger_sequence SET NOT NULL,
+  ALTER COLUMN ledger_sequence ADD GENERATED ALWAYS AS IDENTITY;
+
+ALTER SEQUENCE accounts.schema_migrations_ledger_sequence_seq RESTART WITH 4;
+
+ALTER TABLE accounts.schema_migrations
+  ADD CONSTRAINT schema_migrations_ledger_sequence_check
+    CHECK (ledger_sequence > 0),
+  ADD CONSTRAINT schema_migrations_ledger_sequence_key
+    UNIQUE (ledger_sequence),
+  ADD CONSTRAINT schema_migrations_applied_at_finite
+    CHECK (pg_catalog.isfinite(applied_at));
+
+CREATE TRIGGER schema_migrations_immutable
+  BEFORE UPDATE OR DELETE ON accounts.schema_migrations
+  FOR EACH ROW EXECUTE FUNCTION accounts.reject_append_only_change();
+
+REVOKE ALL ON SEQUENCE accounts.schema_migrations_ledger_sequence_seq FROM PUBLIC;
+`;
+
+export const POSTGRES_MIGRATION_V4_CHECKSUM = `sha256:${createHash("sha256")
+  .update(POSTGRES_MIGRATION_V4, "utf8")
+  .digest("hex")}`;
+
+export const POSTGRES_MIGRATION_CHECKSUM = POSTGRES_MIGRATION_V4_CHECKSUM;
 
 export const POSTGRES_FINAL_TABLES = Object.freeze([
   ...POSTGRES_REQUIRED_TABLES,
@@ -808,5 +848,10 @@ export const POSTGRES_MIGRATIONS = Object.freeze([
     version: 3,
     checksum: POSTGRES_MIGRATION_V3_CHECKSUM,
     sql: POSTGRES_MIGRATION_V3,
+  }),
+  Object.freeze({
+    version: 4,
+    checksum: POSTGRES_MIGRATION_V4_CHECKSUM,
+    sql: POSTGRES_MIGRATION_V4,
   }),
 ]);

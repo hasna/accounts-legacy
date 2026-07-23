@@ -7,6 +7,7 @@ import {
   POSTGRES_MIGRATION_V1,
   POSTGRES_MIGRATION_V2,
   POSTGRES_MIGRATION_V3,
+  POSTGRES_MIGRATION_V4,
   POSTGRES_REQUIRED_TABLES,
   POSTGRES_SCHEMA_VERSION,
 } from "./postgres-migrations.js";
@@ -16,12 +17,14 @@ describe("Postgres migration contract", () => {
     const digestV1 = `sha256:${createHash("sha256").update(POSTGRES_MIGRATION_V1, "utf8").digest("hex")}`;
     const digestV2 = `sha256:${createHash("sha256").update(POSTGRES_MIGRATION_V2, "utf8").digest("hex")}`;
     const digestV3 = `sha256:${createHash("sha256").update(POSTGRES_MIGRATION_V3, "utf8").digest("hex")}`;
-    expect(POSTGRES_SCHEMA_VERSION).toBe(3);
-    expect(POSTGRES_MIGRATION_CHECKSUM).toBe(digestV3);
+    const digestV4 = `sha256:${createHash("sha256").update(POSTGRES_MIGRATION_V4, "utf8").digest("hex")}`;
+    expect(POSTGRES_SCHEMA_VERSION).toBe(4);
+    expect(POSTGRES_MIGRATION_CHECKSUM).toBe(digestV4);
     expect(POSTGRES_MIGRATIONS).toEqual([
       { version: 1, checksum: digestV1, sql: POSTGRES_MIGRATION_V1 },
       { version: 2, checksum: digestV2, sql: POSTGRES_MIGRATION_V2 },
       { version: 3, checksum: digestV3, sql: POSTGRES_MIGRATION_V3 },
+      { version: 4, checksum: digestV4, sql: POSTGRES_MIGRATION_V4 },
     ]);
   });
 
@@ -92,5 +95,17 @@ describe("Postgres migration contract", () => {
     expect(POSTGRES_MIGRATION_V3).toContain("FOR EACH ROW EXECUTE FUNCTION accounts.reject_append_only_change()");
     expect(POSTGRES_MIGRATION_V3).toContain("FORCE ROW LEVEL SECURITY");
     expect(POSTGRES_MIGRATION_V3).toContain("accounts.row_owned_by(owner_ref)");
+  });
+
+  test("upgrades migration history to database-assigned monotonic order", () => {
+    expect(POSTGRES_MIGRATION_V4).toContain("ADD COLUMN ledger_sequence BIGINT");
+    expect(POSTGRES_MIGRATION_V4).toContain(
+      "ALTER COLUMN ledger_sequence ADD GENERATED ALWAYS AS IDENTITY",
+    );
+    expect(POSTGRES_MIGRATION_V4).toContain("UNIQUE (ledger_sequence)");
+    expect(POSTGRES_MIGRATION_V4).toContain(
+      "CHECK (pg_catalog.isfinite(applied_at))",
+    );
+    expect(POSTGRES_MIGRATION_V4).toContain("schema_migrations_immutable");
   });
 });

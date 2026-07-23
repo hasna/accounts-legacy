@@ -29,6 +29,24 @@ interface MigrationRow {
   readonly checksum: string;
 }
 
+interface LegacyMigrationRow extends MigrationRow {
+  readonly applied_at: string;
+  readonly applied_at_is_finite: boolean;
+  readonly applied_at_occurrences: string | number | bigint;
+}
+
+interface SequencedMigrationRow extends MigrationRow {
+  readonly applied_at_is_finite: boolean;
+  readonly ledger_sequence: string | number | bigint;
+  readonly ledger_sequence_occurrences: string | number | bigint;
+}
+
+interface ParsedMigrationRow {
+  readonly version: bigint;
+  readonly checksum: string;
+  readonly ledgerSequence: bigint | null;
+}
+
 interface PackageOwnedObjectRow {
   readonly package_owned_objects: string | number | bigint;
 }
@@ -60,6 +78,24 @@ interface TableCatalogRow {
   readonly runtime_references: boolean;
   readonly runtime_trigger: boolean;
   readonly public_any: boolean;
+}
+
+interface SequenceCatalogRow {
+  readonly sequence_name: string;
+  readonly owner_is_current: boolean;
+  readonly owned_by_ledger_sequence: boolean;
+  readonly data_type: string;
+  readonly increment: string | number | bigint;
+  readonly minimum_value: string | number | bigint;
+  readonly maximum_value: string | number | bigint;
+  readonly cache_size: string | number | bigint;
+  readonly cycles: boolean;
+  readonly public_select: boolean;
+  readonly public_usage: boolean;
+  readonly public_update: boolean;
+  readonly runtime_select: boolean;
+  readonly runtime_usage: boolean;
+  readonly runtime_update: boolean;
 }
 
 interface ColumnCatalogRow {
@@ -156,6 +192,10 @@ const EXPECTED_TRIGGERS = new Map<string, {
   readonly tableName: string;
   readonly functionName: string;
 }>([
+  ["schema_migrations_immutable", {
+    tableName: "schema_migrations",
+    functionName: "reject_append_only_change",
+  }],
   ["credential_binding_handles_nonterminal", {
     tableName: "credential_binding_handles",
     functionName: "reject_terminal_credential_handle",
@@ -306,26 +346,12 @@ async function preflightMigrationLedger(
     return new Map();
   }
 
-  const rows = await transaction<MigrationRow[]>`
-    SELECT version::text AS version, checksum
-    FROM accounts.schema_migrations
-    ORDER BY applied_at ASC, version ASC
-  `;
+  const { rows, sequenced } = await readMigrationLedger(transaction);
   if (rows.length === 0) {
     throw catalogMismatch("migration_history", "empty_ledger");
   }
 
-  const parsed = rows.map((row) => {
-    const versionText = String(row.version);
-    if (!/^[1-9][0-9]*$/.test(versionText)) {
-      throw catalogMismatch("migration_history", versionText);
-    }
-    return {
-      version: BigInt(versionText),
-      checksum: row.checksum,
-    };
-  });
-  const highest = parsed.reduce(
+  const highest = rows.reduce(
     (candidate, row) => row.version > candidate ? row.version : candidate,
     0n,
   );
@@ -336,37 +362,156 @@ async function preflightMigrationLedger(
   }
 
   const existing = new Map<number, string>();
-  for (const [index, row] of parsed.entries()) {
+  let previousSequence = 0n;
+  for (const [index, row] of rows.entries()) {
     const expected = POSTGRES_MIGRATIONS[index];
     if (
       expected === undefined ||
       row.version !== BigInt(expected.version) ||
-      row.checksum !== expected.checksum
+      row.checksum !== expected.checksum ||
+      (
+        sequenced &&
+        (
+          row.ledgerSequence === null ||
+          row.ledgerSequence <= previousSequence
+        )
+      )
     ) {
       throw catalogMismatch("migration_history", String(row.version));
     }
+    if (row.ledgerSequence !== null) previousSequence = row.ledgerSequence;
     existing.set(expected.version, row.checksum);
   }
   return existing;
 }
 
 async function assertMigrationLedger(transaction: PostgresTransaction): Promise<void> {
-  const rows = await transaction<MigrationRow[]>`
-    SELECT version::text AS version, checksum
-    FROM accounts.schema_migrations
-    ORDER BY version ASC
-  `;
+  const { rows, sequenced } = await readMigrationLedger(transaction);
   if (
+    !sequenced ||
     rows.length !== POSTGRES_MIGRATIONS.length ||
     rows.some((row, index) => {
       const expected = POSTGRES_MIGRATIONS[index];
       return expected === undefined ||
-        Number(row.version) !== expected.version ||
+        row.version !== BigInt(expected.version) ||
         row.checksum !== expected.checksum;
     })
   ) {
     throw catalogMismatch("migration_history");
   }
+}
+
+async function readMigrationLedger(
+  transaction: PostgresTransaction,
+): Promise<{
+  readonly rows: readonly ParsedMigrationRow[];
+  readonly sequenced: boolean;
+}> {
+  const [{
+    has_ledger_sequence: hasLedgerSequence,
+    ledger_sequence_is_identity: ledgerSequenceIsIdentity,
+  } = {
+    has_ledger_sequence: false,
+    ledger_sequence_is_identity: false,
+  }] = await transaction<Array<{
+    readonly has_ledger_sequence: boolean;
+    readonly ledger_sequence_is_identity: boolean;
+  }>>`
+    SELECT
+      count(*) = 1 AS has_ledger_sequence,
+      COALESCE(
+        bool_and(
+          attribute.atttypid = 'pg_catalog.int8'::pg_catalog.regtype
+          AND attribute.attnotnull
+          AND attribute.attidentity = 'a'
+        ),
+        false
+      ) AS ledger_sequence_is_identity
+    FROM pg_catalog.pg_attribute AS attribute
+    JOIN pg_catalog.pg_class AS relation ON relation.oid = attribute.attrelid
+    JOIN pg_catalog.pg_namespace AS namespace
+      ON namespace.oid = relation.relnamespace
+    WHERE namespace.nspname = 'accounts'
+      AND relation.relname = 'schema_migrations'
+      AND relation.relkind = 'r'
+      AND attribute.attname = 'ledger_sequence'
+      AND attribute.attnum > 0
+      AND NOT attribute.attisdropped
+  `;
+  if (hasLedgerSequence && !ledgerSequenceIsIdentity) {
+    throw catalogMismatch("migration_history", "ledger_sequence_contract");
+  }
+
+  if (hasLedgerSequence) {
+    const rows = await transaction<SequencedMigrationRow[]>`
+      SELECT
+        version::text AS version,
+        checksum,
+        pg_catalog.isfinite(applied_at) AS applied_at_is_finite,
+        ledger_sequence::text AS ledger_sequence,
+        count(*) OVER (
+          PARTITION BY ledger_sequence
+        )::text AS ledger_sequence_occurrences
+      FROM accounts.schema_migrations
+      ORDER BY ledger_sequence ASC
+    `;
+    return {
+      rows: Object.freeze(rows.map((row) => {
+        if (
+          !row.applied_at_is_finite ||
+          String(row.ledger_sequence_occurrences) !== "1"
+        ) {
+          throw catalogMismatch("migration_history", String(row.version));
+        }
+        return parseMigrationRow(row, row.ledger_sequence);
+      })),
+      sequenced: true,
+    };
+  }
+
+  const rows = await transaction<LegacyMigrationRow[]>`
+    SELECT
+      version::text AS version,
+      checksum,
+      applied_at::text AS applied_at,
+      pg_catalog.isfinite(applied_at) AS applied_at_is_finite,
+      count(*) OVER (
+        PARTITION BY applied_at
+      )::text AS applied_at_occurrences
+    FROM accounts.schema_migrations
+    ORDER BY applied_at ASC
+  `;
+  return {
+    rows: Object.freeze(rows.map((row) => {
+      if (
+        !row.applied_at_is_finite ||
+        String(row.applied_at_occurrences) !== "1"
+      ) {
+        throw catalogMismatch("migration_history", String(row.version));
+      }
+      return parseMigrationRow(row, null);
+    })),
+    sequenced: false,
+  };
+}
+
+function parseMigrationRow(
+  row: MigrationRow,
+  ledgerSequence: string | number | bigint | null,
+): ParsedMigrationRow {
+  const versionText = String(row.version);
+  const sequenceText = ledgerSequence === null ? null : String(ledgerSequence);
+  if (
+    !/^[1-9][0-9]*$/.test(versionText) ||
+    (sequenceText !== null && !/^[1-9][0-9]*$/.test(sequenceText))
+  ) {
+    throw catalogMismatch("migration_history", versionText);
+  }
+  return {
+    version: BigInt(versionText),
+    checksum: row.checksum,
+    ledgerSequence: sequenceText === null ? null : BigInt(sequenceText),
+  };
 }
 
 async function assertRoleBoundary(
@@ -576,10 +721,105 @@ async function attestCatalog(
   }
 
   await attestTables(transaction, runtimeRole);
+  await attestSequences(transaction, runtimeRole);
   await attestSchemaManifest(transaction);
   await attestFunctions(transaction, runtimeRole);
   await attestTriggers(transaction);
   await attestPolicies(transaction);
+}
+
+async function attestSequences(
+  transaction: PostgresTransaction,
+  runtimeRole: string,
+): Promise<void> {
+  const rows = await transaction<SequenceCatalogRow[]>`
+    SELECT
+      relation.relname AS sequence_name,
+      relation.relowner = pg_catalog.to_regrole(current_user) AS owner_is_current,
+      EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_depend AS dependency
+        JOIN pg_catalog.pg_attribute AS attribute
+          ON attribute.attrelid = dependency.refobjid
+          AND attribute.attnum = dependency.refobjsubid
+        WHERE dependency.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+          AND dependency.objid = relation.oid
+          AND dependency.refclassid = 'pg_catalog.pg_class'::pg_catalog.regclass
+          AND dependency.refobjid =
+            'accounts.schema_migrations'::pg_catalog.regclass
+          AND dependency.deptype = 'i'
+          AND attribute.attname = 'ledger_sequence'
+      ) AS owned_by_ledger_sequence,
+      pg_catalog.format_type(sequence.seqtypid, NULL) AS data_type,
+      sequence.seqincrement AS increment,
+      sequence.seqmin AS minimum_value,
+      sequence.seqmax AS maximum_value,
+      sequence.seqcache AS cache_size,
+      sequence.seqcycle AS cycles,
+      pg_catalog.has_sequence_privilege(
+        'public',
+        relation.oid,
+        'SELECT'
+      ) AS public_select,
+      pg_catalog.has_sequence_privilege(
+        'public',
+        relation.oid,
+        'USAGE'
+      ) AS public_usage,
+      pg_catalog.has_sequence_privilege(
+        'public',
+        relation.oid,
+        'UPDATE'
+      ) AS public_update,
+      pg_catalog.has_sequence_privilege(
+        ${runtimeRole},
+        relation.oid,
+        'SELECT'
+      ) AS runtime_select,
+      pg_catalog.has_sequence_privilege(
+        ${runtimeRole},
+        relation.oid,
+        'USAGE'
+      ) AS runtime_usage,
+      pg_catalog.has_sequence_privilege(
+        ${runtimeRole},
+        relation.oid,
+        'UPDATE'
+      ) AS runtime_update
+    FROM pg_catalog.pg_class AS relation
+    JOIN pg_catalog.pg_namespace AS namespace
+      ON namespace.oid = relation.relnamespace
+    JOIN pg_catalog.pg_sequence AS sequence
+      ON sequence.seqrelid = relation.oid
+    WHERE namespace.nspname = 'accounts'
+    ORDER BY relation.relname
+  `;
+  if (
+    rows.length !== 1 ||
+    rows[0]?.sequence_name !== "schema_migrations_ledger_sequence_seq"
+  ) {
+    throw catalogMismatch("sequences");
+  }
+  const [sequence] = rows;
+  if (
+    sequence === undefined ||
+    !sequence.owner_is_current ||
+    !sequence.owned_by_ledger_sequence ||
+    sequence.data_type !== "bigint" ||
+    BigInt(sequence.increment) !== 1n ||
+    BigInt(sequence.minimum_value) !== 1n ||
+    BigInt(sequence.maximum_value) !== 9_223_372_036_854_775_807n ||
+    BigInt(sequence.cache_size) !== 1n ||
+    sequence.cycles ||
+    sequence.public_select ||
+    sequence.public_usage ||
+    sequence.public_update ||
+    sequence.runtime_select ||
+    sequence.runtime_usage ||
+    sequence.runtime_update
+  ) {
+    throw catalogMismatch("sequence_contract", sequence?.sequence_name);
+  }
 }
 
 async function attestTables(

@@ -102,7 +102,11 @@ describePostgres("native-subscription PostgreSQL catalog and concurrency", () =>
   }
 
   async function createMigrationLedger(
-    rows: readonly { readonly version: number; readonly checksum: string }[],
+    rows: readonly {
+      readonly version: number;
+      readonly checksum: string;
+      readonly appliedAt?: string;
+    }[],
   ): Promise<void> {
     await ownerSql`
       CREATE TABLE accounts.schema_migrations (
@@ -112,10 +116,17 @@ describePostgres("native-subscription PostgreSQL catalog and concurrency", () =>
       )
     `;
     for (const row of rows) {
-      await ownerSql`
-        INSERT INTO accounts.schema_migrations(version, checksum)
-        VALUES (${row.version}, ${row.checksum})
-      `;
+      if (row.appliedAt === undefined) {
+        await ownerSql`
+          INSERT INTO accounts.schema_migrations(version, checksum)
+          VALUES (${row.version}, ${row.checksum})
+        `;
+      } else {
+        await ownerSql`
+          INSERT INTO accounts.schema_migrations(version, checksum, applied_at)
+          VALUES (${row.version}, ${row.checksum}, ${row.appliedAt}::timestamptz)
+        `;
+      }
     }
   }
 
@@ -248,6 +259,19 @@ describePostgres("native-subscription PostgreSQL catalog and concurrency", () =>
     expect(observed.appliedSql).toEqual([]);
 
     await resetAccountsSchema();
+    const appliedAt = "2030-07-18T12:00:00.000Z";
+    await createMigrationLedger([
+      { ...POSTGRES_MIGRATIONS[1], appliedAt },
+      { ...POSTGRES_MIGRATIONS[0], appliedAt },
+    ]);
+    observed = observeMigrationSql();
+    await expect(runPostgresMigrations(
+      observed.client,
+      { runtimeRole: roleBoundary },
+    )).rejects.toMatchObject({ code: "SCHEMA_CHECKSUM_MISMATCH" });
+    expect(observed.appliedSql).toEqual([]);
+
+    await resetAccountsSchema();
     await ownerSql.unsafe(POSTGRES_MIGRATIONS[0].sql).simple();
     await ownerSql`
       INSERT INTO accounts.schema_migrations(version, checksum)
@@ -258,31 +282,55 @@ describePostgres("native-subscription PostgreSQL catalog and concurrency", () =>
       observed.client,
       { runtimeRole: roleBoundary },
     );
-    expect(prefixReport.appliedVersions).toEqual(["2", "3"]);
+    expect(prefixReport.appliedVersions).toEqual(["2", "3", "4"]);
     expect(observed.appliedSql).not.toContain(POSTGRES_MIGRATIONS[0].sql);
     expect(observed.appliedSql).toContain(POSTGRES_MIGRATIONS[1].sql);
     expect(observed.appliedSql).toContain(POSTGRES_MIGRATIONS[2].sql);
+    expect(observed.appliedSql).toContain(POSTGRES_MIGRATIONS[3].sql);
 
     await resetAccountsSchema();
   });
 
-  test("applies a clean fresh schema, reapplies, catalog-attests, and uses the configured SET ROLE boundary", async () => {
-    const first = await runPostgresMigrations(
-      ownerSql as unknown as PostgresSqlClient,
-      { runtimeRole: roleBoundary },
-    );
-    const replay = await runPostgresMigrations(
-      ownerSql as unknown as PostgresSqlClient,
-      { runtimeRole: roleBoundary },
-    );
+  test("serializes concurrent clean migration, replays the sequenced ledger, and uses SET ROLE", async () => {
+    const reports = await Promise.all([
+      runPostgresMigrations(
+        ownerSql as unknown as PostgresSqlClient,
+        { runtimeRole: roleBoundary },
+      ),
+      runPostgresMigrations(
+        ownerSql as unknown as PostgresSqlClient,
+        { runtimeRole: roleBoundary },
+      ),
+    ]);
+    expect(reports.map((report) => report.appliedVersions.length).sort()).toEqual([
+      0,
+      POSTGRES_MIGRATIONS.length,
+    ]);
+    const first = reports.find((report) => report.appliedVersions.length > 0)!;
+    const replay = reports.find((report) => report.appliedVersions.length === 0)!;
     expect(first).toEqual({
       schemaVersion: String(POSTGRES_SCHEMA_VERSION),
       migrationChecksum: POSTGRES_MIGRATION_CHECKSUM,
-      appliedVersions: ["1", "2", "3"],
+      appliedVersions: ["1", "2", "3", "4"],
       runtimeRole,
       runtimeRoleMode: "set-role",
     });
     expect(replay.appliedVersions).toEqual([]);
+    expect(await ownerSql<Array<{
+      version: string;
+      ledger_sequence: string;
+    }>>`
+      SELECT
+        version::text AS version,
+        ledger_sequence::text AS ledger_sequence
+      FROM accounts.schema_migrations
+      ORDER BY ledger_sequence
+    `).toEqual([
+      { version: "1", ledger_sequence: "1" },
+      { version: "2", ledger_sequence: "2" },
+      { version: "3", ledger_sequence: "3" },
+      { version: "4", ledger_sequence: "4" },
+    ]);
 
     const context = await loginSql.begin("read only", async (transaction) => {
       await installPostgresRuntimeContext(transaction, {
@@ -380,7 +428,14 @@ describePostgres("native-subscription PostgreSQL catalog and concurrency", () =>
       ownerSql as unknown as PostgresSqlClient,
       { runtimeRole: roleBoundary },
     )).rejects.toMatchObject({ code: "SCHEMA_VERSION_UNSUPPORTED" });
-    await ownerSql`DELETE FROM accounts.schema_migrations WHERE version = 999`;
+    await ownerSql`ALTER TABLE accounts.schema_migrations
+      DISABLE TRIGGER schema_migrations_immutable`;
+    try {
+      await ownerSql`DELETE FROM accounts.schema_migrations WHERE version = 999`;
+    } finally {
+      await ownerSql`ALTER TABLE accounts.schema_migrations
+        ENABLE TRIGGER schema_migrations_immutable`;
+    }
     expect((await runPostgresMigrations(
       ownerSql as unknown as PostgresSqlClient,
       { runtimeRole: roleBoundary },

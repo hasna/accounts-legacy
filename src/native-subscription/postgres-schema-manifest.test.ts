@@ -24,6 +24,17 @@ describe("Postgres schema manifest", () => {
 
   test("pins collation, ordered CAS keys, maintenance FK action, and partial-index predicates", () => {
     expect(POSTGRES_SCHEMA_MANIFEST.columns).toContainEqual([
+      "schema_migrations",
+      4,
+      "ledger_sequence",
+      "bigint",
+      true,
+      null,
+      "a",
+      "",
+      null,
+    ]);
+    expect(POSTGRES_SCHEMA_MANIFEST.columns).toContainEqual([
       "capability_use_consumptions",
       6,
       "receipt_jcs_base64url",

@@ -34,7 +34,7 @@ production substitutes.
 ## Postgres
 
 `runPostgresMigrations` applies the dedicated, checksummed Accounts capacity
-schema through version 3. It must run with a dedicated, non-elevated migration
+schema through version 4. It must run with a dedicated, non-elevated migration
 owner connection after an operator provisions the `accounts` schema and runtime
 roles. Runtime identity is configuration, never migration SQL: pass either a
 dedicated direct `LOGIN` role or a configured `LOGIN` role that is the sole
@@ -67,6 +67,13 @@ every ordered column definition, PK/UNIQUE/CHECK/FK constraint, and
 package-owned index definition including ordered keys and partial predicates.
 A matching checksum ledger is necessary but not sufficient; drift fails closed
 with `SCHEMA_CHECKSUM_MISMATCH`.
+
+Version 4 upgrades the migration ledger from timestamp-derived ordering to an
+append-only, database-assigned `ledger_sequence`. Before that upgrade, a legacy
+ledger is accepted only when every `applied_at` value is finite and unique and
+the resulting order is the exact migration prefix. Equal timestamps are
+ambiguous and fail closed before package SQL executes. Once upgraded, sequence
+order is authoritative and timestamp ties no longer affect replay.
 
 ```ts
 import {
