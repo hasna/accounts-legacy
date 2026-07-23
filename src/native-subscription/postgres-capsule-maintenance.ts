@@ -7,12 +7,15 @@ import type {
   CapsuleMaintenanceUseCommit,
 } from "./capsule-maintenance.js";
 import {
+  CAPSULE_MAINTENANCE_CONSUME_RECEIPT_WIRE_SCHEMA,
   CAPSULE_MAINTENANCE_CONSUME_RECEIPT_DESCRIPTOR,
   CAPSULE_MAINTENANCE_CONSUME_RECEIPT_SCHEMA_DIGEST,
   CAPSULE_MAINTENANCE_CONSUME_RECEIPT_SCHEMA_VERSION,
+  CAPSULE_MAINTENANCE_GRANT_WIRE_SCHEMA,
   CAPSULE_MAINTENANCE_GRANT_DESCRIPTOR,
   CAPSULE_MAINTENANCE_GRANT_SCHEMA_DIGEST,
   CAPSULE_MAINTENANCE_GRANT_SCHEMA_VERSION,
+  capsuleMaintenanceWireSchemaFor,
   maintenanceCanonicalRequestDigest,
   maintenanceOperationDigest,
   maintenanceReservationKeyDigest,
@@ -25,7 +28,8 @@ import { isUuidV7 } from "./ids.js";
 import {
   assertNoSensitiveFields,
   canonicalJson,
-  canonicalSha256,
+  canonicalJsonWithWireSchema,
+  canonicalSha256WithWireSchema,
   parseClosedJsonBytes,
 } from "./json.js";
 import {
@@ -533,7 +537,8 @@ function validateGrantReservation(
     grant.operation_digest !== operationDigest ||
     (sourceLineageDigest !== undefined &&
       grant.source_lineage_digest !== sourceLineageDigest) ||
-    canonicalSha256(grant) !== input.grantDigest ||
+    canonicalSha256WithWireSchema(grant, CAPSULE_MAINTENANCE_GRANT_WIRE_SCHEMA) !==
+      input.grantDigest ||
     maintenanceReservationKeyDigest(grant) !== input.reservationKeyDigest
   ) {
     throw validationFailed("grantBytes");
@@ -621,7 +626,10 @@ function validateUseCommit(input: CapsuleMaintenanceUseCommit): JsonRecord {
     receipt.maintenance_use_id !== input.maintenanceUseId ||
     receipt.maintenance_use_id !== maintenanceUseId ||
     receipt.committed_at !== committedAt ||
-    canonicalSha256(receipt) !== input.consumeReceiptDigest
+    canonicalSha256WithWireSchema(
+      receipt,
+      CAPSULE_MAINTENANCE_CONSUME_RECEIPT_WIRE_SCHEMA,
+    ) !== input.consumeReceiptDigest
   ) {
     throw validationFailed("consumeReceiptBytes");
   }
@@ -652,12 +660,15 @@ function parseCanonicalEvidence(bytes: Uint8Array, field: string): JsonRecord {
     throw validationFailed(field);
   }
   const parsed = parseClosedJsonBytes(bytes);
-  assertNoSensitiveFields(parsed);
+  const schema = capsuleMaintenanceWireSchemaFor(parsed);
+  const canonical = schema === undefined
+    ? canonicalJson(parsed)
+    : canonicalJsonWithWireSchema(parsed, schema);
   if (
     parsed === null ||
     typeof parsed !== "object" ||
     Array.isArray(parsed) ||
-    !Buffer.from(bytes).equals(Buffer.from(canonicalJson(parsed), "utf8"))
+    !Buffer.from(bytes).equals(Buffer.from(canonical, "utf8"))
   ) {
     throw validationFailed(field);
   }

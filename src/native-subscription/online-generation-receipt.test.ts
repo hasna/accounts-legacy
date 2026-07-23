@@ -12,8 +12,10 @@ import { parseCounter } from "./counter.js";
 import {
   CAPABILITY_USE_CONSUME_RECEIPT_SCHEMA_DIGEST,
   CAPABILITY_USE_CONSUME_RECEIPT_SCHEMA_VERSION,
+  CAPABILITY_USE_CONSUME_RECEIPT_WIRE_SCHEMA,
   CAPABILITY_USE_CONSUME_REQUEST_SCHEMA_DIGEST,
   CAPABILITY_USE_CONSUME_REQUEST_SCHEMA_VERSION,
+  ONLINE_GENERATION_CHECK_RECEIPT_WIRE_SCHEMA,
   ONLINE_GENERATION_CHECK_RECEIPT_SCHEMA_VERSION,
   consumeOnlineGenerationCheckReceiptUse,
   projectOnlineGenerationCheckReceipt,
@@ -29,7 +31,10 @@ import {
 } from "./online-generation-receipt.js";
 import {
   canonicalJson,
+  canonicalJsonWithWireSchema,
   canonicalSha256,
+  canonicalSha256WithWireSchema,
+  defineCanonicalJsonWireSchema,
   parseClosedJsonBytes,
 } from "./json.js";
 
@@ -111,6 +116,38 @@ const goldenPublicKey = createPublicKey({
 });
 const PYTHON_GOLDEN_SIGNATURE =
   "4GkyUaNlXLhpVuRWI7IXlvKi23r0lvo54Dn2sKOC6jqdqIXcaUKRLWNSTDuDii0ONlhdm3iMEdfkZj3BSdtKAQ";
+const SECRET_LIKE_SIGNATURE_PREFIXES = Object.freeze([
+  "sk-",
+  "sk_",
+  "rk-",
+  "rk_",
+  "pk-",
+  "pk_",
+  "token-",
+  "token_",
+  "secret-",
+  "secret_",
+] as const);
+
+function secretLikeSignature(prefix: (typeof SECRET_LIKE_SIGNATURE_PREFIXES)[number]): string {
+  const signature = `${prefix}${"A".repeat(86 - prefix.length)}`;
+  const decoded = Buffer.from(signature, "base64url");
+  if (decoded.byteLength !== 64 || decoded.toString("base64url") !== signature) {
+    throw new Error("invalid deterministic signature fixture");
+  }
+  return signature;
+}
+
+function replaceTopLevelSignature(source: Uint8Array, signature: string): Uint8Array {
+  const current = String(decoded(source).signature);
+  const canonical = new TextDecoder().decode(source);
+  const replaced = canonical.replace(
+    `"signature":${JSON.stringify(current)}`,
+    `"signature":${JSON.stringify(signature)}`,
+  );
+  if (replaced === canonical) throw new Error("signature fixture was not replaced");
+  return Buffer.from(replaced, "utf8");
+}
 
 function commonDraft() {
   return {
@@ -380,7 +417,18 @@ function signUnchecked(
     Buffer.from(canonicalJson(unsigned), "utf8"),
     privateKey,
   ).toString("base64url");
-  return Buffer.from(canonicalJson({ ...unsigned, signature }), "utf8");
+  const signed = { ...unsigned, signature };
+  const schema = typeof signed.schema_version === "string"
+    ? defineCanonicalJsonWireSchema(signed.schema_version, [
+        { path: ["signature"], encoding: "ed25519-signature" },
+      ])
+    : undefined;
+  return Buffer.from(
+    schema === undefined
+      ? canonicalJson(signed)
+      : canonicalJsonWithWireSchema(signed, schema),
+    "utf8",
+  );
 }
 
 function changedExpectation(
@@ -540,6 +588,66 @@ function durableUseStore(
 }
 
 describe("closed online_generation_check_receipt", () => {
+  test("treats every wire-valid secret-like signature prefix as cryptographic evidence only", async () => {
+    const draft = nativeDraft();
+    const source = signDraft(draft);
+    const expected = expectationFor(draft);
+    const guard = useGuard(draft);
+    let request: OnlineGenerationReceiptUseCasRequest | undefined;
+    await consumeOnlineGenerationCheckReceiptUse(
+      source,
+      trust(),
+      expected,
+      {
+        compareAndConsume(candidate) {
+          request = candidate;
+          return {
+            status: "consumed",
+            signedReceipt: signedConsumeReceipt(candidate, draft),
+          };
+        },
+      },
+      guard,
+    );
+    expect(request).toBeDefined();
+    const validConsumeReceipt = signedConsumeReceipt(request!, draft);
+
+    for (const prefix of SECRET_LIKE_SIGNATURE_PREFIXES) {
+      const signature = secretLikeSignature(prefix);
+      expect(
+        () => verifyOnlineGenerationCheckReceipt(
+          replaceTopLevelSignature(source, signature),
+          trust(),
+          expected,
+        ),
+        `online receipt ${prefix}`,
+      ).toThrow(expect.objectContaining({ code: "FORBIDDEN" }));
+      await expect(
+        consumeOnlineGenerationCheckReceiptUse(
+          source,
+          trust(),
+          expected,
+          fixedUseStore(replaceTopLevelSignature(validConsumeReceipt, signature)),
+          guard,
+        ),
+        `consume receipt ${prefix}`,
+      ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    }
+
+    const ordinarySecret = secretLikeSignature("sk-");
+    const issuerCollision = new TextDecoder().decode(source).replace(
+      `"issuer":${JSON.stringify(SELF_HOSTED_ISSUER)}`,
+      `"issuer":${JSON.stringify(ordinarySecret)}`,
+    );
+    expect(() =>
+      verifyOnlineGenerationCheckReceipt(
+        Buffer.from(issuerCollision, "utf8"),
+        trust(),
+        expected,
+      ),
+    ).toThrow(expect.objectContaining({ code: "VALIDATION_FAILED" }));
+  });
+
   test("matches an independent Python JCS and Ed25519 full-envelope golden vector", () => {
     expect(destinationPolicyDigest).toBe(
       "sha256:88ac0134eb384cc8fc6650213bc31e361a905b5d439579cd0e1d2a4ba817faa2",
@@ -547,7 +655,12 @@ describe("closed online_generation_check_receipt", () => {
     const draft = nativeDraft();
     const source = signUnchecked(draft, goldenPrivateKey);
     expect(decoded(source).signature).toBe(PYTHON_GOLDEN_SIGNATURE);
-    expect(new TextDecoder().decode(source)).toBe(canonicalJson(decoded(source)));
+    expect(new TextDecoder().decode(source)).toBe(
+      canonicalJsonWithWireSchema(
+        decoded(source),
+        ONLINE_GENERATION_CHECK_RECEIPT_WIRE_SCHEMA,
+      ),
+    );
     expect(() =>
       verifyOnlineGenerationCheckReceipt(
         source,
@@ -568,7 +681,12 @@ describe("closed online_generation_check_receipt", () => {
     expect("credential_binding_id" in verified).toBe(false);
     expect(Object.isFrozen(verified)).toBe(true);
     expect(Object.isFrozen(verified.provider_destination_policy)).toBe(true);
-    expect(new TextDecoder().decode(source)).toBe(canonicalJson(decoded(source)));
+    expect(new TextDecoder().decode(source)).toBe(
+      canonicalJsonWithWireSchema(
+        decoded(source),
+        ONLINE_GENERATION_CHECK_RECEIPT_WIRE_SCHEMA,
+      ),
+    );
 
     const projected = projectOnlineGenerationCheckReceipt(verified);
     expect(projected.schemaVersion).toBe(ONLINE_GENERATION_CHECK_RECEIPT_SCHEMA_VERSION);
@@ -688,7 +806,10 @@ describe("closed online_generation_check_receipt", () => {
       canonical_request_digest: D4,
       provider_destination_policy_digest: destinationPolicyDigest,
       online_receipt_id: IDS.receipt,
-      online_receipt_digest: canonicalSha256(decoded(source)),
+      online_receipt_digest: canonicalSha256WithWireSchema(
+        decoded(source),
+        ONLINE_GENERATION_CHECK_RECEIPT_WIRE_SCHEMA,
+      ),
       model_call_anchor_digest: D3,
       expected_use_count: C0,
       max_uses: C1,
@@ -951,7 +1072,12 @@ describe("closed online_generation_check_receipt", () => {
         trust(),
         expected,
         fixedUseStore(Buffer.concat([
-          Buffer.from(canonicalJson(valid)),
+          Buffer.from(
+            canonicalJsonWithWireSchema(
+              valid,
+              CAPABILITY_USE_CONSUME_RECEIPT_WIRE_SCHEMA,
+            ),
+          ),
           Buffer.from("\n"),
         ])),
         guard,
@@ -1628,7 +1754,12 @@ describe("closed online_generation_check_receipt", () => {
     forged[0] = forged[0]! ^ 1;
     expect(() =>
       verifyOnlineGenerationCheckReceipt(
-        Buffer.from(canonicalJson({ ...base, signature: forged.toString("base64url") })),
+        Buffer.from(
+          canonicalJsonWithWireSchema(
+            { ...base, signature: forged.toString("base64url") },
+            ONLINE_GENERATION_CHECK_RECEIPT_WIRE_SCHEMA,
+          ),
+        ),
         trust(),
         expectationFor(draft),
       ),

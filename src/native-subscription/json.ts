@@ -14,6 +14,51 @@ const SUSPECT_VALUE_PATTERNS = [
   /\b(?:sk|rk|pk|token|secret)[-_][A-Za-z0-9_-]{16,}\b/i,
   /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/,
 ] as const;
+const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
+
+export type CanonicalJsonWireEncoding = "ed25519-signature";
+
+export interface CanonicalJsonWireField {
+  readonly path: readonly string[];
+  readonly encoding: CanonicalJsonWireEncoding;
+}
+
+export interface CanonicalJsonWireSchema {
+  readonly schemaVersion: string;
+  readonly fields: readonly CanonicalJsonWireField[];
+}
+
+export function defineCanonicalJsonWireSchema(
+  schemaVersion: string,
+  fields: readonly CanonicalJsonWireField[],
+): CanonicalJsonWireSchema {
+  const seen = new Set<string>();
+  const normalized = fields.map((field) => {
+    if (
+      field.path.length === 0 ||
+      field.path.some((segment) => segment.length === 0) ||
+      field.encoding !== "ed25519-signature"
+    ) {
+      throw new AccountsError("VALIDATION_FAILED", "Canonical wire schema is invalid");
+    }
+    const key = JSON.stringify(field.path);
+    if (seen.has(key)) {
+      throw new AccountsError("VALIDATION_FAILED", "Canonical wire schema has duplicate paths");
+    }
+    seen.add(key);
+    return Object.freeze({
+      path: Object.freeze([...field.path]),
+      encoding: field.encoding,
+    });
+  });
+  if (schemaVersion.length === 0) {
+    throw new AccountsError("VALIDATION_FAILED", "Canonical wire schema is invalid");
+  }
+  return Object.freeze({
+    schemaVersion,
+    fields: Object.freeze(normalized),
+  });
+}
 
 function hasInvalidUnicode(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
@@ -288,6 +333,24 @@ export function canonicalSha256(value: unknown): string {
   return `sha256:${createHash("sha256").update(canonicalJson(value), "utf8").digest("hex")}`;
 }
 
+export function canonicalJsonWithWireSchema(
+  value: unknown,
+  schema: CanonicalJsonWireSchema,
+): string {
+  assertWireSchema(value, schema);
+  assertNoSensitiveFieldsWithWireSchema(value, schema, [], new Set());
+  return serializeCanonical(snapshotJson(value, 0, new Set()));
+}
+
+export function canonicalSha256WithWireSchema(
+  value: unknown,
+  schema: CanonicalJsonWireSchema,
+): string {
+  return `sha256:${createHash("sha256")
+    .update(canonicalJsonWithWireSchema(value, schema), "utf8")
+    .digest("hex")}`;
+}
+
 export function assertNoSensitiveFields(value: unknown, path = "$", seen = new Set<object>()): void {
   if (Array.isArray(value)) {
     if (seen.has(value)) throw new AccountsError("VALIDATION_FAILED", "Cyclic JSON is forbidden");
@@ -330,4 +393,108 @@ export function assertNoSecretLikeString(value: string): void {
   if (SUSPECT_VALUE_PATTERNS.some((pattern) => pattern.test(value))) {
     throw new AccountsError("VALIDATION_FAILED", "A value resembles credential material");
   }
+}
+
+function assertWireSchema(value: unknown, schema: CanonicalJsonWireSchema): void {
+  const schemaVersion = dataPropertyAtPath(value, ["schema_version"]);
+  if (!schemaVersion.found || schemaVersion.value !== schema.schemaVersion) {
+    throw new AccountsError("VALIDATION_FAILED", "Canonical wire schema does not match payload");
+  }
+  for (const field of schema.fields) {
+    const candidate = dataPropertyAtPath(value, field.path);
+    if (!candidate.found) {
+      throw new AccountsError("VALIDATION_FAILED", "Canonical wire field is missing");
+    }
+    if (typeof candidate.value !== "string") {
+      throw new AccountsError("VALIDATION_FAILED", "Canonical wire field is malformed");
+    }
+    assertCanonicalWireValue(candidate.value, field.encoding);
+  }
+}
+
+function dataPropertyAtPath(
+  root: unknown,
+  path: readonly string[],
+): { readonly found: boolean; readonly value?: unknown } {
+  let cursor = root;
+  for (const segment of path) {
+    if (cursor === null || typeof cursor !== "object" || Array.isArray(cursor)) {
+      return { found: false };
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(cursor, segment);
+    if (
+      descriptor === undefined ||
+      !descriptor.enumerable ||
+      !("value" in descriptor) ||
+      descriptor.get !== undefined ||
+      descriptor.set !== undefined
+    ) {
+      return { found: false };
+    }
+    cursor = descriptor.value;
+  }
+  return { found: true, value: cursor };
+}
+
+function pathsEqual(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((segment, index) => segment === right[index]);
+}
+
+function assertCanonicalWireValue(value: string, encoding: CanonicalJsonWireEncoding): void {
+  if (encoding !== "ed25519-signature") {
+    throw new AccountsError("VALIDATION_FAILED", "Canonical wire schema is invalid");
+  }
+  if (!BASE64URL_PATTERN.test(value)) {
+    throw new AccountsError("VALIDATION_FAILED", "Canonical signature field is malformed");
+  }
+  const decoded = Buffer.from(value, "base64url");
+  if (decoded.byteLength !== 64 || decoded.toString("base64url") !== value) {
+    throw new AccountsError("VALIDATION_FAILED", "Canonical signature field is malformed");
+  }
+}
+
+function assertNoSensitiveFieldsWithWireSchema(
+  value: unknown,
+  schema: CanonicalJsonWireSchema,
+  path: readonly string[],
+  seen: Set<object>,
+): void {
+  if (Array.isArray(value)) {
+    if (seen.has(value)) throw new AccountsError("VALIDATION_FAILED", "Cyclic JSON is forbidden");
+    seen.add(value);
+    value.forEach((item, index) =>
+      assertNoSensitiveFieldsWithWireSchema(item, schema, [...path, String(index)], seen)
+    );
+    seen.delete(value);
+    return;
+  }
+  if (typeof value === "string") {
+    const wireField = schema.fields.find((field) => pathsEqual(field.path, path));
+    if (wireField !== undefined) {
+      assertCanonicalWireValue(value, wireField.encoding);
+      return;
+    }
+    assertNoSecretLikeString(value);
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+  if (seen.has(value)) throw new AccountsError("VALIDATION_FAILED", "Cyclic JSON is forbidden");
+  seen.add(value);
+  if (Object.getOwnPropertySymbols(value).length !== 0) {
+    throw new AccountsError("VALIDATION_FAILED", "Symbol properties are forbidden in DTOs");
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  for (const [key, descriptor] of Object.entries(descriptors)) {
+    if (!descriptor.enumerable) continue;
+    if (!("value" in descriptor) || descriptor.get !== undefined || descriptor.set !== undefined) {
+      throw new AccountsError("VALIDATION_FAILED", "Accessor properties are forbidden in DTOs");
+    }
+    if (SENSITIVE_KEYS.test(key)) {
+      throw new AccountsError("VALIDATION_FAILED", "Credential material or locator fields are forbidden", {
+        details: { field: key },
+      });
+    }
+    assertNoSensitiveFieldsWithWireSchema(descriptor.value, schema, [...path, key], seen);
+  }
+  seen.delete(value);
 }

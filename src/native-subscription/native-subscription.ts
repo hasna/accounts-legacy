@@ -8,9 +8,11 @@ import { parseCounter, type Counter } from "./counter.js";
 import { generateUuidV7, isUuidV7 } from "./ids.js";
 import {
   canonicalJson,
+  canonicalJsonWithWireSchema,
   canonicalSha256,
 } from "./json.js";
 import {
+  CAPABILITY_USE_CONSUME_RECEIPT_WIRE_SCHEMA,
   CAPABILITY_USE_CONSUME_RECEIPT_SCHEMA_DIGEST,
   CAPABILITY_USE_CONSUME_RECEIPT_SCHEMA_VERSION,
   CAPABILITY_USE_CONSUME_REQUEST_SCHEMA_DIGEST,
@@ -460,7 +462,12 @@ export function issueNativeCapabilityUseReceipt(
     recovery_frontier_hash: current.recoveryFrontierHash,
   } as const;
   const receipt = { ...unsigned, signature: signCanonical(unsigned, issuer.privateKey) };
-  return Uint8Array.from(Buffer.from(canonicalJson(receipt), "utf8"));
+  return Uint8Array.from(
+    Buffer.from(
+      canonicalJsonWithWireSchema(receipt, CAPABILITY_USE_CONSUME_RECEIPT_WIRE_SCHEMA),
+      "utf8",
+    ),
+  );
 }
 
 function parseProbeRequest(source: unknown): NativeSubscriptionProbeRequest {

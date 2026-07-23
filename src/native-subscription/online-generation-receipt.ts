@@ -6,7 +6,10 @@ import {
 import { AccountsError } from "./errors.js";
 import {
   canonicalJson,
+  canonicalJsonWithWireSchema,
   canonicalSha256,
+  canonicalSha256WithWireSchema,
+  defineCanonicalJsonWireSchema,
   parseClosedJsonBytes,
 } from "./json.js";
 import {
@@ -29,6 +32,22 @@ export const CAPABILITY_USE_CONSUME_RECEIPT_SCHEMA_VERSION =
   "accounts.capability-use-consume-receipt.v1" as const;
 export const CAPABILITY_USE_CONSUME_RECEIPT_SCHEMA_DIGEST =
   "sha256:4e969fab6b3ae55c479357ebffed40b5de1ce207ca955b478462b36c9a345bfc" as const;
+
+export const ONLINE_GENERATION_CHECK_RECEIPT_WIRE_SCHEMA =
+  defineCanonicalJsonWireSchema(
+    ONLINE_GENERATION_CHECK_RECEIPT_SCHEMA_VERSION,
+    [
+      { path: ["signature"], encoding: "ed25519-signature" },
+    ],
+  );
+
+export const CAPABILITY_USE_CONSUME_RECEIPT_WIRE_SCHEMA =
+  defineCanonicalJsonWireSchema(
+    CAPABILITY_USE_CONSUME_RECEIPT_SCHEMA_VERSION,
+    [
+      { path: ["signature"], encoding: "ed25519-signature" },
+    ],
+  );
 
 /** Frozen successor-candidate claims that do not hash to the expanded descriptors. */
 export const CAPABILITY_USE_CONSUME_REQUEST_SUPERSEDED_CLAIMED_DIGEST =
@@ -1294,7 +1313,10 @@ export function verifyOnlineGenerationCheckReceipt(
   expectation: OnlineGenerationCheckReceiptExpectation,
 ): VerifiedOnlineGenerationCheckReceipt {
   const parsed = parseClosedJsonBytes(source);
-  const canonical = Buffer.from(canonicalJson(parsed), "utf8");
+  const canonical = Buffer.from(
+    canonicalJsonWithWireSchema(parsed, ONLINE_GENERATION_CHECK_RECEIPT_WIRE_SCHEMA),
+    "utf8",
+  );
   const supplied = Buffer.from(source.buffer, source.byteOffset, source.byteLength);
   if (!supplied.equals(canonical)) throw malformed();
 
@@ -1453,7 +1475,10 @@ function buildUseRequest(
     canonical_request_digest: receipt.canonical_request_digest,
     provider_destination_policy_digest: receipt.provider_destination_policy_digest,
     online_receipt_id: receipt.receipt_id,
-    online_receipt_digest: canonicalSha256(receipt),
+    online_receipt_digest: canonicalSha256WithWireSchema(
+      receipt,
+      ONLINE_GENERATION_CHECK_RECEIPT_WIRE_SCHEMA,
+    ),
     model_call_anchor_digest: guard.modelCallAnchorDigest,
     expected_use_count: receipt.use_count,
     max_uses: receipt.max_uses,
@@ -1501,7 +1526,10 @@ function validateConsumeReceipt(
   allowedClockSkew: number,
 ): VerifiedCapabilityUseConsumeReceipt {
   const parsed = parseClosedJsonBytes(source);
-  const canonical = Buffer.from(canonicalJson(parsed), "utf8");
+  const canonical = Buffer.from(
+    canonicalJsonWithWireSchema(parsed, CAPABILITY_USE_CONSUME_RECEIPT_WIRE_SCHEMA),
+    "utf8",
+  );
   const supplied = Buffer.from(source.buffer, source.byteOffset, source.byteLength);
   if (!supplied.equals(canonical)) throw malformed();
 
@@ -1688,7 +1716,10 @@ export async function consumeOnlineGenerationCheckReceiptUse(
     use: {
       request,
       consumeReceipt,
-      consumeReceiptDigest: canonicalSha256(consumeReceipt),
+      consumeReceiptDigest: canonicalSha256WithWireSchema(
+        consumeReceipt,
+        CAPABILITY_USE_CONSUME_RECEIPT_WIRE_SCHEMA,
+      ),
       useId: consumeReceipt.use_id,
       priorUseCount: consumeReceipt.prior_use_count,
       nextUseCount: consumeReceipt.next_use_count,

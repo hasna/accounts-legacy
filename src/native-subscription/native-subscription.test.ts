@@ -13,10 +13,12 @@ import {
   CapsuleMaintenanceAuthority,
   InMemoryCapsuleMaintenanceLedger,
   InMemoryCapsuleMaintenanceLedgerState,
+  capsuleMaintenanceWireSchemaFor,
   maintenanceTargetDigest,
   verifyCapsuleMaintenanceGrant,
   verifyInfinityMaintenanceHeldReceipt,
   type CapsuleMaintenanceCurrentState,
+  type CapsuleMaintenanceLedger,
   type CapsuleMaintenanceTransportBinding,
 } from "./capsule-maintenance.js";
 import {
@@ -31,7 +33,13 @@ import {
   CAPABILITY_USE_CONSUME_REQUEST_SCHEMA_DIGEST,
   type OnlineGenerationReceiptUseCasRequest,
 } from "./online-generation-receipt.js";
-import { canonicalJson, canonicalSha256, parseClosedJsonBytes } from "./json.js";
+import {
+  canonicalJson,
+  canonicalJsonWithWireSchema,
+  canonicalSha256,
+  canonicalSha256WithWireSchema,
+  parseClosedJsonBytes,
+} from "./json.js";
 
 const NOW = new Date("2030-07-18T12:00:00.000Z");
 const OWNER = "principal:human:hasna:owner-a";
@@ -70,9 +78,52 @@ const D6 = `sha256:${"6".repeat(64)}`;
 const C0 = parseCounter("0");
 const C1 = parseCounter("1");
 const C2 = parseCounter("2");
+const SECRET_LIKE_SIGNATURE_PREFIXES = Object.freeze([
+  "sk-",
+  "sk_",
+  "rk-",
+  "rk_",
+  "pk-",
+  "pk_",
+  "token-",
+  "token_",
+  "secret-",
+  "secret_",
+] as const);
 
 function canonicalBytes(value: unknown): Uint8Array {
-  return Uint8Array.from(Buffer.from(canonicalJson(value), "utf8"));
+  const schema = capsuleMaintenanceWireSchemaFor(value);
+  return Uint8Array.from(Buffer.from(
+    schema === undefined ? canonicalJson(value) : canonicalJsonWithWireSchema(value, schema),
+    "utf8",
+  ));
+}
+
+function canonicalDigest(value: unknown): string {
+  const schema = capsuleMaintenanceWireSchemaFor(value);
+  return schema === undefined
+    ? canonicalSha256(value)
+    : canonicalSha256WithWireSchema(value, schema);
+}
+
+function secretLikeSignature(prefix: (typeof SECRET_LIKE_SIGNATURE_PREFIXES)[number]): string {
+  const signature = `${prefix}${"A".repeat(86 - prefix.length)}`;
+  const decoded = Buffer.from(signature, "base64url");
+  if (decoded.byteLength !== 64 || decoded.toString("base64url") !== signature) {
+    throw new Error("invalid deterministic signature fixture");
+  }
+  return signature;
+}
+
+function replaceTopLevelSignature(source: Uint8Array, signature: string): Uint8Array {
+  const parsed = parseClosedJsonBytes(source) as Record<string, unknown>;
+  const canonical = new TextDecoder().decode(source);
+  const replaced = canonical.replace(
+    `"signature":${JSON.stringify(String(parsed.signature))}`,
+    `"signature":${JSON.stringify(signature)}`,
+  );
+  if (replaced === canonical) throw new Error("signature fixture was not replaced");
+  return Buffer.from(replaced, "utf8");
 }
 
 function signedBytes(unsigned: Record<string, unknown>, key: KeyLike): Uint8Array {
@@ -410,7 +461,10 @@ describe("native subscription and maintenance contract", () => {
     expect(grant.action).toBe("REAUTHENTICATE_NATIVE");
     expect(grant.target_kind).toBe("native_capsule");
     expect(grant).not.toHaveProperty("credential_binding_id");
-    expect(grant).toHaveProperty("maintenance_hold_receipt_digest", canonicalSha256(parseClosedJsonBytes(hold)));
+    expect(grant).toHaveProperty(
+      "maintenance_hold_receipt_digest",
+      canonicalDigest(parseClosedJsonBytes(hold)),
+    );
 
     await expect(value.issueMaintenanceGrant(
       issuanceRequest({ ...draft, credential_binding_id: IDS.grant3 }, hold, D1),
@@ -468,6 +522,74 @@ describe("native subscription and maintenance contract", () => {
       grant_jcs_base64url: Buffer.from(canonicalBytes(grant)).toString("base64url"),
       hold_receipt_jcs_base64url: Buffer.from(hold).toString("base64url"),
     }, transport({ authenticatedSenderKeyThumbprint: D3 }))).rejects.toMatchObject({ code: "FORBIDDEN" });
+  });
+
+  test("treats secret-like signature prefixes as evidence only across maintenance envelopes", async () => {
+    for (const prefix of SECRET_LIKE_SIGNATURE_PREFIXES) {
+      const signature = secretLikeSignature(prefix);
+      const delegate = new InMemoryCapsuleMaintenanceLedger();
+      const ledger: CapsuleMaintenanceLedger = {
+        reserve: (input) => delegate.reserve(input),
+        async consume(input) {
+          return {
+            status: "consumed",
+            consumeReceiptBytes: replaceTopLevelSignature(input.consumeReceiptBytes, signature),
+          };
+        },
+      };
+      const { accountsKeys, infinityKeys, value } = fixture(
+        ledger,
+        [IDS.grant1, IDS.consumeReceipt],
+      );
+      const draft = grantDraft();
+      const hold = heldReceiptBytes(draft, infinityKeys.privateKey);
+      const grant = await value.issueMaintenanceGrant(
+        issuanceRequest(draft, hold),
+        transport(),
+      );
+      const grantBytes = canonicalBytes(grant);
+
+      expect(
+        () => verifyCapsuleMaintenanceGrant(
+          replaceTopLevelSignature(grantBytes, signature),
+          {
+            issuer: "accounts-self-hosted",
+            issuerIncarnation: "accounts-incarnation-a",
+            keyId: "accounts-maintenance-key-a",
+            audience: "authcapsule-self-hosted",
+            publicKey: accountsKeys.publicKey,
+          },
+          NOW,
+        ),
+        `maintenance grant ${prefix}`,
+      ).toThrow(expect.objectContaining({ code: "FORBIDDEN" }));
+      expect(
+        () => verifyInfinityMaintenanceHeldReceipt(
+          replaceTopLevelSignature(hold, signature),
+          {
+            issuer: "infinity-self-hosted",
+            issuerIncarnation: "infinity-incarnation-a",
+            keyId: "infinity-hold-key-a",
+            audience: "accounts-self-hosted",
+            publicKey: infinityKeys.publicKey,
+            authorityEpoch: C1,
+          },
+          NOW,
+        ),
+        `Infinity HELD receipt ${prefix}`,
+      ).toThrow(expect.objectContaining({ code: "FORBIDDEN" }));
+
+      await expect(
+        value.consumeMaintenanceGrant({
+          schema_version: CAPSULE_MAINTENANCE_CONSUME_REQUEST_SCHEMA_VERSION,
+          account_lane_id: IDS.lane,
+          idempotency_key_digest: D1,
+          grant_jcs_base64url: Buffer.from(grantBytes).toString("base64url"),
+          hold_receipt_jcs_base64url: Buffer.from(hold).toString("base64url"),
+        }, transport()),
+        `maintenance consume receipt ${prefix}`,
+      ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    }
   });
 
   test("survives authority restart and rejects concurrent distinct live grants", async () => {

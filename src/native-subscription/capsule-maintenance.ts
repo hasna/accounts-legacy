@@ -9,7 +9,15 @@ import {
 import { AccountsError } from "./errors.js";
 import { parseCounter, type Counter } from "./counter.js";
 import { generateUuidV7, isUuidV7 } from "./ids.js";
-import { canonicalJson, canonicalSha256, parseClosedJsonBytes } from "./json.js";
+import {
+  canonicalJson,
+  canonicalJsonWithWireSchema,
+  canonicalSha256,
+  canonicalSha256WithWireSchema,
+  defineCanonicalJsonWireSchema,
+  parseClosedJsonBytes,
+  type CanonicalJsonWireSchema,
+} from "./json.js";
 
 export const CAPSULE_MAINTENANCE_GRANT_SCHEMA_VERSION =
   "accounts.capsule-maintenance/v1" as const;
@@ -27,6 +35,56 @@ export const INFINITY_MAINTENANCE_HELD_RECEIPT_SCHEMA_VERSION =
   "infinity.account-maintenance-hold-receipt/v1" as const;
 export const INFINITY_MAINTENANCE_HELD_RECEIPT_SCHEMA_DIGEST =
   "sha256:cf939104366bc82aaf820d6bae85703e3d326ac8454ab9d717d1febd2436e9ed" as const;
+
+export const CAPSULE_MAINTENANCE_GRANT_WIRE_SCHEMA =
+  defineCanonicalJsonWireSchema(
+    CAPSULE_MAINTENANCE_GRANT_SCHEMA_VERSION,
+    [
+      { path: ["signature"], encoding: "ed25519-signature" },
+    ],
+  );
+
+export const CAPSULE_MAINTENANCE_CONSUME_RECEIPT_WIRE_SCHEMA =
+  defineCanonicalJsonWireSchema(
+    CAPSULE_MAINTENANCE_CONSUME_RECEIPT_SCHEMA_VERSION,
+    [
+      { path: ["signature"], encoding: "ed25519-signature" },
+    ],
+  );
+
+export const INFINITY_MAINTENANCE_HELD_RECEIPT_WIRE_SCHEMA =
+  defineCanonicalJsonWireSchema(
+    INFINITY_MAINTENANCE_HELD_RECEIPT_SCHEMA_VERSION,
+    [
+      { path: ["signature"], encoding: "ed25519-signature" },
+    ],
+  );
+
+export function capsuleMaintenanceWireSchemaFor(
+  value: unknown,
+): CanonicalJsonWireSchema | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(value, "schema_version");
+  if (
+    descriptor === undefined ||
+    !descriptor.enumerable ||
+    !("value" in descriptor) ||
+    descriptor.get !== undefined ||
+    descriptor.set !== undefined
+  ) {
+    return undefined;
+  }
+  switch (descriptor.value) {
+    case CAPSULE_MAINTENANCE_GRANT_SCHEMA_VERSION:
+      return CAPSULE_MAINTENANCE_GRANT_WIRE_SCHEMA;
+    case CAPSULE_MAINTENANCE_CONSUME_RECEIPT_SCHEMA_VERSION:
+      return CAPSULE_MAINTENANCE_CONSUME_RECEIPT_WIRE_SCHEMA;
+    case INFINITY_MAINTENANCE_HELD_RECEIPT_SCHEMA_VERSION:
+      return INFINITY_MAINTENANCE_HELD_RECEIPT_WIRE_SCHEMA;
+    default:
+      return undefined;
+  }
+}
 
 export const CAPSULE_MAINTENANCE_GRANT_DESCRIPTOR = Object.freeze({
   action_effect_classes: Object.freeze({
@@ -1228,7 +1286,11 @@ function validateSignedEnvelope(value: JsonObject, trust: CapsuleMaintenanceTrus
 function parseCanonicalObject(source: Uint8Array, field: string): JsonObject {
   const parsed = parseClosedJsonBytes(source);
   const supplied = Buffer.from(source.buffer, source.byteOffset, source.byteLength);
-  if (!supplied.equals(Buffer.from(canonicalJson(parsed), "utf8"))) throw invalid(field);
+  const schema = capsuleMaintenanceWireSchemaFor(parsed);
+  const canonical = schema === undefined
+    ? canonicalJson(parsed)
+    : canonicalJsonWithWireSchema(parsed, schema);
+  if (!supplied.equals(Buffer.from(canonical, "utf8"))) throw invalid(field);
   return plainObject(parsed);
 }
 
@@ -1351,11 +1413,19 @@ function signCanonical(value: unknown, key: KeyLike): string {
 }
 
 function canonicalBytes(value: unknown): Uint8Array {
-  return Uint8Array.from(Buffer.from(canonicalJson(value), "utf8"));
+  const schema = capsuleMaintenanceWireSchemaFor(value);
+  return Uint8Array.from(Buffer.from(
+    schema === undefined ? canonicalJson(value) : canonicalJsonWithWireSchema(value, schema),
+    "utf8",
+  ));
 }
 
 function canonicalSha256Bytes(value: Uint8Array): string {
-  return canonicalSha256(parseClosedJsonBytes(value));
+  const parsed = parseClosedJsonBytes(value);
+  const schema = capsuleMaintenanceWireSchemaFor(parsed);
+  return schema === undefined
+    ? canonicalSha256(parsed)
+    : canonicalSha256WithWireSchema(parsed, schema);
 }
 
 function assertDescriptor(value: unknown, expected: string, label: string): void {
