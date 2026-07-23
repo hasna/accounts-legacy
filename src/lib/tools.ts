@@ -267,9 +267,9 @@ export function validatePermissionInputs(inputs: PermissionInputs): void {
  * constraining the value to today's built-in presets. Claude may add modes,
  * but a caller still must not use a native mode to override another source.
  */
-function validateClaudePermissionModeInputs(inputs: PermissionInputs): void {
+function validateClaudePermissionModeInputs(inputs: PermissionInputs): string | undefined {
   const passthroughArgs = inputs.passthroughArgs ?? [];
-  let nativeModeOccurrences = 0;
+  const nativeModes: string[] = [];
   for (let index = 0; index < passthroughArgs.length; index += 1) {
     const arg = passthroughArgs[index]!;
     if (arg === CLAUDE_PERMISSION_MODE_ARG) {
@@ -277,21 +277,23 @@ function validateClaudePermissionModeInputs(inputs: PermissionInputs): void {
       if (!value?.trim() || value.startsWith("-")) {
         throw new AccountsError(`${CLAUDE_PERMISSION_MODE_ARG} requires a value`);
       }
-      nativeModeOccurrences += 1;
+      nativeModes.push(value);
       index += 1;
       continue;
     }
     if (arg.startsWith(`${CLAUDE_PERMISSION_MODE_ARG}=`)) {
-      if (!arg.slice(CLAUDE_PERMISSION_MODE_ARG.length + 1).trim()) {
+      const value = arg.slice(CLAUDE_PERMISSION_MODE_ARG.length + 1);
+      if (!value.trim()) {
         throw new AccountsError(`${CLAUDE_PERMISSION_MODE_ARG} requires a value`);
       }
-      nativeModeOccurrences += 1;
+      nativeModes.push(value);
     }
   }
-  if (nativeModeOccurrences > 1) {
+  if (nativeModes.length > 1) {
     throw new AccountsError("--permissions may be supplied only once");
   }
-  if (nativeModeOccurrences === 0) return;
+  const nativeMode = nativeModes[0];
+  if (!nativeMode) return undefined;
 
   const hasOtherSource =
     Boolean(inputs.permissions) ||
@@ -307,6 +309,7 @@ function validateClaudePermissionModeInputs(inputs: PermissionInputs): void {
       `${CLAUDE_PERMISSION_MODE_ARG} cannot be combined with another permission source`,
     );
   }
+  return nativeMode;
 }
 
 /** Reject duplicate Accounts/native permission switches directly from argv. */
@@ -385,14 +388,26 @@ function includesArgVector(args: readonly string[], vector: readonly string[]): 
 export function mergeToolArgs(tool: ToolDef, args: string[], opts: ToolArgOptions = {}): string[] {
   const launchArgs = launchArgsFor(tool, opts.profile).filter((arg) => !args.includes(arg));
   const configuredPermissionArgs = permissionArgsFor(tool, opts.permissions);
+  let hasConfiguredPermissionArgs = includesArgVector(args, configuredPermissionArgs);
+  let claudePermissionMode: string | undefined;
+  let configuredClaudePermissionMode: string | undefined;
   if (tool.id === "claude") {
     validatePermissionInputs({ passthroughArgs: args });
-    validateClaudePermissionModeInputs({ passthroughArgs: args });
+    claudePermissionMode = validateClaudePermissionModeInputs({ passthroughArgs: args });
+    configuredClaudePermissionMode = validateClaudePermissionModeInputs({
+      passthroughArgs: configuredPermissionArgs,
+    });
   }
   if (tool.id === "claude" && opts.permissions) {
+    const hasEquivalentNativeMode =
+      claudePermissionMode !== undefined &&
+      configuredClaudePermissionMode !== undefined &&
+      normalizePermissionPreset(claudePermissionMode) ===
+        normalizePermissionPreset(configuredClaudePermissionMode);
+    hasConfiguredPermissionArgs ||= hasEquivalentNativeMode;
     if (
       configuredPermissionArgs.length > 0 &&
-      includesArgVector(args, configuredPermissionArgs)
+      hasConfiguredPermissionArgs
     ) {
       // Preserve the public helper's compatibility behavior for an explicitly
       // repeated equivalent mode while still rejecting a second native source.
@@ -405,7 +420,7 @@ export function mergeToolArgs(tool: ToolDef, args: string[], opts: ToolArgOption
       });
     }
   }
-  const permissionArgs = includesArgVector(args, configuredPermissionArgs) ? [] : configuredPermissionArgs;
+  const permissionArgs = hasConfiguredPermissionArgs ? [] : configuredPermissionArgs;
   return [...permissionArgs, ...launchArgs, ...args];
 }
 

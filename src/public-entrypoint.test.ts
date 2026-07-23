@@ -4,11 +4,13 @@ import { AccountsError, getTool, mergeToolArgs } from "./index.js";
 test("public mergeToolArgs rejects conflicting Claude permission modes", () => {
   const claude = getTool("claude");
 
-  for (const args of [
-    ["--permission-mode", "bypassPermissions"],
-    ["--permission-mode=bypassPermissions"],
-  ]) {
-    expect(() => mergeToolArgs(claude, args, { permissions: "plan" })).toThrow(AccountsError);
+  for (const [permissions, args] of [
+    ["plan", ["--permission-mode", "bypassPermissions"]],
+    ["plan", ["--permission-mode=bypassPermissions"]],
+    ["bypass", ["--permission-mode", "plan"]],
+    ["bypass", ["--permission-mode=plan"]],
+  ] as const) {
+    expect(() => mergeToolArgs(claude, [...args], { permissions })).toThrow(AccountsError);
   }
 });
 
@@ -45,10 +47,14 @@ test("public mergeToolArgs preserves coherent Claude permission sources", () => 
   ]) {
     expect(mergeToolArgs(claude, args)).toEqual(args);
   }
-  expect(mergeToolArgs(claude, ["--permission-mode", "plan"], { permissions: "plan" })).toEqual([
-    "--permission-mode",
-    "plan",
-  ]);
+  for (const [permissions, args] of [
+    ["plan", ["--permission-mode", "plan"]],
+    ["plan", ["--permission-mode=plan"]],
+    ["bypass", ["--permission-mode", "bypassPermissions"]],
+    ["bypass", ["--permission-mode=bypassPermissions"]],
+  ] as const) {
+    expect(mergeToolArgs(claude, [...args], { permissions })).toEqual(args);
+  }
 });
 
 test("public mergeToolArgs leaves Claude-style permission args unchanged for other tools", () => {
