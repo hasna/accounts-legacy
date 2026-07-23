@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { deserialize, serialize } from "node:v8";
 
 let home: string;
 let binDir: string;
@@ -76,6 +78,55 @@ async function waitFor(read: () => boolean, timeoutMs = 4_000): Promise<void> {
     await Bun.sleep(20);
   }
   throw new Error("timed out waiting for fake login process");
+}
+
+function recoveryHookFile(
+  directory: string,
+  role: string,
+  stage: string,
+  suffix: "ready" | "release",
+  journalId = "batch",
+): string {
+  return join(directory, `${role}.${stage}.${journalId}.${suffix}`);
+}
+
+function releaseRecoveryHook(
+  directory: string,
+  role: string,
+  stage: string,
+  journalId = "batch",
+): void {
+  writeFileSync(recoveryHookFile(directory, role, stage, "release", journalId), "release");
+}
+
+async function waitForRecoveryHook(
+  directory: string,
+  role: string,
+  stage: string,
+  journalId = "batch",
+): Promise<void> {
+  await waitFor(
+    () => existsSync(recoveryHookFile(directory, role, stage, "ready", journalId)),
+    12_000,
+  );
+}
+
+function recoveryJournalIds(): string[] {
+  const directory = join(home, "login-finalization-journals");
+  if (!existsSync(directory)) return [];
+  return readdirSync(directory)
+    .filter((name) => name.endsWith(".bin"))
+    .map((name) => name.slice(0, -4))
+    .sort();
+}
+
+function readRecoveryJournal(id: string): {
+  ownerPid: number;
+  finalizationState: { writes: { keychainLockToken?: string } };
+} {
+  return deserialize(
+    readFileSync(join(home, "login-finalization-journals", `${id}.bin`)),
+  );
 }
 
 function runCli(...args: string[]) {
@@ -1276,6 +1327,253 @@ for (const crashPoint of ["pre-save", "post-apply", "post-finalize"] as const) {
     expect(existsSync(journalDir) ? readdirSync(journalDir) : []).toEqual([]);
   }, HARD_DEATH_RECOVERY_TEST_TIMEOUT_MS);
 }
+
+test("concurrent recovery publishes lock ownership only after its exclusive profile claim", async () => {
+  const fixture = setupClaudeLogin("success");
+  const crashed = runCliWith(["login", "acct", "--tool", "claude"], {
+    env: {
+      ...fixture.env,
+      ACCOUNTS_TEST_LOGIN_HARD_CRASH_POINT: "post-finalize",
+    },
+  });
+  expect(crashed.signal).toBe("SIGKILL");
+  const [journalId] = recoveryJournalIds();
+  expect(journalId).toBeTruthy();
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude", 23);
+  const hookDirectory = join(home, "recovery-hooks-ownership");
+  const commonEnv = {
+    ...fixture.env,
+    ACCOUNTS_TEST_LOGIN_RECOVERY_HOOK_DIR: hookDirectory,
+    ACCOUNTS_TEST_LOGIN_RECOVERY_PAUSE_STAGES:
+      "after-read,before-profile-claim",
+  };
+  const recoveryA = spawnCliWith(["login", "acct", "--tool", "claude"], {
+    env: {
+      ...commonEnv,
+      ACCOUNTS_TEST_LOGIN_RECOVERY_ROLE: "a",
+      ACCOUNTS_TEST_LOGIN_RECOVERY_PAUSE_STAGES:
+        "after-read,before-profile-claim,after-keychain-claim",
+    },
+  });
+  const resultA = collect(recoveryA);
+  const recoveryB = spawnCliWith(["login", "acct", "--tool", "claude"], {
+    env: {
+      ...commonEnv,
+      ACCOUNTS_TEST_LOGIN_RECOVERY_ROLE: "b",
+    },
+  });
+  const resultB = collect(recoveryB);
+
+  await waitForRecoveryHook(hookDirectory, "a", "after-read");
+  await waitForRecoveryHook(hookDirectory, "b", "after-read");
+  releaseRecoveryHook(hookDirectory, "a", "after-read");
+  await waitForRecoveryHook(hookDirectory, "a", "before-profile-claim", journalId);
+  releaseRecoveryHook(hookDirectory, "b", "after-read");
+  await waitForRecoveryHook(hookDirectory, "b", "before-profile-claim", journalId);
+  releaseRecoveryHook(hookDirectory, "a", "before-profile-claim", journalId);
+  await waitForRecoveryHook(hookDirectory, "a", "after-keychain-claim", journalId);
+  releaseRecoveryHook(hookDirectory, "b", "before-profile-claim", journalId);
+
+  recoveryA.kill("SIGKILL");
+  const killedA = await resultA;
+  const failedB = await resultB;
+  const durable = readRecoveryJournal(journalId);
+  const restarted = runCliWith(["login", "acct", "--tool", "claude"], {
+    env: fixture.env,
+  });
+
+  expect(killedA.signal).toBe("SIGKILL");
+  expect(failedB.code).toBe(1);
+  expect(durable.ownerPid).toBe(recoveryA.pid);
+  expect(durable.finalizationState.writes.keychainLockToken)
+    .toMatch(new RegExp(`^${recoveryA.pid}:`));
+  expect(restarted.status).toBe(23);
+  expect(restarted.stderr).toBe("");
+  expect(recoveryJournalIds()).toEqual([]);
+  expect(existsSync(fixture.keychainLock)).toBe(false);
+}, HARD_DEATH_RECOVERY_TEST_TIMEOUT_MS);
+
+test("a recovery waiter re-reads a cleared journal instead of replaying stale state", async () => {
+  const fixture = setupClaudeLogin("success");
+  const crashed = runCliWith(["login", "acct", "--tool", "claude"], {
+    env: {
+      ...fixture.env,
+      ACCOUNTS_TEST_LOGIN_HARD_CRASH_POINT: "post-finalize",
+    },
+  });
+  expect(crashed.signal).toBe("SIGKILL");
+  const [journalId] = recoveryJournalIds();
+  expect(journalId).toBeTruthy();
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude", 23);
+  const hookDirectory = join(home, "recovery-hooks-reread");
+  const commonEnv = {
+    ...fixture.env,
+    ACCOUNTS_TEST_LOGIN_RECOVERY_HOOK_DIR: hookDirectory,
+    ACCOUNTS_TEST_LOGIN_RECOVERY_PAUSE_STAGES:
+      "after-read,before-profile-claim",
+  };
+  const recoveryA = spawnCliWith(["login", "acct", "--tool", "claude"], {
+    env: {
+      ...commonEnv,
+      ACCOUNTS_TEST_LOGIN_RECOVERY_ROLE: "a",
+      ACCOUNTS_TEST_LOGIN_RECOVERY_PAUSE_STAGES:
+        "after-read,before-profile-claim,before-replay",
+    },
+  });
+  const resultA = collect(recoveryA);
+  const recoveryB = spawnCliWith(["login", "acct", "--tool", "claude"], {
+    env: {
+      ...commonEnv,
+      ACCOUNTS_TEST_LOGIN_RECOVERY_ROLE: "b",
+      ACCOUNTS_TEST_LOGIN_RECOVERY_PAUSE_STAGES:
+        "after-read,before-profile-claim,after-profile-claim",
+    },
+  });
+  const resultB = collect(recoveryB);
+
+  await waitForRecoveryHook(hookDirectory, "a", "after-read");
+  await waitForRecoveryHook(hookDirectory, "b", "after-read");
+  releaseRecoveryHook(hookDirectory, "a", "after-read");
+  await waitForRecoveryHook(hookDirectory, "a", "before-profile-claim", journalId);
+  releaseRecoveryHook(hookDirectory, "b", "after-read");
+  await waitForRecoveryHook(hookDirectory, "b", "before-profile-claim", journalId);
+  releaseRecoveryHook(hookDirectory, "a", "before-profile-claim", journalId);
+  await waitForRecoveryHook(hookDirectory, "a", "before-replay", journalId);
+  releaseRecoveryHook(hookDirectory, "b", "before-profile-claim", journalId);
+  releaseRecoveryHook(hookDirectory, "a", "before-replay", journalId);
+  await waitForRecoveryHook(hookDirectory, "b", "after-profile-claim", journalId);
+
+  writeFileSync(
+    fixture.keychainState,
+    JSON.stringify({ account: "successor", secret: "successor-secret" }),
+    { mode: 0o600 },
+  );
+  releaseRecoveryHook(hookDirectory, "b", "after-profile-claim", journalId);
+  const [completedA, completedB] = await Promise.all([resultA, resultB]);
+
+  expect(completedA.stderr).toBe("");
+  expect(completedB.stderr).toBe("");
+  expect(completedA.code).toBe(23);
+  expect(completedB.code).toBe(23);
+  expect(JSON.parse(readFileSync(fixture.keychainState, "utf8"))).toEqual({
+    account: "successor",
+    secret: "successor-secret",
+  });
+  expect(recoveryJournalIds()).toEqual([]);
+}, HARD_DEATH_RECOVERY_TEST_TIMEOUT_MS);
+
+test("independent dead recovery journals still proceed under separate claims", () => {
+  const fixture = setupClaudeLogin("success");
+  const crashed = runCliWith(["login", "acct", "--tool", "claude"], {
+    env: {
+      ...fixture.env,
+      ACCOUNTS_TEST_LOGIN_HARD_CRASH_POINT: "post-finalize",
+    },
+  });
+  expect(crashed.signal).toBe("SIGKILL");
+  const [firstId] = recoveryJournalIds();
+  expect(firstId).toBeTruthy();
+  const secondId = randomUUID();
+  const duplicate = deserialize(
+    readFileSync(
+      join(home, "login-finalization-journals", `${firstId}.bin`),
+    ),
+  ) as { id: string };
+  duplicate.id = secondId;
+  writeFileSync(
+    join(home, "login-finalization-journals", `${secondId}.bin`),
+    serialize(duplicate),
+    { mode: 0o600 },
+  );
+  writeFakeTool("claude", "CLAUDE_CONFIG_DIR", "claude", 23);
+
+  const recovered = runCliWith(["login", "acct", "--tool", "claude"], {
+    env: fixture.env,
+  });
+
+  expect(recovered.status).toBe(23);
+  expect(recovered.stderr).toBe("");
+  expect(recoveryJournalIds()).toEqual([]);
+  expect(JSON.parse(readFileSync(fixture.keychainState, "utf8"))).toEqual({
+    account: "prior",
+    secret: "prior-secret",
+  });
+}, HARD_DEATH_RECOVERY_TEST_TIMEOUT_MS);
+
+test("non-Claude recovery waiters also skip a winner-cleared journal", async () => {
+  writeFakeTool("fake-login-tool", "FAKE_LOGIN_HOME", "fake-login");
+  addFakeLoginTool();
+  expect(runCli("add", "prior", "--tool", "fake-login").status).toBe(0);
+  expect(runCli("add", "acct", "--tool", "fake-login").status).toBe(0);
+  expect(runCli("use", "prior", "--tool", "fake-login").status).toBe(0);
+  const crashed = runCliWith(["login", "acct", "--tool", "fake-login"], {
+    env: {
+      ACCOUNTS_TEST_LOGIN_HARD_CRASH_POINT: "post-finalize",
+    },
+  });
+  expect(crashed.signal).toBe("SIGKILL");
+  const [journalId] = recoveryJournalIds();
+  expect(journalId).toBeTruthy();
+  writeFakeTool("fake-login-tool", "FAKE_LOGIN_HOME", "fake-login", 23);
+  const hookDirectory = join(home, "recovery-hooks-non-claude");
+  const commonEnv = {
+    ACCOUNTS_TEST_LOGIN_RECOVERY_HOOK_DIR: hookDirectory,
+    ACCOUNTS_TEST_LOGIN_RECOVERY_PAUSE_STAGES:
+      "after-read,before-profile-claim",
+  };
+  const recoveryA = spawnCliWith(["login", "acct", "--tool", "fake-login"], {
+    env: {
+      ...commonEnv,
+      ACCOUNTS_TEST_LOGIN_RECOVERY_ROLE: "a",
+      ACCOUNTS_TEST_LOGIN_RECOVERY_PAUSE_STAGES:
+        "after-read,before-profile-claim,before-replay",
+    },
+  });
+  const resultA = collect(recoveryA);
+  const recoveryB = spawnCliWith(["login", "acct", "--tool", "fake-login"], {
+    env: {
+      ...commonEnv,
+      ACCOUNTS_TEST_LOGIN_RECOVERY_ROLE: "b",
+      ACCOUNTS_TEST_LOGIN_RECOVERY_PAUSE_STAGES:
+        "after-read,before-profile-claim,after-profile-claim",
+    },
+  });
+  const resultB = collect(recoveryB);
+
+  await waitForRecoveryHook(hookDirectory, "a", "after-read");
+  await waitForRecoveryHook(hookDirectory, "b", "after-read");
+  releaseRecoveryHook(hookDirectory, "a", "after-read");
+  await waitForRecoveryHook(hookDirectory, "a", "before-profile-claim", journalId);
+  releaseRecoveryHook(hookDirectory, "b", "after-read");
+  await waitForRecoveryHook(hookDirectory, "b", "before-profile-claim", journalId);
+  releaseRecoveryHook(hookDirectory, "a", "before-profile-claim", journalId);
+  await waitForRecoveryHook(hookDirectory, "a", "before-replay", journalId);
+  releaseRecoveryHook(hookDirectory, "b", "before-profile-claim", journalId);
+  releaseRecoveryHook(hookDirectory, "a", "before-replay", journalId);
+  await waitForRecoveryHook(hookDirectory, "b", "after-profile-claim", journalId);
+  releaseRecoveryHook(hookDirectory, "b", "after-profile-claim", journalId);
+  const [completedA, completedB] = await Promise.all([resultA, resultB]);
+
+  expect(completedA.stderr).toBe("");
+  expect(completedA.code).toBe(23);
+  expect(completedB.code).toBe(1);
+  expect(completedB.stderr).toContain(
+    'login preparation is still in progress for profile "acct" and tool "fake-login"',
+  );
+  expect(
+    existsSync(
+      recoveryHookFile(
+        hookDirectory,
+        "b",
+        "before-replay",
+        "ready",
+        journalId,
+      ),
+    ),
+  ).toBe(false);
+  expect(recoveryJournalIds()).toEqual([]);
+  expect(readStore().current?.["fake-login"]).toBe("prior");
+}, HARD_DEATH_RECOVERY_TEST_TIMEOUT_MS);
 
 test("committed hard-death replay finishes immutable auth retention before clearing its journal", () => {
   const fixture = setupClaudeLogin("success");

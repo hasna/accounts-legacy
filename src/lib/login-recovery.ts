@@ -326,6 +326,39 @@ function validateJournal(value: unknown, expectedId: string): LoginRecoveryJourn
   return journal as LoginRecoveryJournal;
 }
 
+function readLoginRecoveryJournalFile(id: string): LoginRecoveryJournal | undefined {
+  const path = journalPath(id);
+  assertSafeWritePath(path, { mustStayUnder: accountsHome() });
+  let file: ReturnType<typeof lstatSync>;
+  try {
+    file = lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+  if (!file.isFile() || file.isSymbolicLink() || (file.mode & 0o077) !== 0) {
+    throw new AccountsError("unsafe login recovery journal permissions");
+  }
+  let decoded: unknown;
+  try {
+    decoded = reviveBuffers(deserialize(readFileSync(path)));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new AccountsError(`invalid login recovery journal: ${String(error)}`);
+  }
+  return validateJournal(decoded, id);
+}
+
+/** Read one exact journal regardless of whether its recorded owner is live. */
+export function readLoginRecoveryJournal(id: string): LoginRecoveryJournal | undefined {
+  return readLoginRecoveryJournalFile(id);
+}
+
+/** Stable byte-level identity for detecting replacement or mutation after a wait. */
+export function loginRecoveryJournalFingerprint(journal: LoginRecoveryJournal): string {
+  return createHash("sha256").update(serialize(journal)).digest("hex");
+}
+
 function reviveBuffers(value: unknown): unknown {
   if (value instanceof Uint8Array && !Buffer.isBuffer(value)) return Buffer.from(value);
   if (Array.isArray(value)) return value.map(reviveBuffers);
@@ -369,23 +402,21 @@ export function readRecoverableLoginJournals(): LoginRecoveryJournal[] {
   const journals: LoginRecoveryJournal[] = [];
   for (const name of readdirSync(directory).sort()) {
     if (!JOURNAL_NAME.test(name)) continue;
-    const path = join(directory, name);
-    assertSafeWritePath(path, { mustStayUnder: accountsHome() });
-    const file = lstatSync(path);
-    if (!file.isFile() || file.isSymbolicLink() || (file.mode & 0o077) !== 0) {
-      throw new AccountsError("unsafe login recovery journal permissions");
-    }
     const id = name.slice(0, -4);
-    let decoded: unknown;
-    try {
-      decoded = reviveBuffers(deserialize(readFileSync(path)));
-    } catch (error) {
-      throw new AccountsError(`invalid login recovery journal: ${String(error)}`);
-    }
-    const journal = validateJournal(decoded, id);
+    const journal = readLoginRecoveryJournalFile(id);
+    if (!journal) continue;
     if (!ownerIsLive(journal.ownerPid, journal.ownerProcessStartId)) journals.push(journal);
   }
   return journals;
+}
+
+/** Re-read one journal only if its exact recorded owner is still provably dead. */
+export function readRecoverableLoginJournal(id: string): LoginRecoveryJournal | undefined {
+  const journal = readLoginRecoveryJournalFile(id);
+  if (!journal) return undefined;
+  return ownerIsLive(journal.ownerPid, journal.ownerProcessStartId)
+    ? undefined
+    : journal;
 }
 
 export function readRecoverableLoginLeaseIntents(): LoginLeaseRecoveryIntent[] {
@@ -479,6 +510,37 @@ function releaseAbandonedLeaseIntentLocks(intent: LoginLeaseRecoveryIntent): voi
     intent.profileLockToken,
     intent.ownerPid,
     intent.ownerProcessStartId,
+  );
+}
+
+/** Verify that this process still owns both the durable intent and exact profile lock. */
+export function ownsLoginRecoveryProfileClaim(
+  intentId: string,
+  profileDir: string,
+  profileLockToken: string,
+): boolean {
+  const path = leasePath(intentId);
+  if (!existsSync(path)) return false;
+  const file = lstatSync(path);
+  if (!file.isFile() || file.isSymbolicLink() || (file.mode & 0o077) !== 0) {
+    throw new AccountsError("unsafe login lease recovery intent");
+  }
+  const value = deserialize(readFileSync(path)) as Partial<LoginLeaseRecoveryIntent>;
+  if (
+    value.version !== JOURNAL_VERSION ||
+    value.id !== intentId ||
+    value.ownerPid !== process.pid ||
+    value.ownerProcessStartId !== currentProcessStartId ||
+    resolve(value.profileDir ?? "") !== resolve(profileDir) ||
+    value.profileLockToken !== profileLockToken
+  ) {
+    return false;
+  }
+  return Boolean(
+    observeExactProcessLock(
+      abandonedProfileLoginLockPath(profileDir),
+      profileLockToken,
+    ),
   );
 }
 

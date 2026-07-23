@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -57,7 +57,11 @@ import {
   createLoginLeaseRecoveryIntent,
   createLoginRecoveryJournal,
   loginRecoveryStoreAuthority,
+  loginRecoveryJournalFingerprint,
+  ownsLoginRecoveryProfileClaim,
   persistLoginRecoveryJournal,
+  readLoginRecoveryJournal,
+  readRecoverableLoginJournal,
   readRecoverableLoginJournals,
   recoverAbandonedLoginLeaseIntents,
   releaseAbandonedLoginJournalLocks,
@@ -114,10 +118,33 @@ function loginStoreAuthority(store: AccountsStore): string {
   );
 }
 
+async function loginRecoveryTestHook(
+  stage: string,
+  journalId = "batch",
+): Promise<void> {
+  if (process.env.NODE_ENV !== "test") return;
+  const directory = process.env.ACCOUNTS_TEST_LOGIN_RECOVERY_HOOK_DIR;
+  const role = process.env.ACCOUNTS_TEST_LOGIN_RECOVERY_ROLE;
+  if (!directory || !role) return;
+  mkdirSync(directory, { recursive: true });
+  const prefix = join(directory, `${role}.${stage}.${journalId}`);
+  writeFileSync(`${prefix}.ready`, "ready");
+  const paused = new Set(
+    (process.env.ACCOUNTS_TEST_LOGIN_RECOVERY_PAUSE_STAGES ?? "")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean),
+  );
+  if (paused.has(stage)) {
+    while (!existsSync(`${prefix}.release`)) await Bun.sleep(10);
+  }
+}
+
 async function recoverInterruptedLoginFinalizations(store: AccountsStore): Promise<void> {
   recoverAbandonedLoginLeaseIntents();
   const authority = loginStoreAuthority(store);
   const journals = readRecoverableLoginJournals();
+  await loginRecoveryTestHook("after-read");
   for (const journal of journals) {
     if (journal.transport !== store.transport || journal.storeAuthority !== authority) {
       throw new AccountsError(
@@ -137,65 +164,169 @@ async function recoverInterruptedLoginFinalizations(store: AccountsStore): Promi
     let releaseProfileLease: (() => void) | undefined;
     let releaseKeychainLease: (() => void) | undefined;
     let recoveryProfileLeaseIntentId: string | undefined;
-    let replayComplete = false;
+    let recoveryProfileLockToken: string | undefined;
+    let claimedJournalFingerprint: string | undefined;
+    let replayJournal = journal;
     try {
-      if (journal.preparation.tool.id === "claude") {
-        // Rebind recovery to this process with fresh exact tokens before any
-        // acquisition. A second hard death can therefore be recovered by CAS.
-        journal.finalizationState.writes.keychainLockToken =
-          createClaudeProcessLockToken();
-        journal.finalizationState.writes.applyLockToken = createApplyLockToken();
-        persistLoginRecoveryJournal(
-          journal.id,
-          journal.preparation,
-          journal.finalizationState,
-          journal.priorKeychain,
-          journal.keychainCaptured,
-          journal.transport,
-          journal.storeAuthority,
-          journal.phase,
-        );
-        const profileLockToken = createClaudeProcessLockToken();
-        const recoveryIntent = createLoginLeaseRecoveryIntent(
-          journal.preparation.profile.dir,
-          profileLockToken,
-        );
-        recoveryProfileLeaseIntentId = recoveryIntent.id;
-        releaseProfileLease = await acquireClaudeProfileLoginLock(
-          journal.preparation.profile.dir,
-          undefined,
-          profileLockToken,
-        );
-        if (keychainSupported()) {
-          releaseKeychainLease = await acquireClaudeKeychainLock(
-            undefined,
-            journal.finalizationState.writes.keychainLockToken,
-          );
-        }
+      await loginRecoveryTestHook("before-profile-claim", journal.id);
+      const profileLockToken = createClaudeProcessLockToken();
+      recoveryProfileLockToken = profileLockToken;
+      const recoveryIntent = createLoginLeaseRecoveryIntent(
+        journal.preparation.profile.dir,
+        profileLockToken,
+      );
+      recoveryProfileLeaseIntentId = recoveryIntent.id;
+      releaseProfileLease = await acquireClaudeProfileLoginLock(
+        journal.preparation.profile.dir,
+        undefined,
+        profileLockToken,
+      );
+      await loginRecoveryTestHook("after-profile-claim", journal.id);
+
+      // Every tool's journal is serialized by the same durable profile claim.
+      // Re-read only after any wait, and do not rebind if a winner already
+      // cleared or replaced the dead journal while this process was waiting.
+      const current = readRecoverableLoginJournal(journal.id);
+      if (
+        !current ||
+        loginRecoveryJournalFingerprint(current) !==
+          loginRecoveryJournalFingerprint(journal)
+      ) {
+        continue;
       }
-      if (journal.phase === "rollback") {
-        await rollbackLoginFinalization(journal.finalizationState, store);
-        await rollbackLoginPreparation(
-          journal.preparation,
-          store,
-          journal.finalizationState.profileClaudeIdentityRevision,
-          journal.finalizationState.profileClaudeCommitRevision,
+      if (
+        current.transport !== store.transport ||
+        current.storeAuthority !== authority
+      ) {
+        throw new AccountsError(
+          "interrupted login belongs to a different Accounts storage authority; refusing recovery",
         );
-        if (journal.keychainCaptured) restoreClaudeKeychain(journal.priorKeychain);
+      }
+      if (
+        !ownsLoginRecoveryProfileClaim(
+          recoveryIntent.id,
+          current.preparation.profile.dir,
+          profileLockToken,
+        )
+      ) {
+        throw new AccountsError(
+          "lost the exclusive login recovery profile claim before rebinding",
+        );
+      }
+
+      // Only the exclusive claimant may publish fresh exact lock ownership.
+      if (current.finalizationState.writes.keychainLockToken !== undefined) {
+        current.finalizationState.writes.keychainLockToken =
+          createClaudeProcessLockToken();
+      }
+      if (current.finalizationState.writes.applyLockToken !== undefined) {
+        current.finalizationState.writes.applyLockToken = createApplyLockToken();
+      }
+      persistLoginRecoveryJournal(
+        current.id,
+        current.preparation,
+        current.finalizationState,
+        current.priorKeychain,
+        current.keychainCaptured,
+        current.transport,
+        current.storeAuthority,
+        current.phase,
+      );
+      const claimed = readLoginRecoveryJournal(current.id);
+      if (
+        !claimed ||
+        claimed.ownerPid !== process.pid ||
+        (current.finalizationState.writes.keychainLockToken !== undefined &&
+          claimed.finalizationState.writes.keychainLockToken !==
+            current.finalizationState.writes.keychainLockToken) ||
+        (current.finalizationState.writes.applyLockToken !== undefined &&
+          claimed.finalizationState.writes.applyLockToken !==
+            current.finalizationState.writes.applyLockToken) ||
+        !ownsLoginRecoveryProfileClaim(
+          recoveryIntent.id,
+          claimed.preparation.profile.dir,
+          profileLockToken,
+        )
+      ) {
+        throw new AccountsError(
+          "lost exact login recovery journal ownership after rebinding",
+        );
+      }
+      claimedJournalFingerprint = loginRecoveryJournalFingerprint(claimed);
+      if (
+        claimed.preparation.tool.id === "claude" &&
+        keychainSupported()
+      ) {
+        releaseKeychainLease = await acquireClaudeKeychainLock(
+          undefined,
+          claimed.finalizationState.writes.keychainLockToken,
+        );
+      }
+      await loginRecoveryTestHook("after-keychain-claim", journal.id);
+
+      // Claim acquisition (and Claude keychain acquisition) may wait. Re-read
+      // both the journal and durable profile claim immediately before replay.
+      const beforeReplay = readLoginRecoveryJournal(claimed.id);
+      if (
+        !beforeReplay ||
+        loginRecoveryJournalFingerprint(beforeReplay) !==
+          claimedJournalFingerprint ||
+        !ownsLoginRecoveryProfileClaim(
+          recoveryIntent.id,
+          beforeReplay.preparation.profile.dir,
+          profileLockToken,
+        )
+      ) {
+        throw new AccountsError(
+          "lost exact login recovery ownership while waiting to replay",
+        );
+      }
+      replayJournal = beforeReplay;
+      await loginRecoveryTestHook("before-replay", journal.id);
+      if (replayJournal.phase === "rollback") {
+        await rollbackLoginFinalization(replayJournal.finalizationState, store);
+        await rollbackLoginPreparation(
+          replayJournal.preparation,
+          store,
+          replayJournal.finalizationState.profileClaudeIdentityRevision,
+          replayJournal.finalizationState.profileClaudeCommitRevision,
+        );
+        if (replayJournal.keychainCaptured) {
+          restoreClaudeKeychain(replayJournal.priorKeychain);
+        }
       } else {
-        await commitLoginFinalization(journal.finalizationState);
-        commitLoginPreparation(journal.preparation, store);
-        const operationId = journal.finalizationState.writes.currentOperationId;
+        await commitLoginFinalization(replayJournal.finalizationState);
+        commitLoginPreparation(replayJournal.preparation, store);
+        const operationId =
+          replayJournal.finalizationState.writes.currentOperationId;
         if (operationId) await store.commitLoginOperation?.(operationId);
       }
-      replayComplete = true;
+      const beforeClear = readLoginRecoveryJournal(replayJournal.id);
+      if (
+        !beforeClear ||
+        loginRecoveryJournalFingerprint(beforeClear) !==
+          claimedJournalFingerprint ||
+        !recoveryProfileLeaseIntentId ||
+        !recoveryProfileLockToken ||
+        !ownsLoginRecoveryProfileClaim(
+          recoveryProfileLeaseIntentId,
+          beforeClear.preparation.profile.dir,
+          recoveryProfileLockToken,
+        )
+      ) {
+        throw new AccountsError(
+          "lost exact login recovery ownership before journal cleanup",
+        );
+      }
+      // Clear while the profile claim is still held, so a waiter can only see
+      // a missing journal and can never replay the winner's stale snapshot.
+      clearLoginRecoveryJournal(replayJournal.id);
     } finally {
       releaseKeychainLease?.();
       releaseProfileLease?.();
       if (recoveryProfileLeaseIntentId) {
         clearLoginLeaseRecoveryIntent(recoveryProfileLeaseIntentId);
       }
-      if (replayComplete) clearLoginRecoveryJournal(journal.id);
     }
   }
 }
