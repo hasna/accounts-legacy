@@ -161,8 +161,55 @@ Implementation details: [docs/IMPLEMENT.md](docs/IMPLEMENT.md).
 | `accounts health` (`readiness`) | Print the sanitized account/provider readiness contract. Use `--json` for automation. |
 | `accounts detect <name>` | Re-detect email from config dir. |
 | `accounts doctor` | Check registry and dirs (exits 1 on errors). |
+| `accounts-serve` | Start the Bun HTTP API for the cloud storage mode. Supports `--port`, `--host`, public probes, and authenticated `/v1` account routes. |
+| `accounts-migrate` | Check or apply the cloud Postgres schema migrations. Use `--dry-run` to print the pending migration plan without mutating the database. |
 
 See `accounts --help` for `set`, `rename`, `remove`, `tools`, etc.
+
+## Cloud Runtime Entrypoints
+
+The published package also includes two operator entrypoints for the
+Postgres-backed API runtime. They are separate from the local-first `accounts`
+CLI and are intended for service deployments, one-shot migration jobs, and local
+ops against the same cloud storage mode.
+
+Start the HTTP service with:
+
+```bash
+HASNA_ACCOUNTS_STORAGE_MODE=cloud \
+HASNA_ACCOUNTS_DATABASE_URL=postgres://... \
+HASNA_ACCOUNTS_API_SIGNING_KEY=... \
+accounts-serve --port 8080 --host 0.0.0.0
+```
+
+`accounts-serve` runs on Bun. It reads `PORT` or `ACCOUNTS_SERVE_PORT` when
+`--port` is omitted, defaults to port `8080`, and defaults to host `0.0.0.0`.
+It requires `HASNA_ACCOUNTS_STORAGE_MODE=cloud`,
+`HASNA_ACCOUNTS_DATABASE_URL`, and an API signing key from
+`HASNA_ACCOUNTS_API_SIGNING_KEY` or the shared `HASNA_API_SIGNING_KEY` fallback.
+
+The public probes are:
+
+- `GET /health` — database reachability and package version.
+- `GET /ready` — database reachability plus migration ledger status.
+- `GET /version` — package version.
+
+Authenticated `/v1` account routes require API keys with the `accounts:read` or
+`accounts:write` scopes.
+
+Run migrations before serving, or as a deployment one-shot:
+
+```bash
+HASNA_ACCOUNTS_STORAGE_MODE=cloud \
+HASNA_ACCOUNTS_DATABASE_URL=postgres://... \
+accounts-migrate --dry-run
+```
+
+`accounts-migrate` is idempotent and uses the checksum-guarded migration ledger
+for the accounts schema. `--dry-run` prints the current plan as JSON without
+DDL. Without `--dry-run`, it applies pending migrations and prints a JSON
+summary; when the ledger is already current it exits successfully with a
+`migrate_noop` event.
 
 ## Account Metadata
 
