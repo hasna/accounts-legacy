@@ -17,8 +17,40 @@ import { createHandler, type ServiceContext } from "./app.js";
 import { grantAccountsRuntimeRole } from "./runtime-role.js";
 
 const DATABASE_URL = process.env.HASNA_ACCOUNTS_TEST_DATABASE_URL;
+const BOOTSTRAP_PROBE = process.env.ACCOUNTS_TEST_POSTGRES_PROBE === "1";
+const CLOSED_BOOTSTRAP_PROBE = process.env.ACCOUNTS_TEST_POSTGRES_CLOSED_PROBE === "1";
+const HANG_PROBE = process.env.ACCOUNTS_TEST_POSTGRES_HANG_PROBE === "1";
 
-if (process.env.ACCOUNTS_REQUIRE_POSTGRES === "1" && !DATABASE_URL) {
+if (HANG_PROBE) {
+  test("hang probe holds the integration target open until it is signalled", async () => {
+    await new Promise(() => {});
+  }, 60_000);
+}
+
+if (BOOTSTRAP_PROBE) {
+  test("explicit PostgreSQL target preserves only its isolated test URL", () => {
+    expect(process.env.ACCOUNTS_REQUIRE_POSTGRES).toBe("1");
+    expect(DATABASE_URL).toBe(process.env.ACCOUNTS_TEST_EXPECTED_POSTGRES_URL);
+    expect(process.env.HASNA_ACCOUNTS_DATABASE_URL).toBeUndefined();
+    expect(process.env.ACCOUNTS_DATABASE_URL).toBeUndefined();
+    expect(process.env.PGHOST).toBeUndefined();
+    expect(process.env.PGPORT).toBeUndefined();
+    expect(process.env.PGSSLROOTCERT).toBeUndefined();
+    expect(process.env.NODE_EXTRA_CA_CERTS).toBeUndefined();
+    expect(process.env.HASNA_ACCOUNTS_STORAGE_MODE).toBe("local");
+  });
+}
+
+if (CLOSED_BOOTSTRAP_PROBE) {
+  test("PostgreSQL target without explicit opt-in clears inherited database state", () => {
+    expect(process.env.ACCOUNTS_REQUIRE_POSTGRES).toBeUndefined();
+    expect(DATABASE_URL).toBeUndefined();
+    expect(process.env.HASNA_ACCOUNTS_DATABASE_URL).toBeUndefined();
+    expect(process.env.ACCOUNTS_DATABASE_URL).toBeUndefined();
+  });
+}
+
+if (!HANG_PROBE && process.env.ACCOUNTS_REQUIRE_POSTGRES === "1" && !DATABASE_URL) {
   test("PostgreSQL integration requires an explicit test database", () => {
     throw new Error(
       "Set HASNA_ACCOUNTS_TEST_DATABASE_URL to an isolated PostgreSQL database; no service was started automatically.",
@@ -26,7 +58,9 @@ if (process.env.ACCOUNTS_REQUIRE_POSTGRES === "1" && !DATABASE_URL) {
   });
 }
 
-const describePostgres = DATABASE_URL ? describe : describe.skip;
+const describePostgres = DATABASE_URL && !BOOTSTRAP_PROBE && !CLOSED_BOOTSTRAP_PROBE && !HANG_PROBE
+  ? describe
+  : describe.skip;
 
 describePostgres("PostgreSQL migration and repository integration", () => {
   const signingSecret = "postgres-integration-signing-secret";
