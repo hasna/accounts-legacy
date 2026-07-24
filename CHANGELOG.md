@@ -6,6 +6,21 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.11] - 2026-07-24
+
+### Testing
+
+- Regression coverage locking `--allow-empty-sources` onto the `accounts run` /
+  supervisor codewith configs-prelaunch path for identity-less profiles (e.g.
+  `accountNNN`): `runSupervisedTool` now has an explicit test asserting the
+  `configs session apply` invocation carries `--allow-empty-sources` (and no
+  `--identity-export`) when zero identity exports resolve, plus a direct
+  `runConfigsPrelaunch` test for the shared apply path. The behavior itself
+  shipped in 0.2.9 via the shared `configsPrelaunchCommand` (used by `launch`,
+  `run`, and the supervisor); stations still dead-lettering with "Session render
+  has no instruction sources" are running a pre-0.2.9 binary and need the
+  package update, not a code change.
+
 ## [0.2.10] - 2026-07-24
 
 ### Changed
