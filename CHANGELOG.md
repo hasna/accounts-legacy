@@ -6,6 +6,20 @@ All notable changes to `@hasna/accounts` are documented here. The format is base
 
 ## [Unreleased]
 
+## [0.2.10] - 2026-07-24
+
+### Changed
+
+- Test suite is now isolated from live environments: keychain platform/security
+  resolution is factored into pure, injectable helpers (`keychainSupportedFor`,
+  `securityExecutableFor`) and the PostgreSQL integration tests run through a
+  signal-safe launcher (`test/run-postgres.ts`) that tears down its controlled
+  root on SIGINT/SIGTERM/SIGHUP. No runtime behavior change for the CLI.
+
+### Documentation
+
+- Documented the accounts runtime entrypoints in the README.
+
 ## [0.2.9] - 2026-07-24
 
 ### Fixed
