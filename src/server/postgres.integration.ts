@@ -19,6 +19,13 @@ import { grantAccountsRuntimeRole } from "./runtime-role.js";
 const DATABASE_URL = process.env.HASNA_ACCOUNTS_TEST_DATABASE_URL;
 const BOOTSTRAP_PROBE = process.env.ACCOUNTS_TEST_POSTGRES_PROBE === "1";
 const CLOSED_BOOTSTRAP_PROBE = process.env.ACCOUNTS_TEST_POSTGRES_CLOSED_PROBE === "1";
+const HANG_PROBE = process.env.ACCOUNTS_TEST_POSTGRES_HANG_PROBE === "1";
+
+if (HANG_PROBE) {
+  test("hang probe holds the integration target open until it is signalled", async () => {
+    await new Promise(() => {});
+  }, 60_000);
+}
 
 if (BOOTSTRAP_PROBE) {
   test("explicit PostgreSQL target preserves only its isolated test URL", () => {
@@ -43,7 +50,7 @@ if (CLOSED_BOOTSTRAP_PROBE) {
   });
 }
 
-if (process.env.ACCOUNTS_REQUIRE_POSTGRES === "1" && !DATABASE_URL) {
+if (!HANG_PROBE && process.env.ACCOUNTS_REQUIRE_POSTGRES === "1" && !DATABASE_URL) {
   test("PostgreSQL integration requires an explicit test database", () => {
     throw new Error(
       "Set HASNA_ACCOUNTS_TEST_DATABASE_URL to an isolated PostgreSQL database; no service was started automatically.",
@@ -51,7 +58,7 @@ if (process.env.ACCOUNTS_REQUIRE_POSTGRES === "1" && !DATABASE_URL) {
   });
 }
 
-const describePostgres = DATABASE_URL && !BOOTSTRAP_PROBE && !CLOSED_BOOTSTRAP_PROBE
+const describePostgres = DATABASE_URL && !BOOTSTRAP_PROBE && !CLOSED_BOOTSTRAP_PROBE && !HANG_PROBE
   ? describe
   : describe.skip;
 

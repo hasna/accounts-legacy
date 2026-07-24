@@ -346,6 +346,44 @@ test("PostgreSQL variables survive only the exact integration target plus explic
   }
 }, 30_000);
 
+test("PostgreSQL launcher kills its child and purges its root when signalled", async () => {
+  if (nestedProbe) {
+    expect(process.env.ACCOUNTS_TEST_NESTED_PROBE).toBe("1");
+    return;
+  }
+
+  const launchId = randomUUID();
+  const child = Bun.spawn({
+    cmd: [process.execPath, "run", "./test/run-postgres.ts"],
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      ACCOUNTS_TEST_LAUNCH_ID: launchId,
+      ACCOUNTS_TEST_POSTGRES_HANG_PROBE: "1",
+    },
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+
+  try {
+    const deadline = Date.now() + 20_000;
+    while (postgresLaunchResidue(launchId).length === 0) {
+      if (Date.now() > deadline) throw new Error("launcher never created its controlled root");
+      await Bun.sleep(50);
+    }
+    // Let the child integration run start under the launcher before signalling.
+    await Bun.sleep(500);
+
+    child.kill("SIGTERM");
+    const exitCode = await child.exited;
+
+    expect(exitCode).not.toBe(0);
+    expect(postgresLaunchResidue(launchId)).toEqual([]);
+  } finally {
+    child.kill("SIGKILL");
+  }
+}, 30_000);
+
 test("PostgreSQL launcher removes its unique root after a deliberate bail", async () => {
   if (nestedProbe) {
     expect(process.env.ACCOUNTS_TEST_NESTED_PROBE).toBe("1");
