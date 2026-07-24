@@ -166,6 +166,34 @@ describe("configs prelaunch", () => {
     expect(withSources).not.toContain("--allow-empty-sources");
   });
 
+  test("identity-less profiles get --allow-empty-sources on the actual configs apply invocation", () => {
+    // Regression: `accounts launch`/`run`/supervisor prelaunch for a profile with
+    // zero identity exports (e.g. accountNNN) must request an explicit empty
+    // render, not fail closed with "Session render has no instruction sources".
+    resetHome();
+    try {
+      const p = profileInHome("codewith");
+      const calls: string[][] = [];
+      const result = runConfigsPrelaunch(p, getTool("codewith"), {
+        runner: (bin, args) => {
+          calls.push([bin, ...args]);
+          writeManifest(p, "codewith", []);
+          return { status: 0, stdout: Buffer.from("ok"), stderr: Buffer.from("") };
+        },
+      });
+
+      expect(result.result).toBe("applied");
+      expect(result.identityExports).toEqual([]);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.slice(0, 3)).toEqual(["configs", "session", "apply"]);
+      expect(calls[0]).toContain("--allow-empty-sources");
+      expect(calls[0]).not.toContain("--identity-export");
+      expect(result.prelaunch.status).toBe("ok");
+    } finally {
+      cleanup();
+    }
+  });
+
   test("runs configs prelaunch and fails closed unless bypassed", () => {
     const p = profile("codex");
     const tool = getTool("codex");

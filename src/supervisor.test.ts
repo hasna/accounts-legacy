@@ -87,6 +87,51 @@ test("resolveSupervisorLaunch treats a known target as a tool and uses the activ
   expect(plan.profile.name).toBe("one");
 });
 
+test("accounts run/supervisor prelaunch passes --allow-empty-sources for identity-less profiles", async () => {
+  // Regression for the live-bridge dead-letter: `accounts run codewith -p accountNNN`
+  // (supervisor path) must render an explicit EMPTY session for a profile with no
+  // identity/instruction sources instead of failing closed with
+  // "Session render has no instruction sources".
+  const scriptPath = join(home, "codewith-exec-once.mjs");
+  writeFileSync(scriptPath, "process.exit(0);\n");
+
+  const identityless = addProfile({ name: "account006", tool: "codewith" });
+  const tool = { ...getTool("codewith"), bin: process.execPath };
+  const calls: string[][] = [];
+
+  const exitCode = await runSupervisedTool(identityless, tool, [scriptPath], {
+    stdio: "ignore",
+    restartDelayMs: 25,
+    configsPrelaunch: {
+      mode: "apply",
+      runner: (bin, args) => {
+        calls.push([bin, ...args]);
+        // configs writes a valid sourceCount:0 manifest for an explicit empty render.
+        mkdirSync(join(identityless.dir, ".hasna"), { recursive: true });
+        writeFileSync(
+          join(identityless.dir, ".hasna", "session-render-manifest.json"),
+          JSON.stringify({
+            schema: "hasna.configs.session-render/v1",
+            tool: "codewith",
+            profile: identityless.name,
+            targetHome: identityless.dir,
+            generatedAt: "2026-07-01T00:00:00.000Z",
+            sources: [],
+            files: [],
+          }, null, 2) + "\n",
+        );
+        return { status: 0, stdout: Buffer.from("ok"), stderr: Buffer.from("") };
+      },
+    },
+  });
+
+  expect(exitCode).toBe(0);
+  const apply = calls.find((call) => call[1] === "session" && call[2] === "apply");
+  expect(apply).toBeDefined();
+  expect(apply).toContain("--allow-empty-sources");
+  expect(apply).not.toContain("--identity-export");
+});
+
 test("runSupervisedTool restarts a child under the requested profile", async () => {
   const logPath = join(home, "fake-agent.log");
   const scriptPath = join(home, "fake-agent.mjs");
